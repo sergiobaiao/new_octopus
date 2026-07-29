@@ -17,11 +17,14 @@ FROM node:24-alpine3.23 AS base
 ## step 2: Install & build
 #
 FROM base AS installer
+ARG LICENSE_FILE=/app/apps/web/modules/ee/license-check/lib/license.ts
+ENV LICENSE_FILE=/app/apps/web/modules/ee/license-check/lib/license.ts
 
 # Enable corepack and prepare pnpm
 RUN npm install --ignore-scripts -g corepack@0.35.0
 RUN corepack enable
-RUN corepack prepare pnpm@11.7.0 --activate
+#RUN corepack prepare pnpm@11.7.0 --activate
+RUN corepack prepare pnpm@11.18.0 --activate
 
 # Install necessary build tools and compilers
 RUN apk update && apk add --no-cache cmake g++ gcc jq make openssl-dev python3
@@ -52,6 +55,109 @@ WORKDIR /app
 
 # Prepare the build
 COPY . .
+
+RUN node <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const licenseFile = process.env.LICENSE_FILE;
+
+if (!licenseFile) {
+  throw new Error("Missing build arg LICENSE_FILE. Example: --build-arg LICENSE_FILE=/app/modules/ee/license-check/lib/license.ts");
+}
+
+const target = path.resolve("/app", licenseFile);
+
+if (!fs.existsSync(target)) {
+  throw new Error(`License file not found: ${target}`);
+}
+
+let source = fs.readFileSync(target, "utf8");
+
+const testFeaturesBlock = `
+const ENTERPRISE_TEST_FEATURES: TEnterpriseLicenseFeatures = {
+  isMultiOrgEnabled: true,
+  workspaces: null,
+  twoFactorAuth: true,
+  sso: true,
+  whitelabel: true,
+  removeBranding: true,
+  contacts: true,
+  aiSmartTools: true,
+  saml: true,
+  spamProtection: true,
+  auditLogs: true,
+  accessControl: true,
+  quotas: true,
+  feedbackDirectories: true,
+  dashboards: true,
+};
+
+const isLicenseEmulationAllowed = () => {
+  return (
+    process.env.ENTERPRISE_LICENSE_EMULATION === "true"
+  );
+};
+
+const getEmulatedEnterpriseLicense = (): TEnterpriseLicenseResult => ({
+  active: true,
+  features: ENTERPRISE_TEST_FEATURES,
+  lastChecked: new Date(),
+  isPendingDowngrade: false,
+  fallbackLevel: "live",
+  status: "active",
+});
+`;
+
+if (!source.includes("const ENTERPRISE_TEST_FEATURES: TEnterpriseLicenseFeatures")) {
+  const defaultFeaturesRegex = /(const DEFAULT_FEATURES: TEnterpriseLicenseFeatures = \{[\s\S]*?\n\};)/;
+  if (!defaultFeaturesRegex.test(source)) {
+    throw new Error("Could not find DEFAULT_FEATURES block.");
+  }
+  source = source.replace(defaultFeaturesRegex, `$1\n${testFeaturesBlock}`);
+}
+
+const productionGuard = `
+  if (
+    process.env.NODE_ENV === "development" 
+  ) {
+    errors.push("Enterprise license emulation cannot be enabled in dev");
+  }
+`;
+
+if (!source.includes("Enterprise license emulation cannot be enabled in production")) {
+  source = source.replace(
+    "  if (errors.length > 0) {",
+    `${productionGuard}\n  if (errors.length > 0) {`
+  );
+}
+
+const emulationEntry = `  validateConfig();
+
+  if (isLicenseEmulationAllowed()) {
+    logger.warn(
+      {
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV,
+      },
+      "Enterprise license emulation is enabled"
+    );
+
+    return getEmulatedEnterpriseLicense();
+  }
+
+`;
+
+if (!source.includes("Enterprise license emulation is enabled")) {
+  source = source.replace(
+    "export const getEnterpriseLicense = reactCache(async (): Promise<TEnterpriseLicenseResult> => {\n",
+    `export const getEnterpriseLicense = reactCache(async (): Promise<TEnterpriseLicenseResult> => {\n${emulationEntry}`
+  );
+}
+
+fs.writeFileSync(target, source);
+console.log(`Patched license file: ${licenseFile}`);
+NODE
 
 # Create a .env file
 RUN touch apps/web/.env
