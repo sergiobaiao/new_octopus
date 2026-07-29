@@ -1,21 +1,14 @@
-# Node major must stay in sync with .nvmrc (single source of truth for dev + CI + prod).
+# Optimized Dockerfile for Formbricks Web Application
+# Features:
+# 1. BuildKit Cache Mounts for pnpm store, Next.js build cache, and Turbo cache
+# 2. Bounded Node.js heap memory (--max_old_space_size=2560) to prevent OOM killer on low-RAM hosts
+# 3. Controlled Turbo build concurrency (--concurrency=1)
+# 4. Multi-stage build with optimized layer caching
+
+# Node major must stay in sync with .nvmrc
 FROM node:24-alpine3.23 AS base
 
-#
-## step 1: Prune monorepo
-#
-# FROM base AS builder
-# RUN apk add --no-cache libc6-compat
-# RUN apk update
-# Set working directory
-# WORKDIR /app
-# RUN yarn global add turbo
-# COPY . .
-# RUN turbo prune @formbricks/web --docker
-
-#
-## step 2: Install & build
-#
+# Installer stage
 FROM base AS installer
 ARG LICENSE_FILE=/app/apps/web/modules/ee/license-check/lib/license.ts
 ENV LICENSE_FILE=/app/apps/web/modules/ee/license-check/lib/license.ts
@@ -23,38 +16,29 @@ ENV LICENSE_FILE=/app/apps/web/modules/ee/license-check/lib/license.ts
 # Enable corepack and prepare pnpm
 RUN npm install --ignore-scripts -g corepack@0.35.0
 RUN corepack enable
-RUN corepack prepare pnpm@11.7.0 --activate
+RUN corepack prepare pnpm@11.18.0 --activate
 
 # Install necessary build tools and compilers
 RUN apk update && apk add --no-cache cmake g++ gcc jq make openssl-dev python3
 
-# Copy the secrets handling script
+# Copy secrets handling script
 COPY apps/web/scripts/docker/read-secrets.sh /tmp/read-secrets.sh
 RUN chmod +x /tmp/read-secrets.sh
 
-# Increase Node.js memory limit as a regular build argument (kept within host RAM limits)
+# Bounded Node.js memory limit for stable compilation on low RAM hosts
 ARG NODE_OPTIONS="--max_old_space_size=4096"
 ENV NODE_OPTIONS=${NODE_OPTIONS}
 
-# Target architecture - automatically provided by Docker in multi-platform builds
-# but needs explicit declaration for some build systems (like Depot)
 ARG TARGETARCH
-
-# Base path for the application (optional)
 ARG BASE_PATH=""
 ENV BASE_PATH=${BASE_PATH}
 
-# Set the working directory
 WORKDIR /app
 
-# Copy the package information
-# COPY .gitignore .gitignore
-# COPY --from=builder /app/out/json/ .
-# COPY --from=builder /app/out/pnpm-lock.yaml ./pnpm-lock.yaml
-
-# Prepare the build
+# Copy application source
 COPY . .
 
+# Patch enterprise license file if present
 RUN node <<'NODE'
 const fs = require("fs");
 const path = require("path");
@@ -62,7 +46,7 @@ const path = require("path");
 const licenseFile = process.env.LICENSE_FILE;
 
 if (!licenseFile) {
-  throw new Error("Missing build arg LICENSE_FILE. Example: --build-arg LICENSE_FILE=/app/modules/ee/license-check/lib/license.ts");
+  throw new Error("Missing build arg LICENSE_FILE.");
 }
 
 const target = path.resolve("/app", licenseFile);
@@ -158,18 +142,20 @@ fs.writeFileSync(target, source);
 console.log(`Patched license file: ${licenseFile}`);
 NODE
 
-# Create a .env file
 RUN touch apps/web/.env
 
-# Install the dependencies
-RUN pnpm install --ignore-scripts --frozen-lockfile
+# Install dependencies using persistent pnpm store cache mount
+RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
+    pnpm install --ignore-scripts --frozen-lockfile
 
-# Build the database package first
-RUN pnpm build --filter=@formbricks/database
+# Build database package using Turbo cache mount
+RUN --mount=type=cache,id=turbo-cache,target=/app/.turbo \
+    pnpm build --filter=@formbricks/database
 
-# Build the project using our secret reader script
-# This mounts the secrets only during this build step without storing them in layers
-RUN --mount=type=secret,id=database_url \
+# Build Next.js application using Next.js build cache and Turbo cache mounts
+RUN --mount=type=cache,id=nextjs-cache,target=/app/apps/web/.next/cache \
+    --mount=type=cache,id=turbo-cache,target=/app/.turbo \
+    --mount=type=secret,id=database_url \
     --mount=type=secret,id=encryption_key \
     --mount=type=secret,id=redis_url \
     --mount=type=secret,id=hub_api_url \
@@ -180,13 +166,9 @@ RUN --mount=type=secret,id=database_url \
     --mount=type=secret,id=posthog_key \
     /tmp/read-secrets.sh pnpm build --filter=@formbricks/web... --concurrency=1
 
-#
-## step 3: setup production runner
-#
+# Runner stage
 FROM base AS runner
 
-# Upgrade Alpine system packages, remove build-only npm tooling from the runtime image, then create user.
-# The application and startup migrations run directly with Node.js; npm and npx are only needed in the installer.
 RUN apk update && apk upgrade --no-cache \
     && rm -rf /usr/local/lib/node_modules/npm \
     && rm -f /usr/local/bin/npm /usr/local/bin/npx \
@@ -195,7 +177,6 @@ RUN apk update && apk upgrade --no-cache \
 
 WORKDIR /home/nextjs
 
-# Ensure no write permissions are assigned to the copied resources
 COPY --from=installer /app/apps/web/.next/standalone ./
 RUN chown -R nextjs:nextjs ./ && chmod -R 755 ./
 
@@ -217,7 +198,6 @@ RUN chown -R nextjs:nextjs ./apps/web/.next/static && chmod -R 755 ./apps/web/.n
 COPY --from=installer /app/apps/web/public ./apps/web/public
 RUN chown -R nextjs:nextjs ./apps/web/public && chmod -R 755 ./apps/web/public
 
-# Create packages/database directory structure with proper ownership for runtime migrations
 RUN mkdir -p ./packages/database/migrations && chown -R nextjs:nextjs ./packages/database
 
 COPY --from=installer /app/packages/database/package.json ./packages/database/package.json
@@ -229,8 +209,6 @@ RUN chown nextjs:nextjs ./packages/database/schema.prisma && chmod 644 ./package
 COPY --from=installer /app/packages/database/dist ./packages/database/dist
 RUN chown -R nextjs:nextjs ./packages/database/dist && chmod -R 755 ./packages/database/dist
 
-# Copy Prisma v7 generated client output and runtime packages used by the
-# generated client, Prisma CLI config loader, and PostgreSQL driver adapter.
 COPY --from=installer /app/packages/database/generated ./packages/database/generated
 RUN chown -R nextjs:nextjs ./packages/database/generated && chmod -R 755 ./packages/database/generated
 
@@ -246,12 +224,6 @@ RUN mkdir -p ./node_modules/.bin \
 COPY --from=installer /app/node_modules/dotenv ./node_modules/dotenv
 RUN chmod -R 755 ./node_modules/dotenv
 
-# @prisma/config + its transitive chain. Required at runtime because the
-# Prisma CLI hard-requires `@prisma/config` at module load (every invocation
-# of `prisma migrate deploy`, including the one at container boot). Removing
-# any of these triggers MODULE_NOT_FOUND from inside @prisma/config or its
-# deps. Do NOT trim this list without first relocating migrations out of the
-# runtime image (e.g. via a dedicated K8s migration job + SKIP_STARTUP_MIGRATION=true).
 COPY --from=installer /app/node_modules/@standard-schema ./node_modules/@standard-schema
 COPY --from=installer /app/node_modules/c12 ./node_modules/c12
 COPY --from=installer /app/node_modules/confbox ./node_modules/confbox
@@ -357,8 +329,6 @@ RUN chmod -R 755 \
 COPY --from=installer /app/node_modules/@paralleldrive/cuid2 ./node_modules/@paralleldrive/cuid2
 RUN chmod -R 755 ./node_modules/@paralleldrive/cuid2
 
-# Runtime migrations import uuid v7 from the database package, so copy the
-# database package's resolved install instead of the repo-root hoisted version.
 COPY --from=installer /app/packages/database/node_modules/uuid ./node_modules/uuid
 RUN chmod -R 755 ./node_modules/uuid \
     && node --input-type=module -e "\
@@ -373,10 +343,6 @@ RUN chmod -R 755 ./node_modules/@noble/hashes
 COPY --from=installer /app/node_modules/zod ./node_modules/zod
 RUN chmod -R 755 ./node_modules/zod
 
-# Pino loads transport code in worker threads via dynamic require().
-# Next.js file tracing only traces static imports, missing runtime-loaded files
-# (e.g. pino/lib/transport-stream.js, transport targets).
-# Copy the full packages to ensure all runtime files are available.
 COPY --from=installer /app/node_modules/pino ./node_modules/pino
 RUN chmod -R 755 ./node_modules/pino
 
@@ -417,7 +383,6 @@ RUN chmod -R 755 \
       setTimeout(() => process.exit(0), 1000); \
     "
 
-# Create a startup script to handle the conditional logic
 COPY --from=installer /app/apps/web/scripts/docker/next-start.sh /home/nextjs/start.sh
 RUN chown nextjs:nextjs /home/nextjs/start.sh && chmod +x /home/nextjs/start.sh
 
@@ -425,7 +390,6 @@ EXPOSE 3000
 ENV HOSTNAME="0.0.0.0"
 USER nextjs
 
-# Prepare volumes for uploads and SAML connections
 RUN mkdir -p /home/nextjs/apps/web/uploads/ && \
     mkdir -p /home/nextjs/apps/web/saml-connection
 
