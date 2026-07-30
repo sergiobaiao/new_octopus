@@ -9,13 +9,14 @@ import { PolishedChartTooltip } from "@/modules/ee/analysis/charts/components/po
 import {
   CHART_BRAND_DARK,
   CHART_MEASURE_COLORS,
-  CHART_NOT_ENRICHED_COLOR,
   PIE_MEASURE_NAME_KEY,
   PIE_MEASURE_VALUE_KEY,
   PIVOTED_MEASURE_KEY,
   PIVOTED_VALUE_KEY,
   formatCellValue,
   formatXAxisTick,
+  getSemanticDimensionColor,
+  getSentimentMeasureColor,
   pivotMeasuresToCategories,
   prepareMeasureSliceData,
   preparePieData,
@@ -25,7 +26,6 @@ import {
   formatCubeColumnHeader,
   getMeasureAxisLabel,
   getTranslatedDimensionValueLabel,
-  isNotEnrichedDimensionValue,
   sortMeasureIdsForCategoryAxis,
   sortRowsByEnumDimension,
 } from "@/modules/ee/analysis/lib/schema-definition";
@@ -191,9 +191,9 @@ const BarChartView = ({
     ? sortedData
     : sortedData.map((row, index) => ({
         ...row,
-        fill: isNotEnrichedDimensionValue(xAxisKey, row[xAxisKey])
-          ? CHART_NOT_ENRICHED_COLOR
-          : CHART_MEASURE_COLORS[index % CHART_MEASURE_COLORS.length],
+        fill:
+          getSemanticDimensionColor(xAxisKey, row[xAxisKey]) ??
+          CHART_MEASURE_COLORS[index % CHART_MEASURE_COLORS.length],
       }));
 
   return (
@@ -376,12 +376,14 @@ export function ChartRenderer({ chartType, data, query, optionLabels }: Readonly
     );
   }
 
+  // Sentiment count measures carry semantic colors keyed by enum value (red-ish for very negative →
+  // green for very positive); every other series takes the generic palette by index.
   const chartConfig: ChartConfig = Object.fromEntries(
     dataKeys.map((key, i) => [
       key,
       {
         label: formatCubeColumnHeader(key, t),
-        color: CHART_MEASURE_COLORS[i % CHART_MEASURE_COLORS.length],
+        color: getSentimentMeasureColor(key) ?? CHART_MEASURE_COLORS[i % CHART_MEASURE_COLORS.length],
       },
     ])
   );

@@ -405,6 +405,19 @@ describe("ZV3CreateSurveyBody", () => {
     }
   });
 
+  test("accepts displaySome with displayLimit (show at most N times)", () => {
+    const result = ZV3CreateSurveyBody.safeParse({
+      ...validCreateBody,
+      type: "app",
+      distribution: { displayOption: "displaySome", displayLimit: 3 },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.distribution).toMatchObject({ displayOption: "displaySome", displayLimit: 3 });
+    }
+  });
+
   test("requires displayLimit >= 1 when displayOption is displaySome", () => {
     const noLimit = ZV3CreateSurveyBody.safeParse({
       ...validCreateBody,
