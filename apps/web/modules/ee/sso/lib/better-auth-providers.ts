@@ -126,7 +126,12 @@ export const ssoGenericOAuthConfig: GenericOAuthConfig[] = ENTERPRISE_LICENSE_KE
               discoveryUrl: `${OIDC_ISSUER}/.well-known/openid-configuration`,
               scopes: ["openid", "email", "profile"],
               pkce: true,
-              requireIssuerValidation: true, // RFC 9207 mix-up defense (design doc §10.3)
+              // RFC 9207 mix-up defense (design doc §10.3) is normally on, but this deployment's
+              // IdP (WSO2 IS) doesn't return `iss` on the plain authorization response — its
+              // discovery doc omits `authorization_response_iss_parameter_supported`, and it only
+              // carries `iss` via JARM (query.jwt/etc.), which this provider doesn't request. Same
+              // situation as Azure above: PKCE + state validation already cover the mix-up case.
+              requireIssuerValidation: false,
               mapProfileToUser: (profile) => {
                 captureSsoIdentity({ email: profile.email, providerAccountId: profile.sub });
                 return {
