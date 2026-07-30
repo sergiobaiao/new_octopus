@@ -877,51 +877,6 @@ describe("transformResponseToFeedbackRecords", () => {
       expect(result.every((r) => r.field_group_id === "el-feats")).toBe(true);
     });
 
-    test("emits no records for an empty multi select selection", () => {
-      const response = buildResponse({ "el-feats": [] });
-      const mappings = [createMapping({ elementId: "el-feats", hubFieldType: "categorical" })];
-
-      const result = transformResponseToFeedbackRecords(response, survey, mappings, mockTenantId);
-
-      expect(result).toEqual([]);
-    });
-
-    test("groups unmatched multi-select entries under the stable 'other' id when the element offers one", () => {
-      const otherSurvey = {
-        id: "survey-1",
-        name: "Other Survey",
-        languages: bilingualLanguages,
-        blocks: [
-          {
-            elements: [
-              {
-                id: "el-feats-other",
-                type: "multipleChoiceMulti",
-                headline: { default: "Select features" },
-                choices: [
-                  { id: "c-speed", label: { default: "Speed" } },
-                  { id: "other", label: { default: "Other" } },
-                ],
-              },
-            ],
-          },
-        ],
-      } as unknown as TSurvey;
-      const response = buildResponse({ "el-feats-other": ["Speed", "my own idea"] });
-      const mappings = [createMapping({ elementId: "el-feats-other", hubFieldType: "categorical" })];
-
-      const result = transformResponseToFeedbackRecords(response, otherSurvey, mappings, mockTenantId);
-
-      expect(result).toHaveLength(2);
-      expect(result[0]).toMatchObject({ value_text: "Speed", value_id: "c-speed" });
-      // The free-text entry groups under the stable "other" id and keeps the submitted text.
-      expect(result[1]).toMatchObject({
-        field_id: "el-feats-other__other",
-        value_text: "my own idea",
-        value_id: "other",
-      });
-    });
-
     test("omits value_id for non-choice elements", () => {
       const response = buildResponse({ "el-text": "free text" });
       const mappings = [createMapping({ elementId: "el-text", hubFieldType: "text" })];

@@ -337,14 +337,14 @@ export const AddApiKeyModal = ({
                 </div>
               ))}
               {isFormbricksCloud && (
-                <Alert variant="info" role="status">
+                <Alert variant="info">
                   <AlertDescription>
                     {t("workspace.api_keys.organization_access_cloud_note")}
                   </AlertDescription>
                 </Alert>
               )}
             </div>
-            <Alert variant="warning" role="status">
+            <Alert variant="warning">
               <AlertTitle>{t("workspace.api_keys.api_key_security_warning")}</AlertTitle>
             </Alert>
           </DialogBody>
