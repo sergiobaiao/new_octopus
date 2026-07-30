@@ -26,7 +26,7 @@ RUN corepack enable
 RUN corepack prepare pnpm@11.7.0 --activate
 
 # Install necessary build tools and compilers
-RUN apk update && apk add --no-cache cmake g++ gcc jq make openssl-dev python3
+RUN apk update && apk add --no-cache cmake g++ gcc jq make openssl-dev patch python3
 
 # Copy the secrets handling script
 COPY apps/web/scripts/docker/read-secrets.sh /tmp/read-secrets.sh
@@ -54,6 +54,12 @@ WORKDIR /app
 
 # Prepare the build
 COPY . .
+
+# Rebrand: swap "Formbricks" for "Octopus" in a few user-facing strings (page
+# title, auth appName/issuer, email from-name, TOTP label, API docs) without
+# touching the tracked source tree. See docker/patches/rebrand-octopus.patch.
+COPY docker/patches/rebrand-octopus.patch /tmp/rebrand-octopus.patch
+RUN patch -p1 < /tmp/rebrand-octopus.patch && rm /tmp/rebrand-octopus.patch
 
 RUN node <<'NODE'
 const fs = require("fs");

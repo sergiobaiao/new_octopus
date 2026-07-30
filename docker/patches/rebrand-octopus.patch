@@ -1,0 +1,123 @@
+diff --git a/apps/web/app/layout.tsx b/apps/web/app/layout.tsx
+index 540c28bc8..222f3f5d7 100644
+--- a/apps/web/app/layout.tsx
++++ b/apps/web/app/layout.tsx
+@@ -15,8 +15,8 @@ import "../modules/ui/globals.css";
+ 
+ export const metadata: Metadata = {
+   title: {
+-    template: "%s | Formbricks",
+-    default: "Formbricks",
++    template: "%s | Octopus",
++    default: "Octopus",
+   },
+   description: "Open-Source Survey Suite",
+ };
+diff --git a/apps/web/modules/api/v2/openapi-document.ts b/apps/web/modules/api/v2/openapi-document.ts
+index 4b6e71205..8e838e370 100644
+--- a/apps/web/modules/api/v2/openapi-document.ts
++++ b/apps/web/modules/api/v2/openapi-document.ts
+@@ -29,8 +29,8 @@ import { contactPaths } from "@/modules/ee/contacts/api/v2/management/contacts/l
+ const document = createDocument({
+   openapi: "3.1.0",
+   info: {
+-    title: "Formbricks API",
+-    description: "Manage Formbricks resources programmatically.",
++    title: "Octopus API",
++    description: "Manage Octopus resources programmatically.",
+     version: "2.0.0",
+   },
+   paths: {
+@@ -51,7 +51,7 @@ const document = createDocument({
+   servers: [
+     {
+       url: "https://app.formbricks.com/api/v2",
+-      description: "Formbricks Cloud",
++      description: "Octopus Cloud",
+     },
+   ],
+   tags: [
+@@ -114,7 +114,7 @@ const document = createDocument({
+         type: "apiKey",
+         in: "header",
+         name: "x-api-key",
+-        description: "Use your Formbricks x-api-key to authenticate.",
++        description: "Use your Octopus x-api-key to authenticate.",
+       },
+     },
+     schemas: {
+diff --git a/apps/web/modules/auth/lib/auth.ts b/apps/web/modules/auth/lib/auth.ts
+index a7fc7fdcd..aba5f0f6f 100644
+--- a/apps/web/modules/auth/lib/auth.ts
++++ b/apps/web/modules/auth/lib/auth.ts
+@@ -66,7 +66,7 @@ export const getUserLocale = async (userId: string): Promise<TUserLocale> => {
+  * analytics / Sentry / logger wiring are all live in better-auth-observability.ts.
+  */
+ export const auth = betterAuth({
+-  appName: "Formbricks",
++  appName: "Octopus",
+   // ENG-1054: fall back to NEXTAUTH_SECRET (which already signed NextAuth's session cookies) when
+   // BETTER_AUTH_SECRET is unset. This keeps existing envs working AND guarantees BA's cookie signing
+   // uses the same secret the forward-auth proxy verifies with (session-cookie.ts) — a mismatch makes
+@@ -304,7 +304,7 @@ export const auth = betterAuth({
+     // User.twoFactorSecret|backupCodes into the twoFactor table, and move the login-time TOTP/
+     // backup challenge out of the credentials authorize into Better Auth's flow.
+     twoFactor({
+-      issuer: "Formbricks",
++      issuer: "Octopus",
+       skipVerificationOnEnable: false, // require a valid TOTP before 2FA is enabled
+       totpOptions: { digits: 6, period: 30 },
+       backupCodeOptions: { amount: 10, length: 10, storeBackupCodes: "encrypted" },
+diff --git a/apps/web/modules/ee/two-factor-auth/lib/two-factor-auth.ts b/apps/web/modules/ee/two-factor-auth/lib/two-factor-auth.ts
+index ee8181a72..f45934903 100644
+--- a/apps/web/modules/ee/two-factor-auth/lib/two-factor-auth.ts
++++ b/apps/web/modules/ee/two-factor-auth/lib/two-factor-auth.ts
+@@ -63,7 +63,7 @@ export const setupTwoFactorAuth = async (
+   });
+ 
+   const name = user.email || user.name || user.id.toString();
+-  const keyUri = authenticator.keyuri(name, "Formbricks", secret);
++  const keyUri = authenticator.keyuri(name, "Octopus", secret);
+   const dataUri = await qrcode.toDataURL(keyUri);
+ 
+   return { secret, keyUri, dataUri, backupCodes };
+diff --git a/apps/web/modules/email/index.tsx b/apps/web/modules/email/index.tsx
+index b678184f3..3c3a8dacb 100644
+--- a/apps/web/modules/email/index.tsx
++++ b/apps/web/modules/email/index.tsx
+@@ -99,7 +99,7 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
+     } as SMTPTransport.Options);
+ 
+     const emailDefaults = {
+-      from: `${MAIL_FROM_NAME ?? "Formbricks"} <${MAIL_FROM ?? "noreply@formbricks.com"}>`,
++      from: `${MAIL_FROM_NAME ?? "Octopus"} <${MAIL_FROM ?? "noreply@formbricks.com"}>`,
+     };
+     await transporter.sendMail({ ...emailDefaults, ...emailData });
+ 
+diff --git a/apps/web/modules/survey/link/lib/metadata-utils.ts b/apps/web/modules/survey/link/lib/metadata-utils.ts
+index 2c6f9d967..d83d145a5 100644
+--- a/apps/web/modules/survey/link/lib/metadata-utils.ts
++++ b/apps/web/modules/survey/link/lib/metadata-utils.ts
+@@ -84,7 +84,7 @@ export const getBasicSurveyMetadata = async (
+ 
+   if (!titleFromMetadata) {
+     if (IS_FORMBRICKS_CLOUD) {
+-      title = `${title} | Formbricks`;
++      title = `${title} | Octopus`;
+     }
+   }
+ 
+diff --git a/apps/web/public/favicon/site.webmanifest b/apps/web/public/favicon/site.webmanifest
+index 3fe074952..10423d27c 100644
+--- a/apps/web/public/favicon/site.webmanifest
++++ b/apps/web/public/favicon/site.webmanifest
+@@ -13,7 +13,7 @@
+       "type": "image/png"
+     }
+   ],
+-  "name": "",
+-  "short_name": "",
++  "name": "Octopus",
++  "short_name": "Octopus",
+   "theme_color": "#ffffff"
+ }
