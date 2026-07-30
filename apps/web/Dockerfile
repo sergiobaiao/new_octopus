@@ -96,6 +96,7 @@ const ENTERPRISE_TEST_FEATURES: TEnterpriseLicenseFeatures = {
   quotas: true,
   feedbackDirectories: true,
   dashboards: true,
+  workflows: true,
 };
 
 const isLicenseEmulationAllowed = () => {

@@ -28,7 +28,7 @@ diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
  ENV NODE_OPTIONS=${NODE_OPTIONS}
  
  # Target architecture - automatically provided by Docker in multi-platform builds
-@@ -53,6 +55,115 @@
+@@ -53,6 +55,116 @@
  # Prepare the build
  COPY . .
  
@@ -73,6 +73,7 @@ diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
 +  quotas: true,
 +  feedbackDirectories: true,
 +  dashboards: true,
++  workflows: true,
 +};
 +
 +const isLicenseEmulationAllowed = () => {
@@ -144,7 +145,7 @@ diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
  # Create a .env file
  RUN touch apps/web/.env
  
-@@ -73,7 +184,7 @@
+@@ -73,7 +185,7 @@
      --mount=type=secret,id=cubejs_api_secret \
      --mount=type=secret,id=sentry_auth_token \
      --mount=type=secret,id=posthog_key \
