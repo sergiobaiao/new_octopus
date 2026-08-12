@@ -1,5 +1,5 @@
 diff --git a/apps/web/app/layout.tsx b/apps/web/app/layout.tsx
-index 540c28bc8..d478597591 100644
+index 540c28bc8..81a57a8123 100644
 --- a/apps/web/app/layout.tsx
 +++ b/apps/web/app/layout.tsx
 @@ -8,17 +8,36 @@ import {
@@ -14,7 +14,7 @@ index 540c28bc8..d478597591 100644
  
 +const OCTOPUS_TITLE = "Octopus";
 +const OCTOPUS_DESCRIPTION = "Sistema de Coleta de Dados da PGE-PI";
-+const OCTOPUS_OG_IMAGE = `/api/v1/client/og?brandColor=%231a2953&name=${encodeURIComponent(OCTOPUS_DESCRIPTION)}`;
++const OCTOPUS_OG_IMAGE = "/api/v1/client/og/default";
 +
  export const metadata: Metadata = {
 +  metadataBase: new URL(WEBAPP_URL),
