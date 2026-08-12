@@ -36,6 +36,7 @@ OWNED_PATHS=(
   ".github/workflows/build-multiarch.yml"
   "apps/web/Dockerfile"
   "apps/web/Dockerfile.optimized"
+  "apps/web/app/icon.svg"
   "apps/web/images/formbricks-wordmark.svg"
   "apps/web/public/favicon.ico"
   "apps/web/public/logo-transparent.png"
