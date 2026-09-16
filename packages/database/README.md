@@ -30,10 +30,13 @@ packages/database/
 │   │   └── migration.sql      # Schema migration file
 │   └── [timestamp_name]/      # Data migration folder
 │       └── migration.ts       # Data migration file
-├── migrations/                # Prisma internal migrations
+├── .prisma-migrations/        # Transient Prisma scratch dir (gitignored)
+├── schema/                    # Prisma schema folder
+│   ├── main.prisma            # Shared models, datasource, and generators
+│   └── workflows.prisma       # Workflows models and enums
 ├── types/                     # Custom TypeScript types
 ├── zod/                       # Zod schema definitions
-├── schema.prisma              # Main Prisma schema file
+├── prisma.config.ts           # Prisma schema and migration paths
 └── package.json
 ```
 
@@ -48,6 +51,8 @@ packages/database/
 - **Single Type per Subdirectory**: A migration subdirectory can only contain one file type—either `migration.sql` or `migration.ts`
 - **Custom Naming Convention**: Subdirectories follow the format `timestamp_name_of_the_migration` (e.g., `20241214112456_add_users_table`)
 - **Order of Execution**: Migrations are executed sequentially based on their timestamps, enabling precise control over the execution sequence
+
+> **Why two directories?** `migration/` (singular, checked in) is the source of truth — it contains both schema and data migrations interleaved by timestamp. `.prisma-migrations/` (hidden, gitignored) is a transient scratch directory generated at runtime: the runner copies only schema migrations into it and feeds them to `prisma migrate deploy`. The hidden name prevents accidental edits; developers should only work in `migration/`.
 
 ### Database Tracking
 
@@ -127,12 +132,12 @@ Run these commands from the `packages/database` directory:
   "create-migration": "Create new schema migration",
   "db:migrate:deploy": "Apply migrations in production",
   "db:migrate:dev": "Apply migrations in development",
-  "db:push": "prisma db push --accept-data-loss",
+  "db:push": "prisma db push --accept-data-loss --config ./prisma.config.ts",
   "db:seed": "Seed the database with sample data",
   "db:seed:clear": "Clear all data and re-seed",
   "db:setup": "pnpm db:migrate:dev && pnpm db:create-saml-database:dev && pnpm db:seed",
   "dev": "vite build --watch",
-  "generate": "prisma generate",
+  "generate": "prisma generate --config ./prisma.config.ts",
   "generate-data-migration": "Create new data migration"
 }
 ```
@@ -168,7 +173,7 @@ By default, the seed script uses `upsert` to ensure it can be run multiple times
 
 ### Adding a Schema Migration
 
-1. Modify your Prisma schema in `schema.prisma`
+1. Modify your Prisma schema in `schema/`
 2. Run `pnpm fb-migrate-dev` from the root of the monorepo
 3. Follow the prompts to name your migration
 4. The script automatically:

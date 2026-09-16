@@ -1,16 +1,7 @@
 "use client";
 
 import { TFunction } from "i18next";
-import {
-  CalendarIcon,
-  ChevronDownIcon,
-  HashIcon,
-  MessageSquareTextIcon,
-  PlusIcon,
-  RefreshCwIcon,
-  ToggleLeftIcon,
-  TypeIcon,
-} from "lucide-react";
+import { ChevronDownIcon, MessageSquareTextIcon, PlusIcon, RefreshCwIcon } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useMemo, useState } from "react";
 import toast from "react-hot-toast";
@@ -32,6 +23,7 @@ import {
 } from "@/modules/ui/components/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/modules/ui/components/tooltip";
 import { deleteFeedbackRecordAction } from "../actions";
+import { FieldTypeIcon } from "../lib/field-type-icons";
 import { formatFieldType, formatSourceType, resolveFeedbackDisplayText } from "../lib/utils";
 import { CsvImportModal } from "../sources/components/csv-import-modal";
 import { FeedbackRecordFormDrawer } from "./feedback-record-form-drawer";
@@ -41,18 +33,6 @@ import { TranslatedBadge } from "./translated-badge";
 const RECORDS_PER_PAGE = 50;
 // Must not exceed the getFeedbackRecordContactsAction input cap (`userIds` is `.max(1000)`).
 const CONTACT_RESOLVE_BATCH_SIZE = 1000;
-
-const FIELD_TYPE_ICONS: Record<string, React.ReactNode> = {
-  text: <TypeIcon className="size-3.5" />,
-  categorical: <HashIcon className="size-3.5" />,
-  nps: <HashIcon className="size-3.5" />,
-  csat: <HashIcon className="size-3.5" />,
-  ces: <HashIcon className="size-3.5" />,
-  rating: <HashIcon className="size-3.5" />,
-  number: <HashIcon className="size-3.5" />,
-  boolean: <ToggleLeftIcon className="size-3.5" />,
-  date: <CalendarIcon className="size-3.5" />,
-};
 
 // resolvedText (translation-preferred) is computed once by the caller; null falls through to other types.
 const formatValue = (
@@ -76,6 +56,8 @@ interface FeedbackRecordsTableProps {
   frdMap: Record<string, string>;
   csvSources: { id: string; name: string; fieldMappings: TFeedbackSourceFieldMapping[] }[];
   canWrite: boolean;
+  /** Owners/managers only — records are directory-level, not workspace-level (ENG-1770). */
+  canDeleteRecords: boolean;
 }
 
 interface FeedbackRecordRowProps {
@@ -84,7 +66,7 @@ interface FeedbackRecordRowProps {
   contactId?: string;
   locale: string;
   t: TFunction;
-  canWrite: boolean;
+  isSelectable: boolean;
   isSelected: boolean;
   onSelectChange: (checked: boolean) => void;
   onClick: () => void;
@@ -98,6 +80,7 @@ export const FeedbackRecordsTable = ({
   frdMap,
   csvSources,
   canWrite,
+  canDeleteRecords,
 }: Readonly<FeedbackRecordsTableProps>) => {
   const { t, i18n } = useTranslation();
   const [records, setRecords] = useState<FeedbackRecordData[]>(initialRecords);
@@ -182,10 +165,12 @@ export const FeedbackRecordsTable = ({
 
     const firstFailure = results.find((result) => !result?.data);
     if (firstFailure) {
+      // getFormattedErrorMessage returns "" (not nullish) when the action failed without a
+      // serverError, so `??` never reached the fallback and the user got a blank error.
       return {
         ok: false,
         errorMessage:
-          getFormattedErrorMessage(firstFailure) ?? t("workspace.unify.failed_to_load_feedback_records"),
+          getFormattedErrorMessage(firstFailure) || t("workspace.unify.failed_to_load_feedback_records"),
       };
     }
 
@@ -288,7 +273,7 @@ export const FeedbackRecordsTable = ({
 
   const handleBulkDelete = async () => {
     const ids = Array.from(selectedIds);
-    if (ids.length === 0) return;
+    if (ids.length === 0 || !canDeleteRecords) return;
     setIsDeleting(true);
     const CHUNK_SIZE = 5;
     const failedIds: string[] = [];
@@ -404,7 +389,7 @@ export const FeedbackRecordsTable = ({
           <div className="overflow-x-auto">
             <table className="w-full min-w-[1040px] table-fixed">
               <colgroup>
-                {canWrite && <col className="w-10" />}
+                {canDeleteRecords && <col className="w-10" />}
                 <col className="w-40" />
                 <col className="w-40" />
                 <col className="w-40" />
@@ -415,7 +400,7 @@ export const FeedbackRecordsTable = ({
               </colgroup>
               <thead>
                 <tr className="border-b border-slate-200 text-left text-sm text-slate-900 [&>th]:font-semibold">
-                  {canWrite && (
+                  {canDeleteRecords && (
                     <th className="w-10 px-4 py-3">
                       <Checkbox
                         aria-label={t("common.select_all")}
@@ -436,7 +421,7 @@ export const FeedbackRecordsTable = ({
               {isEmpty ? (
                 <tbody>
                   <tr>
-                    <td colSpan={canWrite ? 8 : 7}>
+                    <td colSpan={canDeleteRecords ? 8 : 7}>
                       <div className="flex h-32 items-center justify-center">
                         <p className="text-sm text-slate-500">{t("workspace.unify.no_feedback_records")}</p>
                       </div>
@@ -453,7 +438,7 @@ export const FeedbackRecordsTable = ({
                       contactId={record.user_id ? contactIdByUserId[record.user_id] : undefined}
                       locale={i18n.resolvedLanguage ?? i18n.language ?? "en-US"}
                       t={t}
-                      canWrite={canWrite}
+                      isSelectable={canDeleteRecords}
                       isSelected={selectedIds.has(record.id)}
                       onSelectChange={(checked) => toggleOne(record.id, checked)}
                       onClick={() => openViewDrawer(record.id)}
@@ -484,7 +469,7 @@ export const FeedbackRecordsTable = ({
         onOpenChange={setIsDrawerOpen}
         workspaceId={workspaceId}
         directories={directories}
-        canWrite={canWrite}
+        canDelete={canDeleteRecords}
         recordId={drawerRecordId}
         onSuccess={handleRefresh}
       />
@@ -521,7 +506,7 @@ const FeedbackRecordRow = ({
   contactId,
   locale,
   t,
-  canWrite,
+  isSelectable,
   isSelected,
   onSelectChange,
   onClick,
@@ -547,7 +532,7 @@ const FeedbackRecordRow = ({
           onClick();
         }
       }}>
-      {canWrite && (
+      {isSelectable && (
         <td
           className="w-10 px-4 py-3"
           onClick={(event) => event.stopPropagation()}
@@ -587,7 +572,7 @@ const FeedbackRecordRow = ({
       </td>
       <td className="px-4 py-3 whitespace-nowrap">
         <span className="inline-flex items-center gap-1 text-slate-600">
-          {FIELD_TYPE_ICONS[record.field_type] ?? <HashIcon className="size-3.5" />}
+          <FieldTypeIcon fieldType={record.field_type} className="size-3.5" />
           {formatFieldType(record.field_type)}
         </span>
       </td>

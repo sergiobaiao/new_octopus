@@ -1,3 +1,4 @@
+import { cookies, headers } from "next/headers";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   INVITE_TOKEN_INVALID_ERROR_CODE,
@@ -7,13 +8,28 @@ import {
 import { getIsFreshInstance } from "@/lib/instance/service";
 import { verifyInviteToken } from "@/lib/jwt";
 import { createMembership } from "@/lib/membership/service";
+import { capturePostHogEvent } from "@/lib/posthog";
 import { getUserByEmail } from "@/lib/user/service";
+import { AuditLoggingCtx } from "@/lib/utils/action-client/types/context";
 import { auth } from "@/modules/auth/lib/auth";
+import { updateUser } from "@/modules/auth/lib/user";
 import { getInvite, resolveInviteMatch } from "@/modules/auth/signup/lib/invite";
 import { applyIPRateLimit } from "@/modules/core/rate-limit/helpers";
+import { UNKNOWN_DATA } from "@/modules/ee/audit-logs/types/audit-log";
 import { getIsMultiOrgEnabled } from "@/modules/ee/license-check/lib/utils";
 import { subscribeUserToMailingList } from "@/modules/ee/mailing/lib/mailing-subscription";
 import { createUserAction } from "./actions";
+
+vi.mock("next/headers", () => ({
+  cookies: vi.fn(),
+  headers: vi.fn(),
+}));
+
+const requestHeaders = new Headers({ "x-formbricks-client-ip": "203.0.113.7" });
+const mockNextRequestData = () => {
+  vi.mocked(headers).mockResolvedValue(requestHeaders as never);
+  vi.mocked(cookies).mockResolvedValue({ get: () => undefined } as never);
+};
 
 vi.mock("@formbricks/logger", () => ({
   logger: {
@@ -107,10 +123,13 @@ describe("createUserAction — signup verification email callbackURL", () => {
   // so an uninvited sign-up arrives with an empty string rather than undefined.
   const baseInput = { name: "Ada", email: "Ada@Example.com", password: "Password123!", inviteToken: "" };
 
-  const newCtx = () => ({ auditLoggingCtx: { organizationId: "", userId: "" } });
+  const newCtx = (): { auditLoggingCtx: AuditLoggingCtx } => ({
+    auditLoggingCtx: { organizationId: "", userId: "", ipAddress: UNKNOWN_DATA },
+  });
 
   beforeEach(() => {
     vi.resetAllMocks();
+    mockNextRequestData();
     constantsOverrides.IS_FORMBRICKS_CLOUD = false;
     constantsOverrides.SIGNUP_DOMAIN_CHECK_ON_INVITES = false;
     constantsOverrides.SIGNUP_ENABLED = true;
@@ -118,6 +137,9 @@ describe("createUserAction — signup verification email callbackURL", () => {
     vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true } as never);
     vi.mocked(getUserByEmail).mockResolvedValue(createdUser as never);
     vi.mocked(getIsMultiOrgEnabled).mockResolvedValue(false);
+    // Real Better Auth resolves with the user it wrote; the action compares that id against the
+    // persisted row to tell a creation from a duplicate (ENG-2091). Matching ids => "created".
+    vi.mocked(auth.api.signUpEmail).mockResolvedValue({ user: createdUser } as never);
   });
 
   afterEach(() => {
@@ -129,7 +151,20 @@ describe("createUserAction — signup verification email callbackURL", () => {
 
     expect(auth.api.signUpEmail).toHaveBeenCalledWith({
       body: { email: "ada@example.com", password: "Password123!", name: "Ada", callbackURL: undefined },
+      headers: requestHeaders,
     });
+  });
+
+  // The other half of the suppression guard below: a REAL creation must still be audited. Without this,
+  // a bug that set the flag unconditionally would silence every `created` event and no test would notice.
+  test("audits a real creation — the suppression flag is not set on the created path", async () => {
+    const ctx = newCtx();
+
+    const result = await createUserAction({ ctx, parsedInput: baseInput } as never);
+
+    expect(result).toEqual({ success: true });
+    expect(ctx.auditLoggingCtx.suppressEvent).toBeUndefined();
+    expect(ctx.auditLoggingCtx.userId).toBe(createdUser.id);
   });
 
   test("does not point the verification callback at /invite for invite signups (ENG-1527)", async () => {
@@ -157,6 +192,7 @@ describe("createUserAction — signup verification email callbackURL", () => {
         password: "Password123!",
         name: "Ada",
       },
+      headers: requestHeaders,
     });
   });
 
@@ -201,8 +237,35 @@ describe("createUserAction — signup verification email callbackURL", () => {
       ).rejects.toThrow(INVITE_TOKEN_INVALID_ERROR_CODE);
 
       expect(createMembership).not.toHaveBeenCalled();
+      // Rejected before the account is written, so a bad token leaves no orphaned user behind.
+      expect(auth.api.signUpEmail).not.toHaveBeenCalled();
     }
   );
+
+  // ENG-2091: with requireEmailVerification + autoSignIn:false, Better Auth does NOT throw on a
+  // duplicate — it returns 200 with a SYNTHETIC user (generated id, nothing written). This suite used
+  // to mock a rejection, so it asserted a branch that cannot execute in production and stayed green
+  // while the real path ran every side effect against the pre-existing account. The real contract is
+  // pinned against the live framework in signup-duplicate-email.integration.test.ts.
+  test("treats a synthetic-user response as already-existed, without post-creation side effects", async () => {
+    vi.mocked(auth.api.signUpEmail).mockResolvedValue({
+      user: { ...createdUser, id: "synthetic-generated-id" },
+    } as never);
+    vi.mocked(getUserByEmail).mockResolvedValue(createdUser as never);
+
+    const ctx = newCtx();
+    const result = await createUserAction({ ctx, parsedInput: baseInput } as never);
+
+    expect(result).toEqual({ success: true }); // same response as a real signup
+    expect(subscribeUserToMailingList).not.toHaveBeenCalled();
+    expect(updateUser).not.toHaveBeenCalled(); // no locale write on someone else's account
+    expect(capturePostHogEvent).not.toHaveBeenCalled();
+    // No `created` audit attribution for an account that was not created (S1) — and no `created` event
+    // at all: withAuditLogging cannot tell this branch apart from a real creation, so the handler has to
+    // say so explicitly or a false creation record is written.
+    expect(ctx.auditLoggingCtx.userId).toBe("");
+    expect(ctx.auditLoggingCtx.suppressEvent).toBe(true);
+  });
 
   // Regression: signup/page.tsx requires a valid invite once public sign-up is closed, but the action
   // itself enforced nothing — so anyone could POST it and create an account on a closed instance.
@@ -253,7 +316,9 @@ describe("createUserAction — signup verification email callbackURL", () => {
     });
   });
 
-  test("treats a duplicate email as already-existed without post-creation side effects", async () => {
+  // The catch branch is still live: flipping EMAIL_VERIFICATION_DISABLED / autoSignIn makes Better Auth
+  // throw USER_ALREADY_EXISTS instead of answering synthetically, so both signals must classify.
+  test("treats a thrown duplicate as already-existed too", async () => {
     vi.mocked(auth.api.signUpEmail).mockRejectedValue(new Error("user already exists"));
     vi.mocked(getUserByEmail).mockResolvedValue(createdUser as never);
 
@@ -279,10 +344,13 @@ describe("createUserAction — personal email domain block (Cloud)", () => {
     password: "Password123!",
     inviteToken: "",
   };
-  const newCtx = () => ({ auditLoggingCtx: { organizationId: "", userId: "" } });
+  const newCtx = (): { auditLoggingCtx: AuditLoggingCtx } => ({
+    auditLoggingCtx: { organizationId: "", userId: "", ipAddress: UNKNOWN_DATA },
+  });
 
   beforeEach(() => {
     vi.resetAllMocks();
+    mockNextRequestData();
     constantsOverrides.IS_FORMBRICKS_CLOUD = true;
     constantsOverrides.SIGNUP_ENABLED = true;
     vi.mocked(getIsFreshInstance).mockResolvedValue(true);
@@ -290,6 +358,9 @@ describe("createUserAction — personal email domain block (Cloud)", () => {
     vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true } as never);
     vi.mocked(getUserByEmail).mockResolvedValue(createdUser as never);
     vi.mocked(getIsMultiOrgEnabled).mockResolvedValue(false);
+    // Real Better Auth resolves with the user it wrote; the action compares that id against the
+    // persisted row to tell a creation from a duplicate (ENG-2091). Matching ids => "created".
+    vi.mocked(auth.api.signUpEmail).mockResolvedValue({ user: createdUser } as never);
   });
 
   afterEach(() => {

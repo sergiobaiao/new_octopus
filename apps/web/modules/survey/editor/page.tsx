@@ -24,22 +24,24 @@ import { getWorkspaceLanguages } from "@/modules/survey/editor/lib/workspace";
 import { getSurveyFollowUpsPermission } from "@/modules/survey/follow-ups/lib/utils";
 import { getActionClasses } from "@/modules/survey/lib/action-class";
 import { getExternalUrlsPermission } from "@/modules/survey/lib/permission";
-import { getResponseCountBySurveyId } from "@/modules/survey/lib/response";
+import {
+  getFinishedResponseCountBySurveyId,
+  getResponseCountBySurveyId,
+} from "@/modules/survey/lib/response";
 import { getOrganizationBilling, getSurvey } from "@/modules/survey/lib/survey";
+import { getSurveyAuth } from "@/modules/survey/lib/survey-auth";
 import { getWorkspaceWithTeamIds } from "@/modules/survey/lib/workspace";
 import { SURVEY_SCHEDULING_CONFIG } from "@/modules/survey/scheduling/lib/constants";
 import { ErrorComponent } from "@/modules/ui/components/error-component";
-import { getWorkspaceAuth } from "@/modules/workspaces/lib/utils";
 import { SurveyEditor } from "./components/survey-editor";
 import { getUserLocale } from "./lib/user";
 
-export const generateMetadata = async (props: { params: Promise<{ surveyId: string }> }) => {
-  const params = await props.params;
-  const survey = await getSurvey(params.surveyId);
-  return {
-    title: survey?.name ? `${survey?.name} | Editor` : "Editor",
-  };
-};
+// No `generateMetadata` here on purpose: Next only reads metadata from the exports of the route
+// segment's own module, and the /edit route file re-exports the default alone
+// (app/(app)/(survey-editor)/workspaces/[workspaceId]/surveys/[surveyId]/edit/page.tsx). A
+// `generateMetadata` exported from this module would never run, so the editor has no title of its
+// own and no survey name to protect. Wiring one up is a UI change, not part of this fix — see
+// ENG-2372.
 
 export const SurveyEditorPage = async (props: {
   params: Promise<{ workspaceId: string; surveyId: string }>;
@@ -48,20 +50,31 @@ export const SurveyEditorPage = async (props: {
   const searchParams = await props.searchParams;
   const params = await props.params;
 
+  // Gated here rather than by a layout: the editor lives in its own route group
+  // ((survey-editor)) with its own layout, so it does not inherit the guard on
+  // (app)/workspaces/[workspaceId]/surveys/[surveyId]/layout.tsx.
   const { session, isMember, hasReadAccess, currentUserMembership, workspacePermission, workspace } =
-    await getWorkspaceAuth(params.workspaceId);
+    await getSurveyAuth(params.workspaceId, params.surveyId);
 
   const t = await getTranslate();
 
-  const [survey, workspaceWithTeamIds, actionClasses, contactAttributeKeys, responseCount, segments] =
-    await Promise.all([
-      getSurvey(params.surveyId),
-      getWorkspaceWithTeamIds(params.workspaceId),
-      getActionClasses(workspace.id),
-      getContactAttributeKeys(workspace.id),
-      getResponseCountBySurveyId(params.surveyId),
-      getSegments(workspace.id),
-    ]);
+  const [
+    survey,
+    workspaceWithTeamIds,
+    actionClasses,
+    contactAttributeKeys,
+    responseCount,
+    finishedResponseCount,
+    segments,
+  ] = await Promise.all([
+    getSurvey(params.surveyId),
+    getWorkspaceWithTeamIds(params.workspaceId),
+    getActionClasses(workspace.id),
+    getContactAttributeKeys(workspace.id),
+    getResponseCountBySurveyId(params.surveyId),
+    getFinishedResponseCountBySurveyId(params.surveyId),
+    getSegments(workspace.id),
+  ]);
 
   if (!workspaceWithTeamIds) {
     throw new ResourceNotFoundError(t("common.workspace"), null);
@@ -119,6 +132,7 @@ export const SurveyEditorPage = async (props: {
       actionClasses={actionClasses}
       contactAttributeKeys={contactAttributeKeys}
       responseCount={responseCount}
+      finishedResponseCount={finishedResponseCount}
       membershipRole={currentUserMembership.role}
       workspacePermission={workspacePermission}
       colors={SURVEY_BG_COLORS}

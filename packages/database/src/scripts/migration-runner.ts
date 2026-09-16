@@ -23,12 +23,12 @@ export interface MigrationScript {
   type: "data" | "schema";
 }
 
-// MIGRATE_DATABASE_URL is scoped to this migration runner. prisma.config.mjs
+// MIGRATE_DATABASE_URL is scoped to this migration runner. prisma.config.ts
 // always reads DATABASE_URL so normal Prisma CLI commands (generate, format,
 // db push from a developer shell) do not unexpectedly target the elevated-
 // privilege migration database. When this runner spawns `prisma migrate
 // deploy` below, we explicitly inject the resolved URL into the child env so
-// the subprocess's prisma.config.mjs resolves to the same database.
+// the subprocess's prisma.config.ts resolves to the same database.
 const getMigrationDatabaseUrl = (): string | undefined => {
   const migrateDatabaseUrl = process.env.MIGRATE_DATABASE_URL;
   return migrateDatabaseUrl !== undefined && migrateDatabaseUrl.trim() !== ""
@@ -45,10 +45,10 @@ const isBuilt = __filename.split(path.sep).includes("dist");
 const MIGRATIONS_DIR = isBuilt
   ? path.resolve(__dirname, "../migration") // From dist/scripts to dist/migration
   : path.resolve(__dirname, "../../migration"); // From src/scripts to migration
-const PRISMA_MIGRATIONS_DIR = path.resolve(__dirname, "../../migrations");
+const PRISMA_MIGRATIONS_DIR = path.resolve(__dirname, "../../.prisma-migrations");
 const DATABASE_PACKAGE_DIR = isBuilt ? path.resolve(__dirname, "../..") : path.resolve(__dirname, "../..");
 const REPO_ROOT_DIR = path.resolve(DATABASE_PACKAGE_DIR, "../..");
-const PRISMA_CONFIG_PATH = path.join(REPO_ROOT_DIR, "prisma.config.mjs");
+const PRISMA_CONFIG_PATH = path.join(DATABASE_PACKAGE_DIR, "prisma.config.ts");
 const LOCAL_PRISMA_BIN = path.join(REPO_ROOT_DIR, "node_modules", ".bin", "prisma");
 
 // Prefer the workspace-local prisma binary; fall back to PATH for Docker
@@ -186,7 +186,7 @@ const runMigrations = async (migrations: MigrationScript[]): Promise<void> => {
   const startTime = Date.now();
 
   // packages/database/migration is the source of truth (checked in). We copy
-  // each schema migration into packages/database/migrations on demand for
+  // each schema migration into packages/database/.prisma-migrations on demand for
   // `prisma migrate deploy`, then wipe between runs so stale or experimental
   // migrations from a previous local invocation can't influence this one.
   await fs.rm(PRISMA_MIGRATIONS_DIR, { recursive: true, force: true });
@@ -337,6 +337,7 @@ const runDataMigration = async (migration: MigrationScript): Promise<void> => {
     // Record migration failure
     logger.error(error, `Data migration ${migration.name} failed`);
 
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- hasLock is set inside the transaction callback; TS control-flow analysis cannot see assignments across the closure boundary
     if (hasLock) {
       // Mark migration as failed
       await prisma.$queryRaw`
@@ -400,7 +401,7 @@ const runSchemaMigrationBatch = async (
 
     // Run Prisma migrate. Throws when migrate deploy fails.
     // We pin DATABASE_URL on the child env to the same URL the in-process
-    // PrismaClient resolved above. prisma.config.mjs always reads
+    // PrismaClient resolved above. prisma.config.ts always reads
     // env("DATABASE_URL"), so this is how MIGRATE_DATABASE_URL reaches the
     // subprocess without leaking into the parent's env.
     const prismaBin = await resolvePrismaBin();
@@ -470,7 +471,7 @@ const loadMigrations = async (): Promise<MigrationScript[]> => {
       migrations.push({
         type: "schema",
         name: dirName,
-      } as MigrationScript);
+      });
     } else if (hasDataMigration) {
       // Check for duplicates among data migrations
       if (dataMigrationNames.has(migrationName)) {

@@ -47,6 +47,7 @@ export default defineConfig({
         "modules/**/*.ts",
         "lib/**/*.ts",
         "lingodotdev/**/*.ts",
+        "instrumentation-node-config.ts",
         "instrumentation-jobs.ts",
         "proxy.ts",
       ],
@@ -91,6 +92,7 @@ export default defineConfig({
         "**/actions.ts", // Server actions (plural)
         "**/action.ts", // Server actions (singular)
         "lib/env.ts", // Environment configuration
+        "lib/env-client.ts", // Environment configuration (client-safe)
         "**/cache.ts", // Cache files
         "**/cache/**", // Cache directories
 
@@ -126,7 +128,6 @@ export default defineConfig({
         // tests, so they are excluded from the unit-coverage gate below (ENG-1054).
         "modules/auth/lib/auth.ts",
         "modules/auth/lib/auth-client.ts",
-        "modules/auth/lib/secondary-storage.ts",
         "modules/auth/lib/better-auth-email-verification.ts",
         "packages/js-core/src/index.ts", // JS Core index file
 

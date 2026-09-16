@@ -1,6 +1,4 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { logger } from "@formbricks/logger";
-import { buildV3AuditLog, queueV3AuditLog } from "@/app/api/v3/lib/audit";
+import type { McpServer } from "@modelcontextprotocol/server";
 import {
   createV3SurveyResponseFromRawInput,
   deleteV3Survey,
@@ -10,9 +8,10 @@ import {
   validateV3SurveyFromRawInput,
 } from "@/app/api/v3/surveys/lib/operations";
 import { MCP_API_ROUTE } from "@/modules/mcp/constants";
-import { getMcpAuthentication, getMcpRequestId } from "../auth";
+import { getMcpAuthentication, getMcpRequestId, getMcpToolAuthInfo } from "../auth";
 import { responseToMcpToolResult } from "../errors";
-import { guardMcpScopes } from "./guard-scopes";
+import { registerScopedTool } from "./guard-scopes";
+import { runMcpMutation } from "./run-mcp-mutation";
 import {
   type TMcpCreateSurveyInput,
   type TMcpDeleteSurveyInput,
@@ -62,12 +61,13 @@ export function buildListSurveysSearchParams(input: TMcpListSurveysInput): URLSe
 }
 
 export function registerSurveyTools(server: McpServer): void {
-  server.registerTool(
+  registerScopedTool(
+    server,
     "list_surveys",
     {
       title: "List surveys",
       description: "List surveys in a Formbricks workspace using the v3 Surveys API contract.",
-      inputSchema: ZMcpListSurveysInput.shape,
+      inputSchema: ZMcpListSurveysInput,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -75,16 +75,13 @@ export function registerSurveyTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async (input: TMcpListSurveysInput, extra) => {
-      const requestId = getMcpRequestId(extra.authInfo);
-      const scopeError = await guardMcpScopes(extra.authInfo, ["surveys:read"], requestId);
-      if (scopeError) {
-        return scopeError;
-      }
-
+    ["surveys:read"],
+    async (input: TMcpListSurveysInput, ctx) => {
+      const authInfo = getMcpToolAuthInfo(ctx);
+      const requestId = getMcpRequestId(authInfo);
       const response = await listV3Surveys({
         searchParams: buildListSurveysSearchParams(input),
-        authentication: getMcpAuthentication(extra.authInfo),
+        authentication: getMcpAuthentication(authInfo),
         requestId,
         instance: MCP_API_ROUTE,
       });
@@ -93,12 +90,13 @@ export function registerSurveyTools(server: McpServer): void {
     }
   );
 
-  server.registerTool(
+  registerScopedTool(
+    server,
     "get_survey",
     {
       title: "Get survey",
       description: "Get one Formbricks survey using the v3 Surveys API contract.",
-      inputSchema: ZMcpGetSurveyInput.shape,
+      inputSchema: ZMcpGetSurveyInput,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -106,17 +104,14 @@ export function registerSurveyTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async (input: TMcpGetSurveyInput, extra) => {
-      const requestId = getMcpRequestId(extra.authInfo);
-      const scopeError = await guardMcpScopes(extra.authInfo, ["surveys:read"], requestId);
-      if (scopeError) {
-        return scopeError;
-      }
-
+    ["surveys:read"],
+    async (input: TMcpGetSurveyInput, ctx) => {
+      const authInfo = getMcpToolAuthInfo(ctx);
+      const requestId = getMcpRequestId(authInfo);
       const response = await getV3Survey({
         surveyId: input.surveyId,
         lang: input.lang,
-        authentication: getMcpAuthentication(extra.authInfo),
+        authentication: getMcpAuthentication(authInfo),
         requestId,
         instance: MCP_API_ROUTE,
       });
@@ -125,12 +120,13 @@ export function registerSurveyTools(server: McpServer): void {
     }
   );
 
-  server.registerTool(
+  registerScopedTool(
+    server,
     "create_survey",
     {
       title: "Create survey",
       description: "Create a Formbricks link survey using the v3 Surveys API contract.",
-      inputSchema: ZMcpCreateSurveyInput.shape,
+      inputSchema: ZMcpCreateSurveyInput,
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -138,53 +134,29 @@ export function registerSurveyTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async (input: TMcpCreateSurveyInput, extra) => {
-      const requestId = getMcpRequestId(extra.authInfo);
-      const scopeError = await guardMcpScopes(extra.authInfo, ["surveys:write"], requestId);
-      if (scopeError) {
-        return scopeError;
-      }
-
-      const authentication = getMcpAuthentication(extra.authInfo);
-      const log = logger.withContext({ requestId, workspaceId: input.workspaceId });
-      const auditLog = buildV3AuditLog(authentication, "created", "survey", MCP_API_ROUTE);
-
-      try {
-        const response = await createV3SurveyResponseFromRawInput({
-          body: input,
-          authentication,
-          requestId,
-          instance: MCP_API_ROUTE,
-          auditLog,
-        });
-
-        if (auditLog) {
-          if (response.ok) {
-            auditLog.status = "success";
-          } else {
-            auditLog.eventId = requestId;
-          }
-        }
-
-        await queueV3AuditLog(auditLog, requestId, log);
-        return await responseToMcpToolResult(response, requestId);
-      } catch (error) {
-        if (auditLog) {
-          auditLog.eventId = requestId;
-          await queueV3AuditLog(auditLog, requestId, log);
-        }
-
-        throw error;
-      }
-    }
+    ["surveys:write"],
+    async (input: TMcpCreateSurveyInput, ctx) =>
+      runMcpMutation(
+        ctx,
+        { action: "created", resource: "survey", logContext: { workspaceId: input.workspaceId } },
+        ({ authentication, requestId, auditLog }) =>
+          createV3SurveyResponseFromRawInput({
+            body: input,
+            authentication,
+            requestId,
+            instance: MCP_API_ROUTE,
+            auditLog,
+          })
+      )
   );
 
-  server.registerTool(
+  registerScopedTool(
+    server,
     "validate_survey",
     {
       title: "Validate survey",
       description: "Validate a v3 survey create or patch payload without writing survey changes.",
-      inputSchema: ZMcpValidateSurveyInput.shape,
+      inputSchema: ZMcpValidateSurveyInput,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -192,19 +164,16 @@ export function registerSurveyTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async (input: TMcpValidateSurveyInput, extra) => {
-      const requestId = getMcpRequestId(extra.authInfo);
+    ["surveys:read"],
+    async (input: TMcpValidateSurveyInput, ctx) => {
+      const authInfo = getMcpToolAuthInfo(ctx);
+      const requestId = getMcpRequestId(authInfo);
       // validate_survey never persists changes (readOnlyHint) — a dry-run validation of a create or
-      // patch payload only needs read access. The actual write permission is enforced by the v3 layer
-      // when create_survey / patch_survey run.
-      const scopeError = await guardMcpScopes(extra.authInfo, ["surveys:read"], requestId);
-      if (scopeError) {
-        return scopeError;
-      }
-
+      // patch payload only needs read access, and validateV3Survey gates at "read" to match. The
+      // actual write permission is enforced when create_survey / patch_survey run.
       const response = await validateV3SurveyFromRawInput({
         body: input,
-        authentication: getMcpAuthentication(extra.authInfo),
+        authentication: getMcpAuthentication(authInfo),
         requestId,
         instance: MCP_API_ROUTE,
       });
@@ -213,7 +182,8 @@ export function registerSurveyTools(server: McpServer): void {
     }
   );
 
-  server.registerTool(
+  registerScopedTool(
+    server,
     "patch_survey",
     {
       title: "Patch survey",
@@ -221,7 +191,7 @@ export function registerSurveyTools(server: McpServer): void {
         "Update a Formbricks survey using the v3 Surveys API patch contract.",
         "Provided top-level arrays and objects replace that whole subtree.",
       ].join(" "),
-      inputSchema: ZMcpPatchSurveyInput.shape,
+      inputSchema: ZMcpPatchSurveyInput,
       annotations: {
         readOnlyHint: false,
         destructiveHint: true,
@@ -229,54 +199,30 @@ export function registerSurveyTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async (input: TMcpPatchSurveyInput, extra) => {
-      const requestId = getMcpRequestId(extra.authInfo);
-      const scopeError = await guardMcpScopes(extra.authInfo, ["surveys:write"], requestId);
-      if (scopeError) {
-        return scopeError;
-      }
-
-      const authentication = getMcpAuthentication(extra.authInfo);
-      const log = logger.withContext({ requestId, surveyId: input.surveyId });
-      const auditLog = buildV3AuditLog(authentication, "updated", "survey", MCP_API_ROUTE);
-
-      try {
-        const response = await patchV3SurveyResponse({
-          surveyId: input.surveyId,
-          body: input.data,
-          authentication,
-          requestId,
-          instance: MCP_API_ROUTE,
-          auditLog,
-        });
-
-        if (auditLog) {
-          if (response.ok) {
-            auditLog.status = "success";
-          } else {
-            auditLog.eventId = requestId;
-          }
-        }
-
-        await queueV3AuditLog(auditLog, requestId, log);
-        return await responseToMcpToolResult(response, requestId);
-      } catch (error) {
-        if (auditLog) {
-          auditLog.eventId = requestId;
-          await queueV3AuditLog(auditLog, requestId, log);
-        }
-
-        throw error;
-      }
-    }
+    ["surveys:write"],
+    async (input: TMcpPatchSurveyInput, ctx) =>
+      runMcpMutation(
+        ctx,
+        { action: "updated", resource: "survey", logContext: { surveyId: input.surveyId } },
+        ({ authentication, requestId, auditLog }) =>
+          patchV3SurveyResponse({
+            surveyId: input.surveyId,
+            body: input.data,
+            authentication,
+            requestId,
+            instance: MCP_API_ROUTE,
+            auditLog,
+          })
+      )
   );
 
-  server.registerTool(
+  registerScopedTool(
+    server,
     "delete_survey",
     {
       title: "Delete survey",
       description: "Delete a Formbricks survey using the v3 Surveys API contract.",
-      inputSchema: ZMcpDeleteSurveyInput.shape,
+      inputSchema: ZMcpDeleteSurveyInput,
       annotations: {
         readOnlyHint: false,
         destructiveHint: true,
@@ -284,44 +230,19 @@ export function registerSurveyTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async (input: TMcpDeleteSurveyInput, extra) => {
-      const requestId = getMcpRequestId(extra.authInfo);
-      const scopeError = await guardMcpScopes(extra.authInfo, ["surveys:write"], requestId);
-      if (scopeError) {
-        return scopeError;
-      }
-
-      const authentication = getMcpAuthentication(extra.authInfo);
-      const log = logger.withContext({ requestId, surveyId: input.surveyId });
-      const auditLog = buildV3AuditLog(authentication, "deleted", "survey", MCP_API_ROUTE);
-
-      try {
-        const response = await deleteV3Survey({
-          surveyId: input.surveyId,
-          authentication,
-          requestId,
-          instance: MCP_API_ROUTE,
-          auditLog,
-        });
-
-        if (auditLog) {
-          if (response.ok) {
-            auditLog.status = "success";
-          } else {
-            auditLog.eventId = requestId;
-          }
-        }
-
-        await queueV3AuditLog(auditLog, requestId, log);
-        return await responseToMcpToolResult(response, requestId);
-      } catch (error) {
-        if (auditLog) {
-          auditLog.eventId = requestId;
-          await queueV3AuditLog(auditLog, requestId, log);
-        }
-
-        throw error;
-      }
-    }
+    ["surveys:write"],
+    async (input: TMcpDeleteSurveyInput, ctx) =>
+      runMcpMutation(
+        ctx,
+        { action: "deleted", resource: "survey", logContext: { surveyId: input.surveyId } },
+        ({ authentication, requestId, auditLog }) =>
+          deleteV3Survey({
+            surveyId: input.surveyId,
+            authentication,
+            requestId,
+            instance: MCP_API_ROUTE,
+            auditLog,
+          })
+      )
   );
 }

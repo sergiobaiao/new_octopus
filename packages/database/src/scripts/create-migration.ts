@@ -13,7 +13,7 @@ const __dirname = path.dirname(__filename);
 const execFileAsync = promisify(execFile);
 const DATABASE_PACKAGE_DIR = path.resolve(__dirname, "../..");
 const REPO_ROOT_DIR = path.resolve(DATABASE_PACKAGE_DIR, "../..");
-const PRISMA_CONFIG_PATH = path.join(REPO_ROOT_DIR, "prisma.config.mjs");
+const PRISMA_CONFIG_PATH = path.join(DATABASE_PACKAGE_DIR, "prisma.config.ts");
 const LOCAL_PRISMA_BIN = path.join(REPO_ROOT_DIR, "node_modules", ".bin", "prisma");
 
 const resolvePrismaBin = async (): Promise<string> => {
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
   const migrationName = await promptForMigrationName();
   const migrationNameUnderscored = migrationName.replace(/\s+/g, "_");
 
-  const migrationsDir = path.resolve(__dirname, "../../migrations");
+  const migrationsDir = path.resolve(__dirname, "../../.prisma-migrations");
   const customMigrationsDir = path.resolve(__dirname, "../../migration");
 
   // Check if migration already exists in custom migrations

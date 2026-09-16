@@ -34,6 +34,7 @@ import {
   SheetTitle,
 } from "@/modules/ui/components/sheet";
 import { Switch } from "@/modules/ui/components/switch";
+import { Textarea } from "@/modules/ui/components/textarea";
 import { deleteFeedbackRecordAction, retrieveFeedbackRecordAction } from "../actions";
 import { FIELD_TYPE_OPTIONS, type TFeedbackRecordFormValues } from "../lib/types";
 import {
@@ -49,7 +50,8 @@ interface FeedbackRecordFormDrawerProps {
   onOpenChange: (open: boolean) => void;
   workspaceId: string;
   directories: { id: string; name: string }[];
-  canWrite: boolean;
+  /** Owners/managers only — records are directory-level, not workspace-level (ENG-1770). */
+  canDelete: boolean;
   recordId?: string;
   onSuccess: () => Promise<void> | void;
 }
@@ -59,7 +61,7 @@ export const FeedbackRecordFormDrawer = ({
   onOpenChange,
   workspaceId,
   directories,
-  canWrite,
+  canDelete,
   recordId,
   onSuccess,
 }: Readonly<FeedbackRecordFormDrawerProps>) => {
@@ -124,7 +126,7 @@ export const FeedbackRecordFormDrawer = ({
   }, [form, onOpenChange, open, recordId, t, workspaceId]);
 
   const handleDelete = async () => {
-    if (!recordId) return;
+    if (!recordId || !canDelete) return;
     setIsDeleting(true);
     try {
       const result = await deleteFeedbackRecordAction({ workspaceId, recordId });
@@ -378,29 +380,35 @@ export const FeedbackRecordFormDrawer = ({
                   )}
                 />
 
-                <div className="grid grid-cols-2 gap-3">
-                  <FormField
-                    control={form.control}
-                    name="value_text"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t("workspace.unify.value_text")}</FormLabel>
-                        <FormControl>
-                          <Input {...field} value={field.value ?? ""} disabled />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
+                {/* Full width, multi-line: open-text answers are the longest values on the record and
+                    have to stay readable without horizontal scrolling. */}
+                <FormField
+                  control={form.control}
+                  name="value_text"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("workspace.unify.value_text")}</FormLabel>
+                      <FormControl>
+                        <Textarea
+                          {...field}
+                          value={field.value ?? ""}
+                          rows={5}
+                          className="resize-y"
+                          disabled
+                        />
+                      </FormControl>
+                    </FormItem>
+                  )}
+                />
 
-                  {/* ENG-1673: read-only — the stable option identity is managed by ingestion/backfill;
-                      hand-editing it would desync the record from its source option. Always shown so the
-                      canonical Value ID is visible even when the record has none. */}
-                  <div className="space-y-2">
-                    <Label htmlFor="value_id" className="block text-slate-800">
-                      {t("workspace.unify.value_id")}
-                    </Label>
-                    <Input id="value_id" value={record.value_id ?? ""} disabled readOnly />
-                  </div>
+                {/* ENG-1673: read-only — the stable option identity is managed by ingestion/backfill;
+                    hand-editing it would desync the record from its source option. Always shown so the
+                    canonical Value ID is visible even when the record has none. */}
+                <div className="space-y-2">
+                  <Label htmlFor="value_id" className="block text-slate-800">
+                    {t("workspace.unify.value_id")}
+                  </Label>
+                  <Input id="value_id" value={record.value_id ?? ""} disabled readOnly />
                 </div>
 
                 {translatedText && (
@@ -552,7 +560,7 @@ export const FeedbackRecordFormDrawer = ({
           )}
 
           <SheetFooter className="mt-2 sm:justify-between">
-            {canWrite && recordId ? (
+            {canDelete && recordId ? (
               <Button
                 variant="destructive"
                 onClick={() => setIsDeleteDialogOpen(true)}

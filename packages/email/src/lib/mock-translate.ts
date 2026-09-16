@@ -41,28 +41,27 @@ const translations: Record<TranslationKey, TranslationValue> = {
   "emails.forgot_password_email_text":
     "You have requested a link to change your password. You can do this by clicking the link below:",
   "emails.hidden_field": "Hidden field",
-  "emails.invite_accepted_email_heading": "Hey",
+  "emails.imprint": "Imprint",
+  "emails.invite_accepted_email_heading": "Hey {inviterName}",
   "emails.invite_accepted_email_subject": "You've got a new organization member!",
-  "emails.invite_accepted_email_text_par1": "Just letting you know that",
-  "emails.invite_accepted_email_text_par2": "accepted your invitation. Have fun collaborating!",
+  "emails.invite_accepted_email_text":
+    "Just letting you know that {inviteeName} accepted your invitation. Have fun collaborating!",
   "emails.invite_email_button_label": "Join organization",
-  "emails.invite_email_heading": "Hey",
-  "emails.invite_email_text_par1": "Your colleague",
-  "emails.invite_email_text_par2":
-    "invited you to join them at Formbricks. To accept the invitation, please click the link below:",
+  "emails.invite_email_heading": "Hey {inviteeName}",
+  "emails.invite_email_text":
+    "Your colleague {inviterName} invited you to join them at Formbricks. To accept the invitation, please click the link below:",
   "emails.invite_member_email_subject": "You're invited to collaborate on Formbricks!",
   "emails.new_email_verification_text": "To verify your new email address, please click the button below:",
   "emails.number_variable": "Number variable",
   "emails.password_changed_email_heading": "Password changed",
   "emails.password_changed_email_text": "Your password has been changed successfully.",
   "emails.password_reset_notify_email_subject": "Your Formbricks password has been changed",
+  "emails.privacy_policy": "Privacy Policy",
   "emails.reject": "Reject",
   "emails.render_email_response_value_file_upload_response_link_not_included":
     "Link to uploaded file is not included for data privacy reasons",
   "emails.response_data": "Response data",
   "emails.response_finished_email_subject": "A response for {surveyName} was completed ✅",
-  "emails.response_finished_email_subject_with_email":
-    "{personEmail} just completed your {surveyName} survey ✅",
   "emails.schedule_your_meeting": "Schedule your meeting",
   "emails.select_a_date": "Select a date",
   "emails.survey_response_finished_email_congrats":

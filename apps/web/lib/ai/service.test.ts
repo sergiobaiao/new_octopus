@@ -1,9 +1,5 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import {
-  OperationNotAllowedError,
-  ResourceNotFoundError,
-  TooManyRequestsError,
-} from "@formbricks/types/errors";
+import { OperationNotAllowedError, ResourceNotFoundError } from "@formbricks/types/errors";
 import {
   assertOrganizationAIConfigured,
   generateOrganizationAIObject,
@@ -21,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   getOrganization: vi.fn(),
   getIsAISmartToolsEnabled: vi.fn(),
   loggerError: vi.fn(),
+  wrapAiModelWithTracing: vi.fn(),
 }));
 
 vi.mock("server-only", () => ({}));
@@ -71,6 +68,10 @@ vi.mock("@/lib/organization/service", () => ({
 
 vi.mock("@/modules/ee/license-check/lib/utils", () => ({
   getIsAISmartToolsEnabled: mocks.getIsAISmartToolsEnabled,
+}));
+
+vi.mock("@/lib/posthog/ai-tracing", () => ({
+  wrapAiModelWithTracing: mocks.wrapAiModelWithTracing,
 }));
 
 describe("AI organization service", () => {
@@ -144,8 +145,30 @@ describe("AI organization service", () => {
         AI_PROVIDER: "google",
         AI_MODEL: "gemini-2.5-flash",
         AI_GOOGLE_CLOUD_PROJECT: "google-cloud-project",
-      })
+      }),
+      undefined
     );
+  });
+
+  test("wraps the model with PostHog tracing when aiTracing is provided (text)", async () => {
+    mocks.generateText.mockResolvedValueOnce({ text: "Translated text" });
+
+    await generateOrganizationAIText({
+      organizationId: "org_1",
+      aiTracing: { distinctId: "user_1", feature: "ai_survey_generation" },
+      prompt: "Translate this survey",
+    });
+
+    const wrapModel = mocks.generateText.mock.calls[0][2];
+    expect(wrapModel).toBeInstanceOf(Function);
+
+    const rawModel = { providerName: "google" };
+    wrapModel(rawModel);
+    expect(mocks.wrapAiModelWithTracing).toHaveBeenCalledWith(rawModel, {
+      organizationId: "org_1",
+      distinctId: "user_1",
+      feature: "ai_survey_generation",
+    });
   });
 
   test("generates organization AI objects with the configured package abstraction", async () => {
@@ -169,8 +192,32 @@ describe("AI organization service", () => {
         AI_PROVIDER: "google",
         AI_MODEL: "gemini-2.5-flash",
         AI_GOOGLE_CLOUD_PROJECT: "google-cloud-project",
-      })
+      }),
+      undefined
     );
+  });
+
+  test("wraps the model with PostHog tracing when aiTracing is provided (object)", async () => {
+    mocks.generateObject.mockResolvedValueOnce({ object: { name: "Generated survey" } });
+
+    await generateOrganizationAIObject({
+      organizationId: "org_1",
+      aiTracing: { distinctId: "user_1", feature: "ai_chart_query", workspaceId: "ws_1" },
+      schema: { type: "object" },
+      prompt: "Generate a survey",
+    } as any);
+
+    const wrapModel = mocks.generateObject.mock.calls[0][2];
+    expect(wrapModel).toBeInstanceOf(Function);
+
+    const rawModel = { providerName: "google" };
+    wrapModel(rawModel);
+    expect(mocks.wrapAiModelWithTracing).toHaveBeenCalledWith(rawModel, {
+      organizationId: "org_1",
+      distinctId: "user_1",
+      feature: "ai_chart_query",
+      workspaceId: "ws_1",
+    });
   });
 
   test("logs and rethrows generation errors", async () => {

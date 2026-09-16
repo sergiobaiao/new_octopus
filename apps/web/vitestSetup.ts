@@ -1,5 +1,6 @@
 // mock these globally used functions
 import "@testing-library/jest-dom/vitest";
+import { cleanup } from "@testing-library/react";
 import ResizeObserver from "resize-observer-polyfill";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ValidationError } from "@formbricks/types/errors";
@@ -91,6 +92,22 @@ vi.mock("@formbricks/database/prisma", async () => {
     ...actual,
     Prisma: actual.Prisma,
     PrismaClient: class {
+      // Better Auth 1.7 seeds its `oauthResource` rows when the oauthProvider plugin initialises
+      // (ENG-2343), which happens on any import of modules/auth/lib/auth.ts. Against this stub the
+      // adapter would otherwise throw `Model oauthResource does not exist in the database` as an
+      // unhandled error in every such test file — noise that would sit in the suite forever and
+      // mask a real failure later. A read that returns nothing lets seeding complete quietly;
+      // nothing here asserts on it, and the real behaviour is covered against a real database.
+      oauthResource = {
+        findMany: () => Promise.resolve([]),
+        findFirst: () => Promise.resolve(null),
+        findUnique: () => Promise.resolve(null),
+        create: (args: { data: unknown }) => Promise.resolve(args.data),
+        createMany: () => Promise.resolve({ count: 0 }),
+        update: (args: { data: unknown }) => Promise.resolve(args.data),
+        upsert: (args: { create: unknown }) => Promise.resolve(args.create),
+      };
+
       $connect() {
         return Promise.resolve();
       }
@@ -161,6 +178,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // React Testing Library normally registers this itself, but it looks for a *global* `afterEach`
+  // (`typeof afterEach === 'function'`) and this project runs with vitest `globals: false` — so its
+  // auto-cleanup never installs. Without it, every render()/renderHook() stays mounted for the rest
+  // of the file: components from earlier tests keep firing timers, keep responding to window events,
+  // and keep calling shared module mocks, so a later test's assertions can count work it never did.
+  // Called here rather than as its own afterEach so the order against clearAllMocks is explicit:
+  // unmount first, while mock implementations are still in place for any cleanup effects.
+  cleanup();
   vi.clearAllMocks();
 });
 

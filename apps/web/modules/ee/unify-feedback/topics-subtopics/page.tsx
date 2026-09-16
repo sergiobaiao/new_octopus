@@ -52,7 +52,7 @@ export const UnifyTopicsSubtopicsPage = async (
                 text: t("common.learn_more"),
                 href: IS_FORMBRICKS_CLOUD
                   ? `/organizations/${organization.id}/settings/billing`
-                  : "https://formbricks.com/learn-more-self-hosting-license",
+                  : "https://formbricks.com/learn-more-self-hosting-license?utm_source=formbricks-app&utm_medium=webapp&utm_campaign=ee_lock_unify_topics",
               },
             ]}
           />
@@ -79,7 +79,10 @@ export const UnifyTopicsSubtopicsPage = async (
   }
 
   const directoryMap = Object.fromEntries(directories.map((directory) => [directory.id, directory.name]));
-  const canWrite = isOwner || isManager || hasReadWriteAccess || hasManageAccess;
+  // A directory's taxonomy is one tree shared by every workspace the directory is assigned to, and it
+  // carries no workspace of its own — so changing it (generate, rename, remove) is an org-level act
+  // and stays with owners and managers (ENG-1770). Everyone else gets the read-only view.
+  const canWrite = isOwner || isManager;
 
   return (
     <TopicsSubtopicsPage workspaceId={params.workspaceId} directoryMap={directoryMap} canWrite={canWrite} />
