@@ -7,6 +7,8 @@ import { OperationNotAllowedError } from "@formbricks/types/errors";
 import { capturePostHogEvent } from "@/lib/posthog";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
 import { AuthenticatedActionClientCtx } from "@/lib/utils/action-client/types/context";
+import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
 import { executeTenantScopedQuery } from "@/modules/ee/analysis/api/lib/cube-client";
 import { generateAIChartQuery } from "@/modules/ee/analysis/charts/lib/ai-chart-query.server";
 import {
@@ -17,7 +19,8 @@ import {
   getCharts,
   updateChart,
 } from "@/modules/ee/analysis/charts/lib/charts";
-import { resolveOptionGrouping } from "@/modules/ee/analysis/charts/lib/option-grouping";
+import { dropEmptyMeasureRows } from "@/modules/ee/analysis/charts/lib/empty-measure-rows";
+import { pruneOptionLabels, resolveOptionGrouping } from "@/modules/ee/analysis/charts/lib/option-grouping";
 import { checkFeedbackDirectoryAccess, checkWorkspaceAccess } from "@/modules/ee/analysis/lib/access";
 import {
   type TDimensionValue,
@@ -55,6 +58,8 @@ export const createChartAction = authenticatedActionClient.inputSchema(ZCreateCh
       ctx: AuthenticatedActionClientCtx;
       parsedInput: z.infer<typeof ZCreateChartAction>;
     }) => {
+      ctx.auditLoggingCtx.workspaceId = parsedInput.workspaceId;
+      await applyRateLimit(rateLimitConfigs.actions.chartCreation, ctx.user.id);
       const { organizationId, workspaceId } = await checkWorkspaceAccess(
         ctx.user.id,
         parsedInput.workspaceId,
@@ -64,9 +69,9 @@ export const createChartAction = authenticatedActionClient.inputSchema(ZCreateCh
 
       await checkFeedbackDirectoryAccess({
         feedbackDirectoryId: parsedInput.chartInput.feedbackDirectoryId,
-        organizationId,
         workspaceId,
         userId: ctx.user.id,
+        minPermission: "readWrite",
         source: "charts.createChartAction",
       });
 
@@ -278,9 +283,9 @@ export const executeQueryAction = authenticatedActionClient
 
       const { feedbackDirectoryId } = await checkFeedbackDirectoryAccess({
         feedbackDirectoryId: parsedInput.feedbackDirectoryId,
-        organizationId,
         workspaceId,
         userId: ctx.user.id,
+        minPermission: "read",
         source: "charts.executeQueryAction",
       });
 
@@ -295,9 +300,12 @@ export const executeQueryAction = authenticatedActionClient
         source: "charts.executeQueryAction",
       });
 
-      const rows = Array.isArray(rawRows) ? rawRows : [];
+      // Cube emits a row per group present in the source, including groups no selected measure can
+      // answer for — they render as blank bars and empty Chart Data rows (ENG-3150).
+      const rows = dropEmptyMeasureRows(Array.isArray(rawRows) ? rawRows : [], rewrittenQuery);
+      const usedLabels = pruneOptionLabels(rewrittenQuery, rows, optionLabels);
 
-      return { rows, ...(optionLabels ? { optionLabels } : {}), effectiveQuery: rewrittenQuery };
+      return { rows, ...(usedLabels ? { optionLabels: usedLabels } : {}), effectiveQuery: rewrittenQuery };
     }
   );
 
@@ -327,15 +335,16 @@ export const generateAIChartAction = authenticatedActionClient
 
       const { feedbackDirectoryId } = await checkFeedbackDirectoryAccess({
         feedbackDirectoryId: parsedInput.feedbackDirectoryId,
-        organizationId,
         workspaceId,
         userId: ctx.user.id,
+        minPermission: "read",
         source: "charts.generateAIChartAction",
       });
 
       const { chartType, query, name } = await generateAIChartQuery({
         organizationId,
         workspaceId,
+        feedbackDirectoryId,
         userId: ctx.user.id,
         prompt: parsedInput.prompt,
       });
@@ -400,9 +409,9 @@ export const getDimensionValuesAction = authenticatedActionClient
 
       const { feedbackDirectoryId } = await checkFeedbackDirectoryAccess({
         feedbackDirectoryId: parsedInput.feedbackDirectoryId,
-        organizationId,
         workspaceId,
         userId: ctx.user.id,
+        minPermission: "read",
         source: "charts.getDimensionValuesAction",
       });
 

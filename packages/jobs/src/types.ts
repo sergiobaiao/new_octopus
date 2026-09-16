@@ -60,6 +60,14 @@ export const ZSurveyArchivePurgeJobData = ZGlobalScopeJobData;
 
 export type TSurveyArchivePurgeJobData = TGlobalScopeJobData;
 
+export const ZUsageTelemetryJobData = ZGlobalScopeJobData;
+
+export type TUsageTelemetryJobData = TGlobalScopeJobData;
+
+/** Daily PostHog snapshot of workflow usage per organization (ENG-2851). */
+export const ZWorkflowsUsageSnapshotJobData = ZGlobalScopeJobData;
+export type TWorkflowsUsageSnapshotJobData = TGlobalScopeJobData;
+
 export const ZWorkflowRunJobData = z.object({
   workflowRunId: z.cuid2(),
   workflowId: z.cuid2(),

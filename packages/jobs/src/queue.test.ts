@@ -340,9 +340,13 @@ describe("@formbricks/jobs queue helpers", () => {
   // These ids address schedules that already exist in production Redis. Changing one orphans the live
   // schedule instead of updating it, so they are pinned as literals here rather than derived.
   test.each([
+    ["authzedProjectionDelivery", "authzed-projection.deliver:global:authzed-projection-delivery"],
+    ["authzedReconciliationAudit", "authzed-reconciliation.audit:global:authzed-reconciliation-audit"],
     ["surveyArchivePurge", "survey-archive-purge.process:global:daily-survey-archive-purge"],
     ["surveyScheduling", "survey-scheduling.reconcile:global:daily-survey-scheduling"],
+    ["usageTelemetry", "usage-telemetry.process:global:daily-usage-telemetry"],
     ["workflowRunReconcile", "workflow-run.reconcile:global:workflow-run-reconcile"],
+    ["workflowsUsageSnapshot", "workflows-usage.snapshot:global:daily-workflows-usage-snapshot"],
   ] as const)("keeps the %s scheduler id stable", async (key, expectedSchedulerId) => {
     mockQueueUpsertJobScheduler.mockResolvedValue({
       id: "job-id-parity",

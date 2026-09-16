@@ -12,6 +12,7 @@ import {
 } from "@/app/api/v3/lib/response";
 import type { TV3AuditLog, TV3Authentication } from "@/app/api/v3/lib/types";
 import { getFeedbackDirectoriesByWorkspaceId } from "@/modules/ee/feedback-directory/lib/feedback-directory";
+import type { TTeamPermission } from "@/modules/ee/teams/workspace-teams/types/team";
 import {
   countFeedbackRecords,
   createFeedbackRecord,
@@ -77,6 +78,11 @@ import {
  */
 
 const CACHE = "private, no-store" as const;
+
+const getMutationAssignmentPermission = (
+  authentication: TV3Authentication,
+  apiKeyPermission: Extract<TTeamPermission, "readWrite" | "manage">
+): TTeamPermission => (authentication && "apiKeyId" in authentication ? apiKeyPermission : "read");
 
 /**
  * Build the Hub create payload. This field list *is* the allowlist — never a spread of the input — so
@@ -332,7 +338,7 @@ export async function listV3FeedbackDatasets({
       { requestId, cache: CACHE }
     );
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackDatasets.list");
   }
 }
 
@@ -429,7 +435,7 @@ export async function listV3FeedbackRecords({
       { requestId, cache: CACHE }
     );
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.list");
   }
 }
 
@@ -490,7 +496,7 @@ export async function countV3FeedbackRecords({
       { requestId, cache: CACHE }
     );
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.count");
   }
 }
 
@@ -544,7 +550,7 @@ export async function getV3FeedbackRecord({
 
     return successResponse(serializeV3FeedbackRecord(owned.record), { requestId, cache: CACHE });
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.get");
   }
 }
 
@@ -614,7 +620,7 @@ export async function createV3FeedbackRecord({
 
     return successResponse(serialized, { requestId, status: 201, cache: CACHE });
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.create");
   }
 }
 
@@ -739,7 +745,7 @@ export async function createV3FeedbackRecords({
       { requestId, cache: CACHE }
     );
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.createBatch");
   }
 }
 
@@ -790,7 +796,7 @@ export async function updateV3FeedbackRecord({
       authentication,
       workspaceId,
       datasetId,
-      minPermission: "readWrite",
+      minPermission: getMutationAssignmentPermission(authentication, "readWrite"),
       requestId,
       instance,
     });
@@ -878,7 +884,7 @@ export async function updateV3FeedbackRecord({
 
     return successResponse(serialized, { requestId, cache: CACHE });
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.update");
   }
 }
 
@@ -917,7 +923,7 @@ export async function deleteV3FeedbackRecord({
       datasetId,
       // `manage`, matching the gateway's DELETE route and `methodPermissionMap` everywhere else in the
       // API. Both delete paths had to move or the bar would only apply to one of them (ENG-2083).
-      minPermission: "manage",
+      minPermission: getMutationAssignmentPermission(authentication, "manage"),
       requestId,
       instance,
     });
@@ -976,7 +982,7 @@ export async function deleteV3FeedbackRecord({
     // 204, as the v3 delete convention has it (see `deleteV3Survey`).
     return noContentResponse({ requestId });
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.delete");
   }
 }
 
@@ -1059,7 +1065,7 @@ export async function searchV3FeedbackRecords({
 
     return similarityMatchesResponse(result.data, resolution, filters.data.minScore, requestId);
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.search");
   }
 }
 
@@ -1158,6 +1164,6 @@ export async function findSimilarV3FeedbackRecords({
 
     return similarityMatchesResponse(result.data, resolution, filters.data.minScore, requestId);
   } catch (err) {
-    return handleUnexpectedError(err, log, requestId, instance);
+    return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.findSimilar");
   }
 }

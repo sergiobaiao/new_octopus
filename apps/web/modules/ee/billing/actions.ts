@@ -4,12 +4,14 @@ import { z } from "zod";
 import { ZId } from "@formbricks/types/common";
 import { OperationNotAllowedError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { ZCloudBillingInterval } from "@formbricks/types/organizations";
+import { assertCan } from "@/lib/authorization";
 import { WEBAPP_URL } from "@/lib/constants";
 import { getOrganization } from "@/lib/organization/service";
 import { capturePostHogEvent } from "@/lib/posthog";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
-import { checkAuthorizationUpdated } from "@/lib/utils/action-client/action-client-middleware";
 import { CLOUD_STRIPE_FEATURE_LOOKUP_KEYS } from "@/modules/billing/lib/stripe-catalog";
+import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
 import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
 import { createCustomerPortalSession } from "@/modules/ee/billing/api/lib/create-customer-portal-session";
 import { createSetupCheckoutSession } from "@/modules/ee/billing/api/lib/create-setup-checkout-session";
@@ -20,6 +22,7 @@ import {
   createProTrialSubscription,
   ensureCloudStripeSetupForOrganization,
   ensureStripeCustomerForOrganization,
+  getProTrialDays,
   previewImmediateUpgradeCharge,
   reconcileCloudStripeSubscriptionsForOrganization,
   setOrganizationPaymentAttemptError,
@@ -37,15 +40,9 @@ export const manageSubscriptionAction = authenticatedActionClient
   .action(
     withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
       const { organizationId } = parsedInput;
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager", "billing"],
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+        type: "organization",
+        id: organizationId,
       });
 
       const organization = await getOrganization(organizationId);
@@ -78,15 +75,9 @@ export const createPlanCheckoutAction = authenticatedActionClient
   .action(
     withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
       const { organizationId } = parsedInput;
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager", "billing"],
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+        type: "organization",
+        id: organizationId,
       });
 
       const organization = await getOrganization(organizationId);
@@ -131,15 +122,9 @@ export const getUpgradeChargePreviewAction = authenticatedActionClient
   .inputSchema(ZGetUpgradeChargePreviewAction)
   .action(async ({ ctx, parsedInput }) => {
     const { organizationId } = parsedInput;
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager", "billing"],
-        },
-      ],
+    await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+      type: "organization",
+      id: organizationId,
     });
 
     const organization = await getOrganization(organizationId);
@@ -166,15 +151,9 @@ const ZRetryStripeSetupAction = z.object({
 export const retryStripeSetupAction = authenticatedActionClient
   .inputSchema(ZRetryStripeSetupAction)
   .action(async ({ ctx, parsedInput }) => {
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId: parsedInput.organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager", "billing"],
-        },
-      ],
+    await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+      type: "organization",
+      id: parsedInput.organizationId,
     });
 
     await ensureCloudStripeSetupForOrganization(parsedInput.organizationId);
@@ -192,15 +171,9 @@ export const createTrialPaymentCheckoutAction = authenticatedActionClient
   .action(
     withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
       const { organizationId } = parsedInput;
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager", "billing"],
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+        type: "organization",
+        id: organizationId,
       });
 
       const organization = await getOrganization(organizationId);
@@ -254,15 +227,9 @@ const ZStartScaleTrialAction = z.object({
 export const startHobbyAction = authenticatedActionClient
   .inputSchema(ZStartScaleTrialAction)
   .action(async ({ ctx, parsedInput }) => {
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId: parsedInput.organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager"],
-        },
-      ],
+    await assertCan({ type: "user", id: ctx.user.id }, "organization.manage", {
+      type: "organization",
+      id: parsedInput.organizationId,
     });
 
     const organization = await getOrganization(parsedInput.organizationId);
@@ -292,19 +259,13 @@ export const startHobbyAction = authenticatedActionClient
     return { success: true };
   });
 
-export const startProTrialAction = authenticatedActionClient
-  .inputSchema(ZStartScaleTrialAction)
-  .action(async ({ ctx, parsedInput }) => {
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId: parsedInput.organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager"],
-        },
-      ],
+export const startProTrialAction = authenticatedActionClient.inputSchema(ZStartScaleTrialAction).action(
+  withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
+    await assertCan({ type: "user", id: ctx.user.id }, "organization.manage", {
+      type: "organization",
+      id: parsedInput.organizationId,
     });
+    await applyRateLimit(rateLimitConfigs.actions.stateMutation, parsedInput.organizationId);
 
     const organization = await getOrganization(parsedInput.organizationId);
     if (!organization) {
@@ -318,7 +279,11 @@ export const startProTrialAction = authenticatedActionClient
       throw new ResourceNotFoundError("OrganizationBilling", parsedInput.organizationId);
     }
 
-    await createProTrialSubscription(parsedInput.organizationId, customerId);
+    ctx.auditLoggingCtx.organizationId = parsedInput.organizationId;
+
+    const trialDays = await getProTrialDays(parsedInput.organizationId);
+
+    await createProTrialSubscription(parsedInput.organizationId, customerId, trialDays);
     await reconcileCloudStripeSubscriptionsForOrganization(parsedInput.organizationId);
     await syncOrganizationBillingFromStripe(parsedInput.organizationId);
     // Optimistically grant ai-smart-tools so the onboarding survey page sees it
@@ -335,7 +300,7 @@ export const startProTrialAction = authenticatedActionClient
       {
         plan: "pro",
         organization_id: parsedInput.organizationId,
-        trial_duration_days: 14,
+        trial_duration_days: trialDays,
       },
       { organizationId: parsedInput.organizationId }
     );
@@ -349,8 +314,11 @@ export const startProTrialAction = authenticatedActionClient
       { organizationId: parsedInput.organizationId }
     );
 
+    ctx.auditLoggingCtx.newObject = { plan: "pro", trialDurationDays: trialDays };
+
     return { success: true };
-  });
+  })
+);
 
 const ZChangeBillingPlanAction = z.discriminatedUnion("targetPlan", [
   z.object({
@@ -368,15 +336,9 @@ const ZChangeBillingPlanAction = z.discriminatedUnion("targetPlan", [
 export const changeBillingPlanAction = authenticatedActionClient.inputSchema(ZChangeBillingPlanAction).action(
   withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
     const { organizationId } = parsedInput;
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager", "billing"],
-        },
-      ],
+    await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+      type: "organization",
+      id: organizationId,
     });
 
     const organization = await getOrganization(organizationId);
@@ -431,15 +393,9 @@ export const reportUpgradePaymentIssueAction = authenticatedActionClient
   .action(
     withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
       const { organizationId, paymentIntentId } = parsedInput;
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager", "billing"],
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+        type: "organization",
+        id: organizationId,
       });
 
       await setOrganizationPaymentAttemptError(organizationId, {
@@ -467,15 +423,9 @@ export const finalizeSetupCheckoutUpgradeAction = authenticatedActionClient
   .action(
     withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
       const { organizationId, checkoutSessionId } = parsedInput;
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager", "billing"],
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+        type: "organization",
+        id: organizationId,
       });
 
       const result = await applySetupCheckoutUpgrade({ organizationId, checkoutSessionId });
@@ -525,15 +475,9 @@ export const waitForBillingPlanAction = authenticatedActionClient
   .action(
     withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
       const { organizationId, targetPlan } = parsedInput;
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager", "billing"],
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+        type: "organization",
+        id: organizationId,
       });
 
       const plan = await pollBillingSync(
@@ -559,15 +503,9 @@ export const waitForBillingPaymentMethodAction = authenticatedActionClient
   .action(
     withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
       const { organizationId } = parsedInput;
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager", "billing"],
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+        type: "organization",
+        id: organizationId,
       });
 
       const hasPaymentMethod = await pollBillingSync(
@@ -590,15 +528,9 @@ export const undoPendingPlanChangeAction = authenticatedActionClient
   .action(
     withAuditLogging("subscriptionAccessed", "organization", async ({ ctx, parsedInput }) => {
       const { organizationId } = parsedInput;
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager", "billing"],
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "organization.manage_billing", {
+        type: "organization",
+        id: organizationId,
       });
 
       const organization = await getOrganization(organizationId);

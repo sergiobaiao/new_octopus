@@ -105,8 +105,8 @@ const createPreviewSurvey = (element: TSurveyElement): TSurvey =>
     isBackButtonHidden: false,
     isAutoProgressingEnabled: false,
     isCaptureIpEnabled: false,
+    isAnonymizeResponsesEnabled: false,
     isVerifyEmailEnabled: false,
-    isSingleResponsePerEmailEnabled: false,
   }) as unknown as TSurvey;
 
 const createPreviewElementByType = (type: TSurveyElementTypeEnum): TSurveyElement => {

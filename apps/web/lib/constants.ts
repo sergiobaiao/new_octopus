@@ -66,6 +66,7 @@ export const SAML_PATH = "/api/auth/saml/callback";
 export const SIGNUP_ENABLED = IS_FORMBRICKS_CLOUD || IS_DEVELOPMENT || E2E_TESTING;
 export const EMAIL_AUTH_ENABLED = env.EMAIL_AUTH_DISABLED !== "1";
 export const INVITE_DISABLED = env.INVITE_DISABLED === "1";
+export const INVITE_RATE_LIMIT_PER_24_HOURS = env.INVITE_RATE_LIMIT_PER_24_HOURS;
 
 export const SLACK_CLIENT_SECRET = env.SLACK_CLIENT_SECRET;
 export const SLACK_CLIENT_ID = env.SLACK_CLIENT_ID;
@@ -109,8 +110,28 @@ export const TEXT_RESPONSES_PER_PAGE = 5;
 export const MAX_RESPONSES_FOR_INSIGHT_GENERATION = 500;
 export const MAX_OTHER_OPTION_LENGTH = 250;
 
+/**
+ * Workspaces an organization gets on a self-hosted instance with no active enterprise license
+ * (Community Edition). Mirrors docs/self-hosting/advanced/license.mdx.
+ */
+export const COMMUNITY_WORKSPACE_LIMIT = 1;
+
+/**
+ * Workspaces a cloud organization falls back to when the license server cannot confirm the instance
+ * license (expired, invalid_license, instance_mismatch, unreachable). Deliberately the Hobby (free
+ * tier) allowance: an entitlement we cannot verify is treated as no entitlement. The create gate is
+ * `count >= limit`, so an org already above it keeps every workspace it has and only pauses creating
+ * new ones until the license resolves.
+ */
+export const CLOUD_HOBBY_WORKSPACE_LIMIT = 1;
+
 export const SKIP_INVITE_FOR_SSO = env.AUTH_SKIP_INVITE_FOR_SSO === "1";
 export const DEFAULT_TEAM_ID = env.AUTH_DEFAULT_TEAM_ID;
+// Self-hosted SSO auto-provisioning (`AUTH_SSO_DEFAULT_ORGANIZATION_ID`): when set, every new SSO user
+// joins this organization without needing an invite, created on first sign-up if it does not exist
+// yet. ENG-2089.
+export const DEFAULT_ORGANIZATION_ID = env.AUTH_DEFAULT_ORGANIZATION_ID;
+export const DEFAULT_ORGANIZATION_ROLE = env.AUTH_DEFAULT_ORGANIZATION_ROLE;
 
 // Cloud-only kill-switch: when enabled, the personal-email sign-up block also applies to invited
 // users (default exempts invites). See @/modules/auth/lib/signup-email-domain.
@@ -169,7 +190,7 @@ export const DEBUG = env.DEBUG === "1";
 export const ENTERPRISE_LICENSE_KEY = env.ENTERPRISE_LICENSE_KEY;
 
 export const ENTERPRISE_LICENSE_REQUEST_FORM_URL =
-  "https://app.formbricks.com/s/trvp8tzy5uvsps9rc9qi9l9w?delivery=onpremise&source=ce";
+  "https://app.formbricks.com/s/trvp8tzy5uvsps9rc9qi9l9w?delivery=onpremise&source=ce&type=licenseRequest";
 
 export const REDIS_URL = env.REDIS_URL;
 export const RATE_LIMITING_DISABLED = env.RATE_LIMITING_DISABLED === "1";

@@ -7,6 +7,7 @@ import { useForm } from "react-hook-form";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
+import { getComputedEmbeddedFields, getIngestedStorageKeys } from "@formbricks/types/embedded-data-resolver";
 import { TIntegrationInput } from "@formbricks/types/integration";
 import {
   TIntegrationNotion,
@@ -110,6 +111,17 @@ export const AddIntegrationModal = ({
         type: dbProperties[fieldKey].type,
       })) || []
     );
+    // The effect below re-seeds `selectedDatabase` with a fresh object literal whenever the
+    // `databases`/`surveys` server props change identity, which an RSC refresh does on unchanged
+    // content. Keying on the id keeps identical content from recomputing this list.
+    //
+    // The trade-off, stated so it is a choice rather than an oversight: if a refresh brings back
+    // *different* properties for the same database id — someone edited the Notion database's schema
+    // while this modal was open on it — the list here stays stale until the database is reselected.
+    // Fixing that by keying on the object trades a rare staleness for a recompute on every refresh;
+    // fixing it properly means not re-seeding with a fresh literal when the content is unchanged,
+    // which belongs in the effect rather than in this dep array.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the database's identity, not the object's
   }, [selectedDatabase?.id]);
 
   const elementItems = useMemo(() => {
@@ -121,19 +133,24 @@ export const AddIntegrationModal = ({
         }))
       : [];
 
-    const variables =
-      selectedSurvey?.variables.map((variable) => ({
-        id: variable.id,
-        name: variable.name,
-        type: TSurveyElementTypeEnum.OpenText,
-      })) || [];
+    // ENG-1837: the mapping list must name the same things the pipeline exports, and
+    // `handle-integrations.ts` labels a computed field by `field.name` and an ingested one by its
+    // storage key — so both come from the survey's Embedded Data definitions, not the legacy columns.
+    const variables = selectedSurvey
+      ? getComputedEmbeddedFields(selectedSurvey).map(({ field, link }) => ({
+          id: link.storageKey,
+          name: field.name,
+          type: TSurveyElementTypeEnum.OpenText,
+        }))
+      : [];
 
-    const hiddenFields =
-      selectedSurvey?.hiddenFields.fieldIds?.map((fId) => ({
-        id: fId,
-        name: `${t("common.hidden_field")} : ${fId}`,
-        type: TSurveyElementTypeEnum.OpenText,
-      })) || [];
+    const hiddenFields = selectedSurvey
+      ? getIngestedStorageKeys(selectedSurvey).map((storageKey) => ({
+          id: storageKey,
+          name: `${t("common.hidden_field")} : ${storageKey}`,
+          type: TSurveyElementTypeEnum.OpenText,
+        }))
+      : [];
     const Metadata = [
       {
         id: "metadata",
@@ -155,7 +172,10 @@ export const AddIntegrationModal = ({
     }));
 
     return [...mappedElements, ...variables, ...hiddenFields, ...Metadata, ...createdAt, ...personAttributes];
-  }, [selectedSurvey?.id, contactAttributeKeys]);
+    // Same as `dbItems` above: `selectedSurvey` is re-seeded from the `surveys` server prop, so its
+    // identity changes on a refresh that changed nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the survey's identity, not the object's
+  }, [contactAttributeKeys, elements, selectedSurvey?.id, t]);
 
   useEffect(() => {
     if (selectedIntegration) {

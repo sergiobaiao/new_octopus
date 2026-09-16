@@ -4991,7 +4991,6 @@ export const previewSurvey = (workspaceName: string, t: TFunction): TSurvey => {
     displayPercentage: null,
     autoComplete: 50,
     isVerifyEmailEnabled: false,
-    isSingleResponsePerEmailEnabled: false,
     workspaceOverwrites: null,
     surveyClosedMessage: null,
     singleUse: {
@@ -5006,6 +5005,7 @@ export const previewSurvey = (workspaceName: string, t: TFunction): TSurvey => {
     isBackButtonHidden: false,
     isAutoProgressingEnabled: true,
     isCaptureIpEnabled: false,
+    isAnonymizeResponsesEnabled: false,
     metadata: {},
     questions: [], // Required for build-time type checking (Zod defaults to [] at runtime)
     slug: null,

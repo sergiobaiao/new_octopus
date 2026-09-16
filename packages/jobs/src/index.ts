@@ -32,7 +32,9 @@ export {
   ZSurveyArchivePurgeJobData,
   ZSurveySchedulingJobData,
   ZTestLogJobData,
+  ZUsageTelemetryJobData,
   ZWorkflowRunJobData,
+  ZWorkflowsUsageSnapshotJobData,
   ZWorkflowRunReconcileJobData,
 } from "./types";
 export type {
@@ -42,6 +44,8 @@ export type {
   TSurveyArchivePurgeJobData,
   TSurveySchedulingJobData,
   TTestLogJobData,
+  TUsageTelemetryJobData,
+  TWorkflowsUsageSnapshotJobData,
   TWorkflowRunJobData,
   TWorkflowRunReconcileJobData,
 } from "./types";

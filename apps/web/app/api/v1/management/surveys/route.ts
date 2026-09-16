@@ -18,12 +18,14 @@ import {
   transformQuestionsToBlocks,
   validateSurveyInput,
   withDerivedQuestions,
+  withoutInternalSurveyProjections,
 } from "@/app/lib/api/survey-transformation";
 import { transformErrorToDetails } from "@/app/lib/api/validator";
 import { withV1ApiWrapper } from "@/app/lib/api/with-api-logging";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
 import { createSurvey } from "@/lib/survey/service";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
 import { resolveStorageUrlsInObject } from "@/modules/storage/utils";
 import { getSurveys } from "./lib/surveys";
 
@@ -47,7 +49,9 @@ export const GET = withV1ApiWrapper({
 
       // Always expose `questions` (derived from blocks) alongside `blocks` so API v1
       // consumers get a consistent shape regardless of how the survey was built.
-      const surveysWithQuestions = surveys.map((survey) => withDerivedQuestions(survey));
+      const surveysWithQuestions = surveys.map((survey) =>
+        withoutInternalSurveyProjections(withDerivedQuestions(survey))
+      );
 
       return {
         response: responses.successResponse(
@@ -89,7 +93,7 @@ export const POST = withV1ApiWrapper({
       surveyInput = normaliseProjectOverwritesToWorkspace(surveyInput);
 
       // Accept workspaceId as alternative to environmentId — resolve to production environment
-      const resolved = await resolveBodyIds(surveyInput, authentication.workspacePermissions, "POST");
+      const resolved = await resolveBodyIds(surveyInput, authentication, "POST");
       if (!resolved.ok) return { response: resolved.response };
       surveyInput = resolved.body;
 
@@ -109,7 +113,11 @@ export const POST = withV1ApiWrapper({
 
       if (
         !resolved.alreadyAuthorized &&
-        !hasPermission(authentication.workspacePermissions, workspaceId, "POST")
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("POST"),
+          { type: "workspace", id: workspaceId }
+        ))
       ) {
         return { response: responses.unauthorizedResponse() };
       }
@@ -157,7 +165,9 @@ export const POST = withV1ApiWrapper({
         // on, so a client retrying that false error creates a second survey.
         response: responses.successResponse(
           await addLegacyEnvironmentIdBestEffort(
-            addLegacyProjectOverwrites(resolveStorageUrlsInObject(withDerivedQuestions(survey)))
+            addLegacyProjectOverwrites(
+              resolveStorageUrlsInObject(withoutInternalSurveyProjections(withDerivedQuestions(survey)))
+            )
           )
         ),
       };

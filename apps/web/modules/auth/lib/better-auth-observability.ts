@@ -43,9 +43,13 @@ export const getSignInAuthMethod = (path: string | undefined): string | null => 
   // onto this route before Better Auth sees it. Do not "restore" /oauth2/ here.
   if (path.includes("/callback/")) return "sso";
   if (path === "/sign-in/email") return "password";
-  // Auto-login after email verification (autoSignInAfterVerification, ENG-1746) creates a session for
-  // a credential/email-password account, so audit it as "password". Idempotent replays of an
-  // already-verified token don't create a session, so this fires once, on the genuine first verify.
+  // A session created on the verification endpoint belongs to a credential/email-password account, so
+  // audit it as "password". Since ENG-2562 the session is minted by `verificationAutoSignInAfterHandler`
+  // rather than by `autoSignInAfterVerification` (now off), and only for the browser that signed up —
+  // but it still arrives here with this path, so the signedIn trail is unchanged. A withheld
+  // verification creates no session and so produces no event here; it is recorded separately by
+  // `auditVerificationSessionWithheld`. Idempotent replays of an already-verified token create no
+  // session either, so this fires once, on the genuine first verify.
   if (path === "/verify-email") return "password";
   // The 2FA challenge completes the credentials sign-in → "password" (matches NextAuth). Deliberately
   // NOT /two-factor/verify-otp (also the first-time-enable path) nor /two-factor/disable|enable.
@@ -129,6 +133,30 @@ const EMAIL_IN_MESSAGE = /[^\s@]{1,64}@([\w-]{1,63}(?:\.[\w-]{1,63}){1,8})/g;
 
 export const redactEmailsInLogMessage = (message: unknown): unknown =>
   typeof message === "string" ? message.replace(EMAIL_IN_MESSAGE, "[redacted]@$1") : message;
+
+const SAFE_WARNING_ERROR_NAMES = new Set([
+  "Error",
+  "TypeError",
+  "PrismaClientInitializationError",
+  "PrismaClientKnownRequestError",
+  "PrismaClientUnknownRequestError",
+]);
+const PRISMA_ERROR_CODE = /^P\d{4}$/;
+
+/**
+ * Warning causes stay in application logs only as a small allowlisted summary. Passing the Error to
+ * Pino's `err` serializer would also emit its message, stack, and enumerable properties, any of which
+ * can contain credentials supplied by an upstream provider.
+ */
+const getSafeWarningErrorContext = (cause: Error): { errorType: string; errorCode?: string } => {
+  const errorType = SAFE_WARNING_ERROR_NAMES.has(cause.name) ? cause.name : "Error";
+  const code = (cause as Error & { code?: unknown }).code;
+
+  return {
+    errorType,
+    ...(typeof code === "string" && PRISMA_ERROR_CODE.test(code) && { errorCode: code }),
+  };
+};
 
 /**
  * `StateError` codes whose events are client- or timing-caused, and so are not actionable in Sentry
@@ -242,6 +270,67 @@ const isUnactionableStateError = (code: string | undefined): boolean =>
   code !== undefined && UNACTIONABLE_STATE_ERROR_CODES.has(code);
 
 /**
+ * Emit a Better Auth `warn`-level log, attaching the safe error context when the entry carried an
+ * `Error`.
+ *
+ * `safeMessage` is `unknown` because Better Auth's logger signature is: the message is usually a
+ * string, but a couple of call sites pass the `Error` itself. pino's two-argument form needs a string
+ * in the message slot, hence the narrowing — a non-string falls back to a fixed label rather than
+ * being stringified, since the `Error` is already carried by the context object.
+ */
+const logWarning = (
+  contextLogger: ReturnType<typeof logger.withContext>,
+  safeMessage: unknown,
+  cause: Error | undefined
+): void => {
+  if (!cause) {
+    contextLogger.warn(safeMessage);
+    return;
+  }
+
+  contextLogger.warn(
+    getSafeWarningErrorContext(cause),
+    typeof safeMessage === "string" ? safeMessage : "Better Auth warning"
+  );
+};
+
+/**
+ * Capture a Better Auth `error`-level log to Sentry, but only when it is a GENUINE internal fault.
+ *
+ * Split out of `betterAuthLogger.log` rather than inlined: the three stacked conditions below carried
+ * most of that function's branching, and the decision "does this page?" is a separate concern from
+ * "how is this logged". Behaviour is unchanged — the gate, its order, and the tag set are the same.
+ *
+ * Skips handled rejections: a bare string code (no Error), a client-facing APIError, or a
+ * client/timing-caused OAuth `StateError` (ENG-2471) — so Sentry stays actionable (see the reason-split
+ * on `betterAuthLogger` and UNACTIONABLE_STATE_ERROR_CODES).
+ */
+const captureInternalAuthFault = (
+  cause: Error | undefined,
+  stateErrorCode: string | undefined,
+  request: ReturnType<typeof getBetterAuthRequestContext>
+): void => {
+  if (!SENTRY_DSN || !IS_PRODUCTION) return;
+  if (!cause || isAPIError(cause) || isUnactionableStateError(stateErrorCode)) return;
+
+  // ENG-2259: Better Auth's router logs a non-APIError as `(e.name, e)` and discards the endpoint
+  // (`better-auth/dist/api/index.mjs:210`), so a bare capture arrives with no transaction, URL or
+  // route — which is why FORMBRICKS-183 sat at ~242 events untriageable. Tags don't affect grouping,
+  // so the issue stays one issue with `auth.path` as a facet.
+  Sentry.captureException(cause, {
+    tags: {
+      component: "better-auth",
+      ...(request && { "auth.path": request.path, "http.method": request.method }),
+    },
+    // No `extra`. Forwarding `message` was considered and dropped: `redactEmailsInLogMessage` strips
+    // emails and nothing else, so a plugin logging `error("… <token> …", err)` would put that token in
+    // Sentry verbatim — while the message adds nothing, being either the error's own name or a
+    // sentence accompanying the Error already captured here. Keeping Sentry to `Error`-or-nothing is
+    // what makes the header note above stay true.
+  });
+};
+
+/**
  * Route Better Auth's logger to @formbricks/logger and capture GENUINE internal faults to Sentry in
  * production — replaces auth.ts's placeholder logger (and the route's Sentry.captureException on auth
  * failures).
@@ -251,7 +340,8 @@ const isUnactionableStateError = (code: string | undefined): boolean =>
  *   1. OAuth callback rejections logged as a bare string code (`logger.error("account_not_linked")`,
  *      `"unable_to_create_user"`, `"unable_to_get_user_info"`, … via `redirectOnError`) — no Error
  *      object; these are client-facing redirects, e.g. our blocked-domain / SSO provisioning gate
- *      returning `false`. These were the top volume in Sentry (FORMBRICKS-16Q).
+ *      rejecting a sign-up. These were the top volume in Sentry (FORMBRICKS-16Q); the SSO gate now
+ *      rejects by throwing an APIError, which this branch skips by design (ENG-2537).
  *   2. Credential-path rejections thrown as a Better Auth `APIError` (`FAILED_TO_CREATE_USER`,
  *      `USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL`, invalid-input codes) — a 4xx-equivalent response, not a
  *      server fault.
@@ -285,30 +375,9 @@ export const betterAuthLogger: NonNullable<BetterAuthOptions["logger"]> = {
     const safeMessage = redactEmailsInLogMessage(message);
     if (level === "error") {
       contextLogger.error(safeMessage);
-      if (SENTRY_DSN && IS_PRODUCTION) {
-        // Skip handled rejections: a bare string code (no Error), a client-facing APIError, or a
-        // client/timing-caused OAuth `StateError` (ENG-2471). Capture only genuine internal faults so
-        // Sentry stays actionable (see the reason-split above and UNACTIONABLE_STATE_ERROR_CODES).
-        if (cause && !isAPIError(cause) && !isUnactionableStateError(stateErrorCode)) {
-          // ENG-2259: Better Auth's router logs a non-APIError as `(e.name, e)` and discards the
-          // endpoint (`better-auth/dist/api/index.mjs:210`), so a bare capture arrives with no
-          // transaction, URL or route — which is why FORMBRICKS-183 sat at ~242 events untriageable.
-          // Tags don't affect grouping, so the issue stays one issue with `auth.path` as a facet.
-          Sentry.captureException(cause, {
-            tags: {
-              component: "better-auth",
-              ...(request && { "auth.path": request.path, "http.method": request.method }),
-            },
-            // No `extra`. Forwarding `message` was considered and dropped: `redactEmailsInLogMessage`
-            // strips emails and nothing else, so a plugin logging `error("… <token> …", err)` would
-            // put that token in Sentry verbatim — while the message adds nothing, being either the
-            // error's own name or a sentence accompanying the Error already captured here. Keeping
-            // Sentry to `Error`-or-nothing is what makes the header note above stay true.
-          });
-        }
-      }
+      captureInternalAuthFault(cause, stateErrorCode, request);
     } else if (level === "warn") {
-      contextLogger.warn(safeMessage);
+      logWarning(contextLogger, safeMessage, cause);
     } else {
       contextLogger.info(safeMessage);
     }
@@ -346,6 +415,39 @@ export const auditFailedAuthAfter = async (ctx: AuthHookContext): Promise<void> 
   const code = (returned.body as { code?: unknown } | undefined)?.code;
   const failureReason = (typeof code === "string" ? code : String(returned.status)).toLowerCase();
   logAuthAttempt(failureReason, "credentials", "password", UNKNOWN_DATA, email);
+};
+
+/**
+ * ENG-2562: a verification completed but no session was granted.
+ *
+ * `reason` is the point of the record, not a detail. This fires on the ordinary cross-device click and on
+ * a mail-scanner prefetch (`absent`) as readily as on a genuine pre-hijack (`other_user`), so the event
+ * alone means "nobody was signed in", NOT "an attack happened". Only `other_user` — a valid intent cookie
+ * naming a different account — is inherently suspicious; `invalid` is worth a look; `grant_failed` is our
+ * own fault rather than the caller's.
+ *
+ * Uses the `updated` + marker idiom of `auditPasswordReset` below rather than a new `ZAuditAction`
+ * value: it is the established shape for auth-internal events, and it keeps a shared enum out of a fix
+ * that has to land on two release branches as well as main. Audit logging is enterprise-gated, so the
+ * caller also logs — a self-hoster must still see this.
+ */
+export const auditVerificationSessionWithheld = async (userId: string, reason: string): Promise<void> => {
+  try {
+    await queueAuditEventBackground({
+      action: "updated",
+      targetType: "user",
+      userId,
+      targetId: userId,
+      organizationId: UNKNOWN_DATA,
+      status: "success",
+      userType: "user",
+      newObject: { verificationSessionWithheldMarker: true, reason },
+    });
+  } catch {
+    logger
+      .withContext({ source: "better-auth" })
+      .error("Failed to queue withheld-verification-session audit event");
+  }
 };
 
 /**

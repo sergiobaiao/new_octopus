@@ -1,18 +1,20 @@
 import { NextRequest } from "next/server";
-import { Response } from "@formbricks/database/prisma";
 import { sendToPipeline } from "@/app/lib/pipelines";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { applyAnonymizePolicy } from "@/lib/response/anonymize";
 import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
 import { formatValidationErrorsForV2Api, validateResponseData } from "@/modules/api/lib/validation";
 import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
 import { validateOtherOptionLengthForMultipleChoice } from "@/modules/api/v2/lib/element";
 import { responses } from "@/modules/api/v2/lib/response";
 import { handleApiError } from "@/modules/api/v2/lib/utils";
+import { getAuthorizedApiKeyWorkspaceIds } from "@/modules/api/v2/management/lib/authorized-workspace-ids";
 import { getWorkspaceId } from "@/modules/api/v2/management/lib/helper";
 import { getResponseForPipeline } from "@/modules/api/v2/management/responses/[responseId]/lib/response";
 import { getSurveyQuestions } from "@/modules/api/v2/management/responses/[responseId]/lib/survey";
 import { ZGetResponsesFilter, ZResponseInput } from "@/modules/api/v2/management/responses/types/responses";
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
 import { resolveStorageUrlsInObject, validateClientFileUploads } from "@/modules/storage/utils";
 import { createResponseWithQuotaEvaluation, getResponses } from "./lib/response";
 
@@ -32,21 +34,17 @@ export const GET = async (request: NextRequest) =>
         });
       }
 
-      const workspaceIds = [
-        ...new Set(authentication.workspacePermissions.map((permission) => permission.workspaceId)),
-      ];
+      const workspaceIds = await getAuthorizedApiKeyWorkspaceIds(authentication);
 
-      const workspaceResponses: Response[] = [];
       const res = await getResponses(workspaceIds, query);
 
       if (!res.ok) {
         return handleApiError(request, res.error);
       }
 
-      workspaceResponses.push(...res.data.data);
-
       return responses.successResponse({
-        data: workspaceResponses.map((r) => ({ ...r, data: resolveStorageUrlsInObject(r.data) })),
+        data: res.data.data.map((r) => ({ ...r, data: resolveStorageUrlsInObject(r.data) })),
+        meta: res.data.meta,
       });
     },
   });
@@ -79,7 +77,13 @@ export const POST = async (request: Request) =>
 
       const { workspaceId } = workspaceIdResult.data;
 
-      if (!hasPermission(authentication.workspacePermissions, workspaceId, "POST")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("POST"),
+          { type: "workspace", id: workspaceId }
+        ))
+      ) {
         return handleApiError(
           request,
           {
@@ -165,7 +169,16 @@ export const POST = async (request: Request) =>
         );
       }
 
-      const createResponseResult = await createResponseWithQuotaEvaluation(workspaceId, body);
+      // "Anonymize responses" is a property of the SURVEY, not of the door a response arrived
+      // through: `ZResponseInput` picks `meta`, so without this a caller could write ipAddress,
+      // country, userAgent and an unredacted url onto a survey that has the toggle on. The realistic
+      // case is a customer proxying submissions from their own backend, which uses this route rather
+      // than the client one. Applied at the route, matching the client routes, because the survey read
+      // already happened here and `createResponse` does not load it.
+      const createResponseResult = await createResponseWithQuotaEvaluation(workspaceId, {
+        ...body,
+        meta: applyAnonymizePolicy(body.meta, surveyQuestions.data.isAnonymizeResponsesEnabled),
+      });
       if (!createResponseResult.ok) {
         return handleApiError(request, createResponseResult.error, auditLog);
       }

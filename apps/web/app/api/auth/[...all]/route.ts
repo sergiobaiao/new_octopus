@@ -5,6 +5,7 @@ import {
 } from "@/modules/auth/lib/better-auth-observability";
 import { createAuthPathLabeller } from "@/modules/auth/lib/better-auth-path-label";
 import { runWithBetterAuthRequestContext } from "@/modules/auth/lib/better-auth-request-context";
+import { runWithEmailVerificationRequestContext } from "@/modules/auth/lib/email-verification-request-context";
 import { mapLegacySsoCallbackRequest } from "@/modules/auth/lib/legacy-sso-callback";
 import { normalizeDcrRequest } from "@/modules/auth/lib/mcp-dcr-application-type";
 import { runWithSsoRequestContext } from "@/modules/ee/sso/lib/sso-request-context";
@@ -68,7 +69,14 @@ const handler = async (request: Request): Promise<Response> => {
   try {
     const response = await runWithBetterAuthRequestContext(
       { path: labelAuthPath(mappedRequest.url), method: mappedRequest.method },
-      () => runWithSsoRequestContext(() => auth.handler(mappedRequest))
+      () =>
+        runWithSsoRequestContext(() =>
+          // ENG-2562: carries "this request just verified an email" from Better Auth's
+          // `afterEmailVerification` hook to the `hooks.after` chain, which is where the session can
+          // actually be minted. Innermost because it is the narrowest scope of the three — one endpoint,
+          // not the whole handler.
+          runWithEmailVerificationRequestContext(() => auth.handler(mappedRequest))
+        )
     );
     // ENG-2551: the one place that sees the outcome of every SSO callback, whatever went wrong and
     // whichever provider it was — a failed callback is a redirect carrying `?error=`, or a 4xx/5xx.

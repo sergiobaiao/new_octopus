@@ -3,8 +3,15 @@ import { type Locator, type Page, expect } from "@playwright/test";
 import { logger } from "@formbricks/logger";
 import { test } from "./lib/fixtures";
 import {
+  A11Y_ANSWERED_STATES_SURVEY_NAME,
   A11Y_SURVEY_NAME,
+  CAL_EMBED_ORIGIN,
+  CAL_HEADLINE,
+  CTA_EXTERNAL_BUTTON_LABEL,
+  CTA_EXTERNAL_HEADLINE,
+  DATE_HEADLINE,
   ENDING_CARD_HEADLINE,
+  FILE_UPLOAD_HEADLINE,
   OPEN_TEXT_HEADLINE,
   SINGLE_SELECT_HEADLINE,
   type SeededAccessibilitySurveys,
@@ -21,6 +28,11 @@ import { mockStorageUploads } from "./utils/helper";
  * empty-submit, back-nav, and a multi-language RTL pass) and asserts zero WCAG 2.1
  * / 2.2 AA violations. A silent stall fails the test rather than passing as "clean":
  * the walker proves it advanced and reached the ending card.
+ *
+ * A tenth variant scans the second, "answered states" fixture (ENG-1298): the cards
+ * whose DOM only exists after an interaction, which the walker — which scans each card
+ * once, before answering it — structurally cannot reach, plus the Cal.com scheduler
+ * wrapper, which cannot live in the kitchen sink at all.
  *
  * Tagged @slow — it provisions surveys and walks them across many variants. It runs
  * in the standard `pnpm test:e2e` job (testMatch **\/*.spec.ts); the tag is metadata
@@ -55,8 +67,10 @@ interface AllowlistEntry {
 }
 
 // Currently empty: every violation the suite found was fixed at the source instead
-// (file-upload dropzone restructure, branding contrast) and the Cal.com third-party
-// iframe was removed from the fixture. Add entries only for justified wontfixes.
+// (file-upload dropzone restructure, branding contrast), and the Cal.com third-party
+// iframe needs no entry because it never renders — the answered-states walk blocks the
+// embed origin and asserts the container stayed empty, so only our own wrapper is
+// graded. Add entries only for justified wontfixes.
 const ALLOWLIST: AllowlistEntry[] = [];
 
 type ViolationRow = {
@@ -72,6 +86,17 @@ type ViolationRow = {
 const CARD_TIMEOUT = 15_000;
 const ACTION_TIMEOUT = 8_000;
 const MAX_STEPS = 25;
+
+// The file the answered-states walk attaches to the (required) file-upload card. Built in
+// memory rather than read from disk so the spec owns its own fixture, and kept to an SVG the
+// storage mock already serves for unknown names (see `mockStorageUploads`). The name is asserted
+// exactly against the delete control's accessible name, which the app derives from the stored file
+// name — so it must survive the upload round-trip unchanged.
+const UPLOAD_FIXTURE_FILE_NAME = "a11y-answered-states.svg";
+const UPLOAD_FIXTURE_BODY = Buffer.from(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="#0f172a"/></svg>',
+  "utf8"
+);
 
 const isAllowlisted = (ruleId: string, target: string): boolean =>
   ALLOWLIST.some(
@@ -146,7 +171,7 @@ const selectControl = async (control: Locator): Promise<void> => {
  * input `name`); ranking is a set of "Add … to ranking" buttons. File upload is an
  * optional card we intentionally skip answering but still advance past.
  */
-const answerCurrentCard = async (page: Page, card: Locator): Promise<void> => {
+const answerCurrentCard = async (card: Locator): Promise<void> => {
   // Text-like inputs (open text, "other" fields). Skip file inputs.
   const textInputs = card.locator(
     'input:not([type="hidden"]):not([type="file"]):not([type="radio"]):not([type="checkbox"]):not([type="button"]):not([type="submit"]), textarea'
@@ -416,7 +441,7 @@ const walkAndScan = async (
       await scan(page, variant, cardId === "questionCard--1" ? "welcome-card" : cardId, failSink);
     }
 
-    await answerCurrentCard(page, card);
+    await answerCurrentCard(card);
 
     const advance = advanceButton(card).first();
     await expect(
@@ -480,6 +505,39 @@ const openFirstQuestionCard = async (page: Page, surveyUrl: string): Promise<str
   return firstCardId ?? "";
 };
 
+/**
+ * Aborts every request to the Cal.com embed origin, so the scheduler's third-party snippet
+ * (packages/surveys cal-embed.tsx loads it from `https://cal.com/embed.js`) never runs and
+ * never injects its cross-origin iframe.
+ *
+ * This is what makes a `cal` card scannable unattended at all. Left unblocked, the card's
+ * axe result would depend on external network and on markup Formbricks neither owns nor can
+ * fix — the reason the kitchen-sink fixture excludes the type outright. Blocked, what renders
+ * is exactly the wrapper that IS ours: headline, subheader, and the embed container. The test
+ * asserts the container stayed iframe-free, so the scan cannot silently grade Cal.com's DOM.
+ */
+const blockCalEmbedRequests = (page: Page): Promise<void> =>
+  page.route(
+    (url) => url.hostname === CAL_EMBED_ORIGIN || url.hostname.endsWith(`.${CAL_EMBED_ORIGIN}`),
+    (route) => route.abort()
+  );
+
+/**
+ * Clicks the current card's advance button and waits for a stable next card, asserting that
+ * one arrived. Used by the answered-states walk, which needs the next card's id to scope its
+ * assertions — unlike `walkAndScan`, which only needs to know it moved.
+ */
+const advanceToNextCard = async (page: Page, fromCardId: string): Promise<string> => {
+  const advance = advanceButton(page.locator(`[id="${fromCardId}"]`)).first();
+  await expect(advance, `advance button should be present on ${fromCardId}`).toBeVisible({
+    timeout: ACTION_TIMEOUT,
+  });
+  await advance.click({ timeout: ACTION_TIMEOUT });
+  const nextCardId = await waitForCardTransition(page, fromCardId);
+  expect(nextCardId, `advancing past ${fromCardId} should land on the next card`).toBeTruthy();
+  return nextCardId ?? "";
+};
+
 const reportAndAssert = (variant: string, failSink: ViolationRow[]): void => {
   if (failSink.length > 0) {
     logger.error(`\n=== ${failSink.length} WCAG AA violation(s) for variant "${variant}" ===`);
@@ -502,6 +560,13 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
   // test would add no isolation, only time.
   let seeded: SeededAccessibilitySurveys | undefined;
 
+  // beforeEach fills the cache before any test body runs; reading through this accessor
+  // keeps that guarantee in the type system instead of narrowing at all 13 call sites.
+  const surveys = (): SeededAccessibilitySurveys => {
+    if (!seeded) throw new Error("accessibility surveys were not seeded");
+    return seeded;
+  };
+
   test.beforeEach(async ({ page, users, baseURL }) => {
     await mockStorageUploads(page);
     seeded ??= await seedAccessibilitySurveys(users, baseURL ?? "http://localhost:3000");
@@ -510,13 +575,13 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
   test("desktop: full walk has no WCAG AA violations", async ({ page }) => {
     test.setTimeout(180_000);
     const violations: ViolationRow[] = [];
-    await walkAndScan(page, "desktop", seeded.surveyUrl, violations);
+    await walkAndScan(page, "desktop", surveys().surveyUrl, violations);
     reportAndAssert("desktop", violations);
   });
 
   test("desktop: empty-submit validation state has no WCAG AA violations", async ({ page }) => {
     test.setTimeout(120_000);
-    const firstCardId = await openFirstQuestionCard(page, seeded.surveyUrl);
+    const firstCardId = await openFirstQuestionCard(page, surveys().surveyUrl);
     const firstCard = page.locator(`[id="${firstCardId}"]`);
 
     // Submit the (required) first card empty to surface validation error states.
@@ -536,10 +601,10 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
 
   test("desktop: back-navigation state has no WCAG AA violations", async ({ page }) => {
     test.setTimeout(120_000);
-    const firstCardId = await openFirstQuestionCard(page, seeded.surveyUrl);
+    const firstCardId = await openFirstQuestionCard(page, surveys().surveyUrl);
     const firstCard = page.locator(`[id="${firstCardId}"]`);
 
-    await answerCurrentCard(page, firstCard);
+    await answerCurrentCard(firstCard);
     await advanceButton(firstCard).first().click({ timeout: ACTION_TIMEOUT });
 
     // Wait until the active card changes (we moved forward), then go Back.
@@ -564,11 +629,147 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
     reportAndAssert("desktop-back-nav", violations);
   });
 
+  /**
+   * Answered-state coverage (ENG-1298).
+   *
+   * The walks above scan each card exactly once, BEFORE answering it, and deliberately never
+   * answer the file input — so the markup a card renders only AFTER an interaction has never
+   * reached axe. This scans that markup on the second fixture, one card per state:
+   *
+   * - the SELECTED day cell, whose `bg-brand` + `text-primary-foreground` pairing is chosen for
+   *   contrast in packages/survey-ui but has never been measured by axe;
+   * - the external CTA's in-card link button, a branch the kitchen sink never renders because it
+   *   sets `buttonExternal: false`;
+   * - the uploaded-file chip and its delete control, with the dropzone gone (single-file mode
+   *   hides the uploader once a file is attached);
+   * - the Cal.com scheduler wrapper, which cannot live in the kitchen sink at all.
+   *
+   * Every state is asserted BEFORE it is scanned, so a click that silently did nothing fails
+   * here instead of being reported as clean — the same rule the walker's stall detection applies.
+   *
+   * One test, desktop only. These are card-local DOM states, so a second viewport, theme or
+   * direction would re-scan the same nodes for the price of another full walk.
+   */
+  test("answered states: selected date, external CTA, uploaded file and scheduler wrapper have no WCAG AA violations", async ({
+    page,
+  }) => {
+    test.setTimeout(180_000);
+    await blockCalEmbedRequests(page);
+
+    const variant = "answered-states";
+    const violations: ViolationRow[] = [];
+    let cardId = "";
+
+    await test.step("selected day cell", async () => {
+      cardId = await openFirstQuestionCard(page, surveys().answeredStatesSurveyUrl);
+      const card = page.locator(`[id="${cardId}"]`);
+      await expect(
+        card.getByRole("heading", { level: 2, name: DATE_HEADLINE }),
+        "the answered-states walk should open on the date card"
+      ).toBeVisible({ timeout: CARD_TIMEOUT });
+
+      // The single-h1 contract (ENG-2336) is asserted on the kitchen sink further down, but it is
+      // a per-survey property of the renderer, so hold the second fixture to it here too.
+      await expect(
+        page.locator("#fbjs").getByRole("heading", { level: 1 }),
+        "the answered-states survey should expose its name as the page's one h1"
+      ).toHaveText(A11Y_ANSWERED_STATES_SURVEY_NAME);
+
+      await answerCurrentCard(card);
+      // Asserted through `aria-selected` rather than the styling hook: it is what a screen reader
+      // consumes, and it is the state whose brand-on-brand contrast this scan exists to measure.
+      await expect(
+        card.getByRole("gridcell", { selected: true }),
+        "a day must be exposed as selected before the selected-day state can be scanned"
+      ).toHaveCount(1);
+      await waitForCardSettled(page, cardId);
+      await scan(page, variant, "date-day-selected", violations);
+    });
+
+    await test.step("external CTA button", async () => {
+      cardId = await advanceToNextCard(page, cardId);
+      const card = page.locator(`[id="${cardId}"]`);
+      await expect(
+        card.getByRole("heading", { level: 2, name: CTA_EXTERNAL_HEADLINE }),
+        "the date card should advance to the external CTA card"
+      ).toBeVisible({ timeout: CARD_TIMEOUT });
+      // The extra in-card button is the whole point of this card, so assert it rendered. It is
+      // never clicked: it opens a new tab.
+      await expect(
+        card.getByRole("button", { name: CTA_EXTERNAL_BUTTON_LABEL }),
+        "the external CTA button should render, named by its ctaButtonLabel"
+      ).toBeVisible({ timeout: ACTION_TIMEOUT });
+      await waitForCardSettled(page, cardId);
+      await scan(page, variant, "cta-external-button", violations);
+    });
+
+    await test.step("attached file", async () => {
+      cardId = await advanceToNextCard(page, cardId);
+      const card = page.locator(`[id="${cardId}"]`);
+      await expect(
+        card.getByRole("heading", { level: 2, name: FILE_UPLOAD_HEADLINE }),
+        "the CTA card should advance to the file upload card"
+      ).toBeVisible({ timeout: CARD_TIMEOUT });
+
+      await card.locator('input[type="file"]').setInputFiles({
+        name: UPLOAD_FIXTURE_FILE_NAME,
+        mimeType: "image/svg+xml",
+        buffer: UPLOAD_FIXTURE_BODY,
+      });
+
+      // The delete control only exists once a file is attached, and its accessible name IS the
+      // stored file name — so one assertion proves both that the mocked upload landed and that the
+      // control a respondent needs in order to undo it says which file it removes.
+      await expect(
+        card.getByRole("button", { name: `Delete ${UPLOAD_FIXTURE_FILE_NAME}`, exact: true }),
+        "the attached file should render one delete control named after it"
+      ).toHaveCount(1);
+      await waitForCardSettled(page, cardId);
+      await scan(page, variant, "file-upload-attached", violations);
+    });
+
+    await test.step("scheduler wrapper", async () => {
+      // The upload card is REQUIRED, so landing here at all proves the upload produced a response.
+      cardId = await advanceToNextCard(page, cardId);
+      const card = page.locator(`[id="${cardId}"]`);
+      await expect(
+        card.getByRole("heading", { level: 2, name: CAL_HEADLINE }),
+        "a required file upload must accept the mocked upload and advance to the scheduler card"
+      ).toBeVisible({ timeout: CARD_TIMEOUT });
+
+      // Not a markup check but a scope check: if the embed ever loads, this scan silently starts
+      // grading Cal.com's DOM, which nobody here can fix. Fail loudly instead.
+      const calContainer = card.locator('[id^="cal-embed-"]');
+      await expect(calContainer, "the scheduler wrapper should render").toHaveCount(1);
+      await expect(
+        calContainer.locator("iframe"),
+        "the third-party Cal.com embed must stay blocked: this scan covers our wrapper only"
+      ).toHaveCount(0);
+      await waitForCardSettled(page, cardId);
+      await scan(page, variant, "cal-scheduler-wrapper", violations);
+    });
+
+    await test.step("reaches the ending card", async () => {
+      // `advanceToNextCard` is not reused here: the next state is the ending card, which has no
+      // card id of its own, so it would fail that helper's "landed on the next card" assertion.
+      await advanceButton(page.locator(`[id="${cardId}"]`))
+        .first()
+        .click({ timeout: ACTION_TIMEOUT });
+      await waitForCardTransition(page, cardId);
+      await expect(
+        endingCardLocator(page).first(),
+        "the answered-states walk should reach the ending card"
+      ).toBeVisible({ timeout: CARD_TIMEOUT });
+    });
+
+    reportAndAssert(variant, violations);
+  });
+
   test("mobile: full walk has no WCAG AA violations", async ({ page }) => {
     test.setTimeout(180_000);
     await page.setViewportSize(MOBILE_VIEWPORT);
     const violations: ViolationRow[] = [];
-    await walkAndScan(page, "mobile", seeded.surveyUrl, violations);
+    await walkAndScan(page, "mobile", surveys().surveyUrl, violations);
     reportAndAssert("mobile", violations);
   });
 
@@ -576,7 +777,7 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
     test.setTimeout(180_000);
     await page.setViewportSize(TABLET_VIEWPORT);
     const violations: ViolationRow[] = [];
-    await walkAndScan(page, "tablet", seeded.surveyUrl, violations);
+    await walkAndScan(page, "tablet", surveys().surveyUrl, violations);
     reportAndAssert("tablet", violations);
   });
 
@@ -584,7 +785,7 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
     test.setTimeout(180_000);
     await page.emulateMedia({ forcedColors: "active" });
     const violations: ViolationRow[] = [];
-    await walkAndScan(page, "forced-colors", seeded.surveyUrl, violations);
+    await walkAndScan(page, "forced-colors", surveys().surveyUrl, violations);
     reportAndAssert("forced-colors", violations);
   });
 
@@ -592,7 +793,7 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
     test.setTimeout(180_000);
     await page.emulateMedia({ reducedMotion: "reduce" });
     const violations: ViolationRow[] = [];
-    await walkAndScan(page, "reduced-motion", seeded.surveyUrl, violations);
+    await walkAndScan(page, "reduced-motion", surveys().surveyUrl, violations);
     reportAndAssert("reduced-motion", violations);
   });
 
@@ -602,7 +803,7 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
     test("dark mode: full walk has no WCAG AA violations", async ({ page }) => {
       test.setTimeout(180_000);
       const violations: ViolationRow[] = [];
-      await walkAndScan(page, "dark", seeded.surveyUrl, violations);
+      await walkAndScan(page, "dark", surveys().surveyUrl, violations);
       reportAndAssert("dark", violations);
     });
   });
@@ -618,7 +819,7 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
     test.setTimeout(120_000);
     const widget = page.locator("#fbjs");
 
-    await page.goto(seeded.surveyUrl, { waitUntil: "domcontentloaded" });
+    await page.goto(surveys().surveyUrl, { waitUntil: "domcontentloaded" });
     await expect(activeCard(page).first(), "welcome card should render").toBeVisible({
       timeout: CARD_TIMEOUT,
     });
@@ -636,7 +837,7 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
       "welcome card headline should be an h2, not a styled div"
     ).toBeVisible();
 
-    const firstCardId = await openFirstQuestionCard(page, seeded.surveyUrl);
+    const firstCardId = await openFirstQuestionCard(page, surveys().surveyUrl);
     const firstCard = page.locator(`[id="${firstCardId}"]`);
 
     // Still exactly one h1 on a question card: the heading lives on the container, so the stacked
@@ -653,7 +854,7 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
 
     // Advance to the single-select card: its radiogroup is named through aria-labelledby pointing at
     // the headline id, which now sits on an element nested inside the h2.
-    await answerCurrentCard(page, firstCard);
+    await answerCurrentCard(firstCard);
     await advanceButton(firstCard).first().click({ timeout: ACTION_TIMEOUT });
     await waitForCardTransition(page, firstCardId);
 
@@ -668,12 +869,12 @@ test.describe("Survey accessibility (axe-core) @slow", () => {
     test.setTimeout(180_000);
     // Confirm the survey actually renders right-to-left before scanning, so this
     // variant genuinely exercises RTL rather than silently falling back to LTR.
-    await page.goto(seeded.rtlSurveyUrl, { waitUntil: "domcontentloaded" });
+    await page.goto(surveys().rtlSurveyUrl, { waitUntil: "domcontentloaded" });
     await expect(page.locator('[dir="rtl"]').first(), "survey should render RTL for ?lang=ar").toBeVisible({
       timeout: CARD_TIMEOUT,
     });
     const violations: ViolationRow[] = [];
-    await walkAndScan(page, "rtl-arabic", seeded.rtlSurveyUrl, violations);
+    await walkAndScan(page, "rtl-arabic", surveys().rtlSurveyUrl, violations);
     reportAndAssert("rtl-arabic", violations);
   });
 });

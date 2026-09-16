@@ -12,6 +12,13 @@ const setTestEnv = (overrides: Record<string, string | undefined> = {}) => {
     HUB_API_KEY: "test-hub-api-key",
     CUBEJS_API_URL: "https://cube.formbricks.local",
     CUBEJS_API_SECRET: "cube-secret",
+    AUTHZED_CONSISTENCY: undefined,
+    AUTHZED_ENABLED: undefined,
+    AUTHZED_ENDPOINT: undefined,
+    AUTHZED_INSECURE: undefined,
+    AUTHZED_SYSTEM_KEY: undefined,
+    AUTHZED_TOKEN: undefined,
+    MCP_OAUTH_JWKS_URL: undefined,
     ...overrides,
   };
 };
@@ -54,6 +61,34 @@ describe("env", () => {
     expect(env.PASSWORD_RESET_TOKEN_LIFETIME_MINUTES).toBe(45);
   });
 
+  test("uses the default invite rate limit when env var is not set", async () => {
+    setTestEnv({
+      INVITE_RATE_LIMIT_PER_24_HOURS: undefined,
+    });
+
+    const { env } = await import("./env");
+
+    expect(env.INVITE_RATE_LIMIT_PER_24_HOURS).toBe(50);
+  });
+
+  test("uses the configured invite rate limit", async () => {
+    setTestEnv({
+      INVITE_RATE_LIMIT_PER_24_HOURS: "250",
+    });
+
+    const { env } = await import("./env");
+
+    expect(env.INVITE_RATE_LIMIT_PER_24_HOURS).toBe(250);
+  });
+
+  test.each(["0", "1.5", "invalid"])("rejects invalid invite rate limit %s", async (limit) => {
+    setTestEnv({
+      INVITE_RATE_LIMIT_PER_24_HOURS: limit,
+    });
+
+    await expect(import("./env")).rejects.toThrow("INVITE_RATE_LIMIT_PER_24_HOURS");
+  });
+
   test("includes the failing field name and validation message in thrown errors", async () => {
     setTestEnv({
       ENCRYPTION_KEY: undefined,
@@ -86,6 +121,271 @@ describe("env", () => {
     const { env } = await import("./env");
 
     expect(env.DEBUG_SHOW_RESET_LINK).toBe("1");
+  });
+
+  test.each(["http://formbricks:3000/api/auth/jwks", "https://auth.example.com/internal/jwks?version=1"])(
+    "accepts MCP OAuth JWKS URL %s",
+    async (jwksUrl) => {
+      setTestEnv({ MCP_OAUTH_JWKS_URL: jwksUrl });
+
+      const { env } = await import("./env");
+
+      expect(env.MCP_OAUTH_JWKS_URL).toBe(jwksUrl);
+    }
+  );
+
+  test.each([
+    "ftp://formbricks/api/auth/jwks",
+    "http://user:password@formbricks:3000/api/auth/jwks",
+    "http://formbricks:3000/api/auth/jwks#key",
+  ])("rejects unsafe MCP OAuth JWKS URL %s", async (jwksUrl) => {
+    setTestEnv({ MCP_OAUTH_JWKS_URL: jwksUrl });
+
+    await expect(import("./env")).rejects.toThrow("MCP_OAUTH_JWKS_URL");
+  });
+
+  test.each(["true", "1"])("accepts enabled AuthZed boolean value %s", async (enabled) => {
+    setTestEnv({
+      AUTHZED_CONSISTENCY: "minimize_latency",
+      AUTHZED_ENABLED: enabled,
+      AUTHZED_ENDPOINT: "localhost:50051",
+      AUTHZED_INSECURE: enabled,
+      AUTHZED_SYSTEM_KEY: "formbricks",
+      AUTHZED_TOKEN: "test-authzed-token",
+    });
+
+    const { env } = await import("./env");
+
+    expect(env.AUTHZED_ENABLED).toBe(enabled);
+    expect(env.AUTHZED_INSECURE).toBe(enabled);
+    expect(env.AUTHZED_TOKEN).toBe("test-authzed-token");
+  });
+
+  test.each(["false", "0"])("accepts disabled AuthZed boolean value %s", async (enabled) => {
+    setTestEnv({
+      AUTHZED_ENABLED: enabled,
+      AUTHZED_INSECURE: enabled,
+    });
+
+    const { env } = await import("./env");
+
+    expect(env.AUTHZED_ENABLED).toBe(enabled);
+    expect(env.AUTHZED_INSECURE).toBe(enabled);
+  });
+
+  test("parses disabled AuthZed without credentials for builds and diagnostic commands", async () => {
+    setTestEnv();
+
+    const { env } = await import("./env");
+
+    expect(env.AUTHZED_ENABLED).toBeUndefined();
+    expect(env.AUTHZED_ENDPOINT).toBeUndefined();
+    expect(env.AUTHZED_TOKEN).toBeUndefined();
+    expect(env.AUTHZED_SYSTEM_KEY).toBeUndefined();
+  });
+
+  test.each([undefined, "false", "0"])(
+    "refuses server startup when AuthZed enablement is %s",
+    async (enabled) => {
+      setTestEnv({ AUTHZED_ENABLED: enabled });
+      const { assertAuthzedRuntimeConfiguration } = await import("./env");
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        expect(assertAuthzedRuntimeConfiguration).toThrow("Formbricks v6 requires AUTHZED_ENABLED=true");
+        expect(log.mock.calls[0][0]).toContain("AUTHZED_ENDPOINT");
+        expect(log.mock.calls[0][0]).toContain("AUTHZED_TOKEN");
+        expect(log.mock.calls[0][0]).toContain("AUTHZED_SYSTEM_KEY");
+        expect(log.mock.calls[0][0]).toContain("AUTHZED_CONSISTENCY");
+      } finally {
+        log.mockRestore();
+      }
+    }
+  );
+
+  test.each([undefined, "minimize_latency"])(
+    "requires fully consistent server configuration, not %s",
+    async (consistency) => {
+      const token = "private-runtime-token";
+      setTestEnv({
+        AUTHZED_ENABLED: "true",
+        AUTHZED_ENDPOINT: "localhost:50051",
+        AUTHZED_SYSTEM_KEY: "formbricks",
+        AUTHZED_TOKEN: token,
+        AUTHZED_CONSISTENCY: consistency,
+      });
+      const { assertAuthzedRuntimeConfiguration } = await import("./env");
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        expect(assertAuthzedRuntimeConfiguration).toThrow("AUTHZED_CONSISTENCY=fully_consistent");
+        expect(JSON.stringify(log.mock.calls)).not.toContain(token);
+      } finally {
+        log.mockRestore();
+      }
+    }
+  );
+
+  test.each(["true", "1"])(
+    "accepts complete server configuration with enablement %s without connecting",
+    async (enabled) => {
+      setTestEnv({
+        AUTHZED_ENABLED: enabled,
+        AUTHZED_ENDPOINT: "127.0.0.1:1",
+        AUTHZED_SYSTEM_KEY: "formbricks",
+        AUTHZED_TOKEN: "test-authzed-token",
+        AUTHZED_CONSISTENCY: "fully_consistent",
+      });
+      const { assertAuthzedRuntimeConfiguration, env } = await import("./env");
+      expect(assertAuthzedRuntimeConfiguration).not.toThrow();
+      expect(env.AUTHZED_INSECURE).toBeUndefined();
+    }
+  );
+
+  test("allows valid AuthZed credentials to be prepared while disabled", async () => {
+    setTestEnv({
+      AUTHZED_ENABLED: "false",
+      AUTHZED_ENDPOINT: "spicedb:50051",
+      AUTHZED_SYSTEM_KEY: "formbricks",
+      AUTHZED_TOKEN: "prepared-token",
+    });
+
+    const { env } = await import("./env");
+
+    expect(env.AUTHZED_ENDPOINT).toBe("spicedb:50051");
+    expect(env.AUTHZED_SYSTEM_KEY).toBe("formbricks");
+    expect(env.AUTHZED_TOKEN).toBe("prepared-token");
+  });
+
+  test.each([
+    ["AUTHZED_ENDPOINT", " "],
+    ["AUTHZED_TOKEN", " "],
+    ["AUTHZED_SYSTEM_KEY", ""],
+    ["AUTHZED_CONSISTENCY", ""],
+  ])("rejects invalid supplied %s while AuthZed is disabled", async (variable, value) => {
+    setTestEnv({ [variable]: value });
+
+    await expect(import("./env")).rejects.toThrow(variable);
+  });
+
+  test.each(["AUTHZED_ENDPOINT", "AUTHZED_TOKEN", "AUTHZED_SYSTEM_KEY"])(
+    "requires %s when AuthZed is enabled",
+    async (missingVariable) => {
+      const authzedEnv: Record<string, string | undefined> = {
+        AUTHZED_ENABLED: "true",
+        AUTHZED_ENDPOINT: "spicedb:50051",
+        AUTHZED_SYSTEM_KEY: "formbricks",
+        AUTHZED_TOKEN: "test-authzed-token",
+      };
+      authzedEnv[missingVariable] = undefined;
+      setTestEnv(authzedEnv);
+
+      await expect(import("./env")).rejects.toThrow(missingVariable);
+    }
+  );
+
+  test.each([
+    "localhost:50051",
+    "spicedb:50051",
+    "spicedb.authzed.svc.cluster.local:50051",
+    "grpc.authzed.com:443",
+    "127.0.0.1:1",
+    "10.20.30.40:65535",
+    "example.com:80",
+    "[::1]:50051",
+    "[2001:db8::1]:443",
+  ])("accepts valid AuthZed endpoint %s", async (endpoint) => {
+    setTestEnv({ AUTHZED_ENDPOINT: endpoint });
+
+    const { env } = await import("./env");
+
+    expect(env.AUTHZED_ENDPOINT).toBe(endpoint);
+  });
+
+  test.each([
+    "http://localhost:50051",
+    "https://grpc.authzed.com:443",
+    "spicedb",
+    "spicedb:0",
+    "spicedb:65536",
+    "spicedb:abc",
+    "spicedb:50051/path",
+    "spicedb:50051?query=true",
+    "spicedb:50051#fragment",
+    "user@spicedb:50051",
+    " spicedb:50051",
+    "spicedb:50051 ",
+    "::1:50051",
+  ])("rejects invalid AuthZed endpoint %s", async (endpoint) => {
+    setTestEnv({ AUTHZED_ENDPOINT: endpoint });
+
+    await expect(import("./env")).rejects.toThrow("AUTHZED_ENDPOINT");
+  });
+
+  test.each(["minimize_latency", "fully_consistent"])(
+    "accepts AuthZed consistency value %s",
+    async (consistency) => {
+      setTestEnv({ AUTHZED_CONSISTENCY: consistency });
+
+      const { env } = await import("./env");
+
+      expect(env.AUTHZED_CONSISTENCY).toBe(consistency);
+    }
+  );
+
+  test("rejects an unsupported AuthZed consistency value", async () => {
+    setTestEnv({ AUTHZED_CONSISTENCY: "at_least_as_fresh" });
+
+    await expect(import("./env")).rejects.toThrow("AUTHZED_CONSISTENCY");
+  });
+
+  test.each(["abc", "_a1", `a${"b".repeat(62)}1`])(
+    "accepts valid AuthZed system key %s",
+    async (systemKey) => {
+      setTestEnv({ AUTHZED_SYSTEM_KEY: systemKey });
+
+      const { env } = await import("./env");
+
+      expect(env.AUTHZED_SYSTEM_KEY).toBe(systemKey);
+    }
+  );
+
+  test.each([
+    "ab",
+    `a${"b".repeat(63)}1`,
+    "Formbricks",
+    "form-bricks",
+    "form/bricks",
+    "form bricks",
+    "formbricks_",
+    "1formbricks",
+    " formbricks",
+    "formbricks ",
+  ])("rejects invalid AuthZed system key %s", async (systemKey) => {
+    setTestEnv({ AUTHZED_SYSTEM_KEY: systemKey });
+
+    await expect(import("./env")).rejects.toThrow("AUTHZED_SYSTEM_KEY");
+  });
+
+  test("does not expose the AuthZed token in validation errors", async () => {
+    const token = "never-log-this-authzed-token";
+    setTestEnv({
+      AUTHZED_ENABLED: "true",
+      AUTHZED_ENDPOINT: "https://invalid.example.com:443",
+      AUTHZED_SYSTEM_KEY: "formbricks",
+      AUTHZED_TOKEN: token,
+    });
+
+    const error = await import("./env").catch((caughtError: unknown) => caughtError);
+
+    expect(String(error)).toContain("AUTHZED_ENDPOINT");
+    expect(String(error)).not.toContain(token);
+  });
+
+  test("rejects unsupported AuthZed boolean values", async () => {
+    setTestEnv({
+      AUTHZED_ENABLED: "yes",
+    });
+
+    await expect(import("./env")).rejects.toThrow("AUTHZED_ENABLED");
   });
 
   test("allows Google Cloud AI configuration to rely on ADC credentials", async () => {
