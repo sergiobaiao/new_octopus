@@ -34,6 +34,25 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # full history + tags, needed for git describe below
+
+      # Formbricks' own release CI stamps apps/web/package.json with the release version before
+      # building (see upstream .github/actions/update-package-version) -- without it the version
+      # stays "0.0.0" from the source tree, and the admin UI's update-available banner
+      # (MainNavigation.tsx comparing packageJson.version against the latest GitHub release)
+      # always thinks 0.0.0 is behind, regardless of what's actually running.
+      - name: Stamp apps/web/package.json with the current version
+        run: |
+          set -euo pipefail
+          VERSION="$(git describe --tags --abbrev=0 | sed 's/^v//')"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "ERROR: nearest tag '$VERSION' is not valid SemVer" >&2
+            exit 1
+          fi
+          jq --arg v "$VERSION" '.version = $v' apps/web/package.json > apps/web/package.json.tmp
+          mv apps/web/package.json.tmp apps/web/package.json
+          echo "Stamped apps/web/package.json version: $VERSION"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
