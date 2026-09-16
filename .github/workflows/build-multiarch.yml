@@ -35,7 +35,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          fetch-depth: 0 # full history + tags, needed for git describe below
+          fetch-depth: 0 # full history, needed for git describe below
+          fetch-tags: true # actions/checkout skips tags by default even with fetch-depth: 0
 
       # Formbricks' own release CI stamps apps/web/package.json with the release version before
       # building (see upstream .github/actions/update-package-version) -- without it the version

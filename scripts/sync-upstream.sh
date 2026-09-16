@@ -101,4 +101,13 @@ fi
 echo "Re-applying docker/patches/*.patch..."
 bash docker/patches/apply-patches.sh
 
+# If $REF is a tag, push it to origin too. CI stamps apps/web/package.json's
+# version from `git describe --tags`, which only sees tags that exist on the
+# remote it checks out -- a tag fetched from upstream but never pushed here
+# makes that step fail on a fresh CI clone.
+if git rev-parse --verify --quiet "refs/tags/$REF" >/dev/null; then
+  echo "Pushing tag $REF to origin (needed for CI's version stamp)..."
+  git push origin "refs/tags/$REF"
+fi
+
 echo "Done. Review the result (git log, git diff HEAD~1), then push when ready."
