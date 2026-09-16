@@ -55,7 +55,7 @@ else
 fi
 
 echo "Fetching upstream tags..."
-git fetch upstream --tags
+git fetch upstream --tags --force
 
 REF="${1:-}"
 if [ -z "$REF" ]; then
