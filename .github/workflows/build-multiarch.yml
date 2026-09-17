@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - v6-test
 
 permissions:
   contents: read
@@ -120,12 +121,26 @@ jobs:
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
+        # main tags :latest (production, watchtower-tracked); any other branch (v6-test) tags
+        # :v6-latest instead so a v6 build can never overwrite the tag production pulls.
         run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            ROLLING_TAG="latest"
+          else
+            ROLLING_TAG="v6-latest"
+          fi
           docker buildx imagetools create \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${ROLLING_TAG} \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          set -euo pipefail
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            ROLLING_TAG="latest"
+          else
+            ROLLING_TAG="v6-latest"
+          fi
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${ROLLING_TAG}
