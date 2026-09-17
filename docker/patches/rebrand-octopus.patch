@@ -14,10 +14,10 @@ index cc0fc401f..014541dc9 100644
    description: "Open-Source Survey Suite",
  };
 diff --git a/apps/web/locales/en-US.json b/apps/web/locales/en-US.json
-index 9dde412d9..336efc3f6 100644
+index d9a08b5b3..4bf083813 100644
 --- a/apps/web/locales/en-US.json
 +++ b/apps/web/locales/en-US.json
-@@ -599,8 +599,8 @@
+@@ -626,8 +626,8 @@
      "email_customization_preview_email_subject": "Formbricks Email Customization Preview",
      "email_customization_preview_email_text": "This is an email preview to show you which logo will be rendered in the emails.",
      "email_footer_text_1": "Have a great day!",
@@ -62,36 +62,47 @@ index 4b6e71205..8e838e370 100644
      },
      schemas: {
 diff --git a/apps/web/modules/auth/components/form-wrapper.tsx b/apps/web/modules/auth/components/form-wrapper.tsx
-index 3a8c49600..aefa84ba9 100644
+index 48aa7ca10..79015dec2 100644
 --- a/apps/web/modules/auth/components/form-wrapper.tsx
 +++ b/apps/web/modules/auth/components/form-wrapper.tsx
-@@ -1,5 +1,5 @@
+@@ -1,6 +1,5 @@
 -import Link from "next/link";
+-import { getTranslate } from "@/lingodotdev/server";
 -import { Logo } from "@/modules/ui/components/logo";
 +import Image from "next/image";
 +import FBLogo from "@/images/formbricks-wordmark.svg";
  
  interface FormWrapperProps {
    children: React.ReactNode;
-@@ -10,12 +10,7 @@ export const FormWrapper = ({ children }: FormWrapperProps) => {
-     <div className="mx-auto flex flex-1 flex-col justify-center px-4 py-12 sm:px-6 lg:flex-none lg:px-20 xl:px-24">
-       <div className="mx-auto w-full max-w-sm rounded-xl bg-white p-8 shadow-2xl lg:w-96">
+@@ -14,21 +13,12 @@ interface FormWrapperProps {
+  * Mobile-first: `min-h-dvh` rather than `min-h-screen`, because `100vh` on mobile is the
+  * *large* viewport, which pushes a vertically centred card under the browser chrome.
+  */
+-export const FormWrapper = async ({ children }: Readonly<FormWrapperProps>) => {
+-  const t = await getTranslate();
+-
++export const FormWrapper = ({ children }: Readonly<FormWrapperProps>) => {
+   return (
+     <div className="flex min-h-dvh w-full flex-col items-center justify-center bg-auth-backdrop px-4 py-8 sm:px-6 sm:py-12">
+       <main className="w-full max-w-sm rounded-xl bg-white p-6 shadow-2xl sm:p-8">
          <div className="mb-8 text-center">
 -          <Link
 -            target="_blank"
 -            href="https://formbricks.com?utm_source=formbricks-app&utm_medium=webapp&utm_campaign=auth_logo"
--            rel="noopener noreferrer">
--            <Logo className="mx-auto w-3/4" />
+-            rel="noopener noreferrer"
+-            aria-label={t("common.formbricks_homepage")}
+-            className="inline-block rounded-md focus-visible:ring-2 focus-visible:ring-brand-dark focus-visible:ring-offset-2 focus-visible:outline-hidden">
+-            <Logo aria-hidden="true" className="mx-auto w-40 sm:w-48" />
 -          </Link>
 +          <Image src={FBLogo} width={160} height={30} alt="Octopus" className="mx-auto" />
          </div>
          {children}
-       </div>
+       </main>
 diff --git a/apps/web/modules/auth/lib/auth.ts b/apps/web/modules/auth/lib/auth.ts
-index 4b414f66a..3b3be22a8 100644
+index a34fa183b..0e4742e51 100644
 --- a/apps/web/modules/auth/lib/auth.ts
 +++ b/apps/web/modules/auth/lib/auth.ts
-@@ -77,7 +77,7 @@ export const getUserLocale = async (userId: string): Promise<TUserLocale> => {
+@@ -71,7 +71,7 @@ export const getUserLocale = async (userId: string): Promise<TUserLocale> => {
   * analytics / Sentry / logger wiring are all live in better-auth-observability.ts.
   */
  export const auth = betterAuth({
@@ -100,7 +111,7 @@ index 4b414f66a..3b3be22a8 100644
    // ENG-1054: fall back to NEXTAUTH_SECRET (which already signed NextAuth's session cookies) when
    // BETTER_AUTH_SECRET is unset. This keeps existing envs working AND guarantees BA's cookie signing
    // uses the same secret the forward-auth proxy verifies with (session-cookie.ts) — a mismatch makes
-@@ -364,7 +364,7 @@ export const auth = betterAuth({
+@@ -381,7 +381,7 @@ export const auth = betterAuth({
      // User.twoFactorSecret|backupCodes into the twoFactor table, and move the login-time TOTP/
      // backup challenge out of the credentials authorize into Better Auth's flow.
      twoFactor({
@@ -123,10 +134,10 @@ index ec1c8600f..a715a27b7 100644
  
    return { secret, keyUri, dataUri, backupCodes };
 diff --git a/apps/web/modules/email/index.tsx b/apps/web/modules/email/index.tsx
-index 8039581ed..3ee3b682d 100644
+index 40b5ed971..f5c6624a6 100644
 --- a/apps/web/modules/email/index.tsx
 +++ b/apps/web/modules/email/index.tsx
-@@ -103,7 +103,7 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
+@@ -107,7 +107,7 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
      } as SMTPTransport.Options);
  
      const emailDefaults = {
@@ -163,10 +174,10 @@ index 3fe074952..10423d27c 100644
    "theme_color": "#ffffff"
  }
 diff --git a/packages/email/src/components/email-template.tsx b/packages/email/src/components/email-template.tsx
-index ff9952581..b1ecd5df6 100644
+index 31d025f1f..36e3ae86d 100644
 --- a/packages/email/src/components/email-template.tsx
 +++ b/packages/email/src/components/email-template.tsx
-@@ -2,8 +2,7 @@ import { Body, Container, Head, Html, Img, Link, Section, Tailwind, Text } from
+@@ -14,8 +14,7 @@ import {
  import { TEmailTemplateLegalProps } from "../types/email";
  import { TFunction } from "../types/translations";
  
@@ -174,20 +185,32 @@ index ff9952581..b1ecd5df6 100644
 -const logoLink = "https://formbricks.com?utm_source=formbricks-app&utm_medium=email&utm_campaign=email_logo";
 +const fbLogoUrl = "https://octopus.pge.pi.gov.br/logo-transparent.png";
  const FORCE_LIGHT_COLOR_SCHEME = "only light";
- 
- interface EmailTemplateProps extends TEmailTemplateLegalProps {
-@@ -49,9 +48,7 @@ export function EmailTemplate({
-           }}>
-           <Section>
-             {isDefaultLogo ? (
--              <Link href={logoLink} target="_blank">
--                <Img data-testid="default-logo-image" alt="Logo" className="mx-auto w-60" src={fbLogoUrl} />
--              </Link>
-+              <Img data-testid="default-logo-image" alt="Logo" className="mx-auto w-60" src={fbLogoUrl} />
-             ) : (
-               <Img
-                 data-testid="logo-image"
-@@ -66,13 +63,7 @@ export function EmailTemplate({
+ /**
+  * Widths are also emitted as `width` HTML attributes, in px, to match the `w-60` / `w-80` classes.
+@@ -76,15 +75,13 @@ export function EmailTemplate({
+           <Row>
+             <Column align="center" className="text-center">
+               {isDefaultLogo ? (
+-                <Link href={logoLink} target="_blank">
+-                  <Img
+-                    data-testid="default-logo-image"
+-                    alt="Logo"
+-                    className="mx-auto w-60"
+-                    src={fbLogoUrl}
+-                    width={DEFAULT_LOGO_WIDTH}
+-                  />
+-                </Link>
++                <Img
++                  data-testid="default-logo-image"
++                  alt="Logo"
++                  className="mx-auto w-60"
++                  src={fbLogoUrl}
++                  width={DEFAULT_LOGO_WIDTH}
++                />
+               ) : (
+                 <Img
+                   data-testid="logo-image"
+@@ -101,13 +98,7 @@ export function EmailTemplate({
            </Container>
  
            <Section className="mt-4 text-center text-sm">
