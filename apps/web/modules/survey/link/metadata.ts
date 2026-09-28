@@ -20,22 +20,25 @@ export const getMetadataForLinkSurvey = async (
 
   const { title, description, ogImage } = await getBasicSurveyMetadata(surveyId, languageCode, survey);
 
-  // Fetch organization whitelabel data for custom favicon
+  // Fetch organization whitelabel data for custom favicon and OG image fallback
   const workspaceContext = await getWorkspaceContextForLinkSurvey(survey.workspaceId);
   const customFaviconUrl = workspaceContext.organizationWhitelabel?.faviconUrl;
+  const orgLogoUrl = workspaceContext.organizationWhitelabel?.logoUrl;
 
   // Use the shared function for creating the base metadata but override with custom data
   const brandColor = getMetadataBrandColor(workspaceContext.workspace.styling, survey.styling);
   const baseMetadata = getSurveyOpenGraphMetadata(survey.id, title, brandColor);
 
-  // Override with the custom image URL
+  // Image priority: per-survey custom OG image > org whitelabel logo > auto-generated brand card.
+  const resolvedImage = ogImage ?? orgLogoUrl ?? undefined;
+
   if (baseMetadata.openGraph) {
-    baseMetadata.openGraph.images = ogImage ?? baseMetadata.openGraph.images;
+    baseMetadata.openGraph.images = resolvedImage ?? baseMetadata.openGraph.images;
     baseMetadata.openGraph.description = description;
   }
 
   if (baseMetadata.twitter) {
-    baseMetadata.twitter.images = ogImage ?? baseMetadata.twitter.images;
+    baseMetadata.twitter.images = resolvedImage ?? baseMetadata.twitter.images;
     baseMetadata.twitter.description = description;
   }
 
