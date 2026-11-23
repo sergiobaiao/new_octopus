@@ -5,8 +5,8 @@ import * as Collapsible from "@radix-ui/react-collapsible";
 import { PlusIcon } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Workspace } from "@formbricks/database/prisma-browser";
 import { cn } from "@/lib/cn";
+import { type TWorkspaceWithoutCustomCss } from "@/modules/custom-css/lib/types";
 import {
   type TElement,
   type TElementCategoryMeta,
@@ -18,9 +18,9 @@ import {
 } from "@/modules/survey/lib/elements";
 
 interface AddElementButtonProps {
-  addElement: (element: any) => void;
-  workspace: Workspace;
-  isCxMode: boolean;
+  readonly addElement: (element: any) => void;
+  readonly workspace: TWorkspaceWithoutCustomCss;
+  readonly isCxMode: boolean;
 }
 
 export const AddElementButton = ({ addElement, workspace, isCxMode }: AddElementButtonProps) => {

@@ -120,6 +120,8 @@ const buildListWhere = (
 export interface WorkflowListPage {
   workflows: WorkflowRowWithLastRun[];
   nextCursor: string | null;
+  /** Workflows matching the filters across all pages; null unless `includeTotalCount` was requested. */
+  totalCount: number | null;
 }
 
 /** Eager-load shape for a run's step logs, ordered by sequence; mirrors the injected delegate. */
@@ -131,8 +133,18 @@ const buildRunCursorWhere = (cursor: TWorkflowRunListCursor): WorkflowRunWhereIn
   return { OR: [{ createdAt: { lt: value } }, { createdAt: value, id: { lt: cursor.id } }] };
 };
 
+/**
+ * Leaves out runs of surveys the caller may not read (ENG-3282). Spelled as `surveyId IS NULL OR NOT IN`
+ * because SQL's `NOT IN` alone also drops the rows whose `surveyId` is null. Nested under `AND` so it
+ * never collides with the cursor's own `OR`.
+ */
+const buildRunSurveyExclusionWhere = (excludeSurveyIds: ReadonlyArray<string>): WorkflowRunWhereInput =>
+  excludeSurveyIds.length === 0
+    ? {}
+    : { AND: [{ OR: [{ surveyId: null }, { surveyId: { notIn: [...excludeSurveyIds] } }] }] };
+
 const buildRunListWhere = (
-  input: TListWorkflowRunsInput,
+  input: TListWorkflowRunsServiceInput,
   cursor: TWorkflowRunListCursor | null
 ): WorkflowRunWhereInput => ({
   workspaceId: input.workspaceId,
@@ -141,7 +153,13 @@ const buildRunListWhere = (
   ...(input.statusIn ? { status: { in: input.statusIn } } : {}),
   ...(input.isDryRun !== undefined ? { isDryRun: input.isDryRun } : {}),
   ...(cursor ? buildRunCursorWhere(cursor) : {}),
+  ...buildRunSurveyExclusionWhere(input.excludeSurveyIds ?? []),
 });
+
+/** The list query plus the surveys whose runs the caller may not read (see `listUnreadableSurveyIds`). */
+export type TListWorkflowRunsServiceInput = TListWorkflowRunsInput & {
+  excludeSurveyIds?: ReadonlyArray<string>;
+};
 
 export interface WorkflowRunListPage {
   runs: WorkflowRunListRow[];
@@ -170,7 +188,7 @@ export interface WorkflowsService {
     options: { definition: TWorkflowExecutableDefinition; publishedBy: string | null }
   ) => Promise<WorkflowRowWithLastRun>;
   disableWorkflow: (params: WorkflowScopedParams) => Promise<WorkflowRowWithLastRun>;
-  listWorkflowRuns: (input: TListWorkflowRunsInput) => Promise<WorkflowRunListPage>;
+  listWorkflowRuns: (input: TListWorkflowRunsServiceInput) => Promise<WorkflowRunListPage>;
   getWorkflowRun: (runId: string) => Promise<WorkflowRunWithLogsRow | null>;
 }
 
@@ -184,12 +202,18 @@ export const createWorkflowsService = ({ prisma }: { prisma: WorkflowsDb }): Wor
   async listWorkflows(input) {
     const cursor = input.cursor ? decodeWorkflowListCursor(input.cursor, input.sortBy) : null;
 
-    const rows = await prisma.workflow.findMany({
-      where: buildListWhere(input, cursor),
-      orderBy: getOrderBy(input.sortBy),
-      take: input.limit + 1,
-      include: LAST_RUN_INCLUDE,
-    });
+    // The count runs beside the page, over the same filters minus the cursor (never a skip).
+    const [rows, totalCount] = await Promise.all([
+      prisma.workflow.findMany({
+        where: buildListWhere(input, cursor),
+        orderBy: getOrderBy(input.sortBy),
+        take: input.limit + 1,
+        include: LAST_RUN_INCLUDE,
+      }),
+      input.includeTotalCount
+        ? prisma.workflow.count({ where: buildListWhere(input, null) })
+        : Promise.resolve(null),
+    ]);
 
     const hasMore = rows.length > input.limit;
     const workflows = hasMore ? rows.slice(0, input.limit) : rows;
@@ -197,6 +221,7 @@ export const createWorkflowsService = ({ prisma }: { prisma: WorkflowsDb }): Wor
 
     return {
       workflows,
+      totalCount,
       nextCursor:
         hasMore && lastRow
           ? encodeWorkflowListCursor(buildNextWorkflowListCursor(lastRow, input.sortBy))

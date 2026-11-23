@@ -19,6 +19,7 @@ import {
 } from "@formbricks/types/errors";
 import { RequestBodyTooLargeError } from "@/app/lib/api/request-body";
 import { getSession } from "@/modules/auth/lib/session";
+import { getAuditRequestMetadata } from "@/modules/ee/audit-logs/lib/request-metadata";
 
 // Mock Sentry
 vi.mock("@sentry/nextjs", () => ({
@@ -43,14 +44,23 @@ vi.mock("@/lib/user/service", () => ({
   getUser: vi.fn(),
 }));
 
+// Mock metadata snapshots, independently of the IP capture preference.
+vi.mock("@/modules/ee/audit-logs/lib/request-metadata", () => ({
+  getAuditRequestMetadata: vi.fn().mockResolvedValue({ ipAddress: "unknown", userAgent: "Agent/1" }),
+  UNKNOWN_AUDIT_REQUEST_METADATA: { ipAddress: "unknown", userAgent: "unknown" },
+}));
+
 // Mock client IP
 vi.mock("@/lib/utils/client-ip", () => ({
   getClientIpFromHeaders: vi.fn(),
 }));
 
 // Mock constants
+const { auditFlags } = vi.hoisted(() => ({ auditFlags: { enabled: false } }));
 vi.mock("@/lib/constants", () => ({
-  AUDIT_LOG_ENABLED: false,
+  get AUDIT_LOG_ENABLED() {
+    return auditFlags.enabled;
+  },
   AUDIT_LOG_GET_USER_IP: false,
 }));
 
@@ -70,11 +80,13 @@ describe("isExpectedError (shared helper)", () => {
       "ValidationError",
       "AuthenticationError",
       "OperationNotAllowedError",
+      "ResponseAlreadyFinishedError",
       "QueryExecutionError",
       "TooManyRequestsError",
       "InvalidPasswordResetTokenError",
       "UniqueConstraintError",
       "RequestBodyTooLargeError",
+      "SurveyLinkedCreativesError",
     ];
 
     expect(EXPECTED_ERROR_NAMES.size).toBe(expected.length);
@@ -219,6 +231,11 @@ describe("actionClient handleServerError", () => {
       );
     });
 
+    test("an unauthenticated action's error is captured without a user", async () => {
+      await executeThrowingAction(new Error("Something broke"));
+      expect(vi.mocked(Sentry.captureException).mock.calls[0][1]).not.toHaveProperty("user");
+    });
+
     test("TypeError is sent to Sentry and returns default message", async () => {
       const error = new TypeError("Cannot read properties of undefined");
       const result = await executeThrowingAction(error);
@@ -289,5 +306,39 @@ describe("authenticatedActionClient", () => {
     expect(result?.data).toBe("success");
     expect(result?.serverError).toBeUndefined();
     expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  test("attributes an unexpected error to the signed-in user by id only", async () => {
+    vi.mocked(getSession).mockResolvedValue({ user: { id: "user-1" }, expires: "2999-01-01T00:00:00.000Z" });
+    vi.mocked(getUser).mockResolvedValue({ id: "user-1", name: "Test", email: "test@example.com" } as Awaited<
+      ReturnType<typeof getUser>
+    >);
+    const error = new Error("Something broke");
+
+    const action = authenticatedActionClient.action(async () => {
+      throw error;
+    });
+    const result = await action();
+
+    expect(result?.serverError).toBe(DEFAULT_SERVER_ERROR_MESSAGE);
+    expect(Sentry.captureException).toHaveBeenCalledWith(
+      error,
+      expect.objectContaining({ user: { id: "user-1" } })
+    );
+  });
+});
+
+describe("audit request metadata context", () => {
+  afterEach(() => {
+    auditFlags.enabled = false;
+  });
+
+  test("spreads the request metadata snapshot into the audit context", async () => {
+    auditFlags.enabled = true;
+    vi.mocked(getAuditRequestMetadata).mockResolvedValue({ ipAddress: "unknown", userAgent: "Agent/1" });
+    const { actionClient } = await import("./index");
+    const action = actionClient.action(async ({ ctx }) => ctx.auditLoggingCtx);
+    const result = await action();
+    expect(result?.data).toMatchObject({ ipAddress: "unknown", userAgent: "Agent/1" });
   });
 });

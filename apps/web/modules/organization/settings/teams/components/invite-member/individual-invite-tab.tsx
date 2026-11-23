@@ -21,17 +21,18 @@ import { MultiSelect } from "@/modules/ui/components/multi-select";
 import { Small } from "@/modules/ui/components/typography";
 
 interface IndividualInviteTabProps {
-  setOpen: (v: boolean) => void;
-  onSubmit: (
+  readonly setOpen: (v: boolean) => void;
+  readonly onSubmit: (
     data: { name: string; email: string; role: TOrganizationRole; teamIds: string[] }[]
   ) => Promise<boolean>;
-  teams: TOrganizationTeam[];
-  organizationId: string;
-  isAccessControlAllowed: boolean;
-  isFormbricksCloud: boolean;
-  membershipRole?: TOrganizationRole;
-  showTeamAdminRestrictions: boolean;
-  enterpriseLicenseRequestFormUrl: string;
+  readonly teams: TOrganizationTeam[];
+  readonly organizationId: string;
+  readonly isAccessControlAllowed: boolean;
+  readonly isFormbricksCloud: boolean;
+  readonly isDashboardViewerRoleEnabled: boolean;
+  readonly membershipRole?: TOrganizationRole;
+  readonly showTeamAdminRestrictions: boolean;
+  readonly enterpriseLicenseRequestFormUrl: string;
 }
 
 export const IndividualInviteTab = ({
@@ -41,6 +42,7 @@ export const IndividualInviteTab = ({
   organizationId,
   isAccessControlAllowed,
   isFormbricksCloud,
+  isDashboardViewerRoleEnabled,
   membershipRole,
   showTeamAdminRestrictions,
   enterpriseLicenseRequestFormUrl,
@@ -136,12 +138,21 @@ export const IndividualInviteTab = ({
                 control={control}
                 isAccessControlAllowed={isAccessControlAllowed}
                 isFormbricksCloud={isFormbricksCloud}
+                isDashboardViewerRoleEnabled={isDashboardViewerRoleEnabled}
                 membershipRole={membershipRole}
               />
               {watch("role") === "member" && (
                 <Alert className="mt-2" variant="info">
                   <AlertDescription>
                     {t("workspace.settings.teams.member_role_info_message")}
+                  </AlertDescription>
+                </Alert>
+              )}
+              {watch("role") === "dashboard_viewer" && (
+                // A viewer sees only dashboards, and only in the workspaces a team grants it (U20).
+                <Alert className="mt-2" variant="info">
+                  <AlertDescription>
+                    {t("workspace.settings.teams.dashboard_viewer_role_info_message")}
                   </AlertDescription>
                 </Alert>
               )}

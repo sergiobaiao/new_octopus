@@ -1,0 +1,210 @@
+import { z } from "zod";
+import type { TSurveyElementTypeEnum } from "@formbricks/types/surveys/constants";
+import {
+  SURVEY_IMPORT_PLAN_MAX_ENTRIES,
+  SURVEY_IMPORT_PLAN_MAX_RAW_NOTE_CHARS,
+  SURVEY_IMPORT_PLAN_MAX_REF_CHARS,
+  SURVEY_IMPORT_PLAN_MAX_TYPE_CHARS,
+  SURVEY_IMPORT_QSF_PLAN_MAX_EXCLUDED_KEYS,
+  SURVEY_IMPORT_QSF_PLAN_MAX_NOTES_PER_ENTRY,
+} from "../limits";
+
+/**
+ * The AI plan for a Qualtrics import (ENG-3479, option B): which Formbricks type each question
+ * becomes, which of its option lists plays which role, and one plain-language line per logic rule.
+ * Nothing more. Blocks are not the AI's to decide: one Qualtrics page is one block (ENG-3410), and the
+ * assembly builds them from the reader's pages.
+ *
+ * The plan holds refs (`QID3`), text keys (`c12`), enums, booleans and numbers. No field in it is a URL
+ * or text that lands in the survey: the assembly copies every text from the file by key. The only free
+ * text is `logicNotes` and skip reasons, which go to the report alone, cleaned and capped.
+ *
+ * One flat schema with a `type` enum and nullable role fields, not a union per type: unions do not
+ * survive every provider's JSON-schema conversion (see `generate/schemas.ts`), and the code checks in
+ * `plan-checks.ts` enforce which fields each type uses — the same strength, provider-safe.
+ */
+
+/**
+ * The element types an import may produce. Never `pictureSelection` (it needs image URLs) or `cal` (an
+ * external host); a CTA is always built without an external button.
+ */
+export const QSF_PLAN_ELEMENT_TYPES = [
+  "openText",
+  "multipleChoiceSingle",
+  "multipleChoiceMulti",
+  "matrix",
+  "nps",
+  "rating",
+  "csat",
+  "ces",
+  "ranking",
+  "date",
+  "fileUpload",
+  "signature",
+  "contactInfo",
+  "address",
+  "consent",
+  "cta",
+] as const satisfies readonly `${TSurveyElementTypeEnum}`[];
+
+export type TQsfPlanElementType = (typeof QSF_PLAN_ELEMENT_TYPES)[number];
+
+export const QSF_PLAN_CONTACT_FIELDS = ["firstName", "lastName", "email", "phone", "company"] as const;
+export type TQsfPlanContactField = (typeof QSF_PLAN_CONTACT_FIELDS)[number];
+export const QSF_PLAN_ADDRESS_FIELDS = [
+  "addressLine1",
+  "addressLine2",
+  "city",
+  "state",
+  "zip",
+  "country",
+] as const;
+export type TQsfPlanAddressField = (typeof QSF_PLAN_ADDRESS_FIELDS)[number];
+/** A form question's fields: a contact form's or an address's, both mapped in `contactFields`. */
+export const QSF_PLAN_FORM_FIELDS = [...QSF_PLAN_CONTACT_FIELDS, ...QSF_PLAN_ADDRESS_FIELDS] as const;
+export type TQsfPlanFormField = (typeof QSF_PLAN_FORM_FIELDS)[number];
+
+export const QSF_PLAN_INPUT_TYPES = ["text", "email", "url", "number", "phone"] as const;
+export const QSF_PLAN_SCALES = ["number", "smiley", "star"] as const;
+/** As strings for the AI, like Create with AI's ranges: numeric enums do not survive every provider. */
+export const QSF_PLAN_RANGES = ["3", "4", "5", "6", "7", "10"] as const;
+export const QSF_PLAN_DATE_FORMATS = ["M-d-y", "d-M-y", "y-M-d"] as const;
+
+const ZOptionSource = z.enum(["choices", "answers"]);
+
+/**
+ * What the provider is asked for. String enums only, no preprocess or transforms: those do not survive
+ * the JSON-schema conversion structured output goes through.
+ */
+export const ZQsfImportPlanForAI = z.object({
+  questions: z
+    .array(
+      z.object({
+        ref: z.string().describe("The question's ref, e.g. QID3"),
+        type: z.enum(QSF_PLAN_ELEMENT_TYPES),
+        required: z.boolean().default(false),
+        choicesFrom: ZOptionSource.nullable().default(null),
+        rowsFrom: ZOptionSource.nullable().default(null),
+        columnsFrom: ZOptionSource.nullable().default(null),
+        otherChoiceKey: z.string().nullable().default(null),
+        noneChoiceKey: z.string().nullable().default(null),
+        labelKey: z.string().nullable().default(null),
+        excludedKeys: z.array(z.string()).nullable().default([]),
+        contactFields: z
+          .array(z.object({ field: z.enum(QSF_PLAN_FORM_FIELDS), key: z.string() }))
+          .nullable()
+          .default([])
+          .describe("contactInfo and address only: which choice key each field of the form is"),
+        inputType: z.enum(QSF_PLAN_INPUT_TYPES).nullable().default(null),
+        scale: z.enum(QSF_PLAN_SCALES).nullable().default(null),
+        range: z
+          .union([z.enum(QSF_PLAN_RANGES), z.number()])
+          .nullable()
+          .default(null),
+        format: z.enum(QSF_PLAN_DATE_FORMATS).nullable().default(null),
+        logicNotes: z
+          .array(z.string())
+          .nullable()
+          .default([])
+          .describe("One sentence per logic rule of the question"),
+      })
+    )
+    .nullable()
+    .default([])
+    .describe("Every question that becomes a Formbricks question"),
+  skipped: z
+    .array(z.object({ ref: z.string(), reason: z.string().describe("Why, in one short sentence") }))
+    .nullable()
+    .default([])
+    .describe("Questions Formbricks cannot represent"),
+  pages: z
+    .array(
+      z.object({
+        id: z.string().describe("The page's id, e.g. p3"),
+        logicNotes: z
+          .array(z.string())
+          .nullable()
+          .default([])
+          .describe("One sentence per branch or randomizer rule of the page"),
+      })
+    )
+    .nullable()
+    .default([])
+    .describe("Only pages that have logic rules"),
+});
+
+// Bounds on what comes back, so a hostile or broken response costs a bounded amount to check
+// (`../limits.ts`).
+const ZRef = z.string().max(SURVEY_IMPORT_PLAN_MAX_REF_CHARS);
+const ZKey = z.string().max(SURVEY_IMPORT_PLAN_MAX_REF_CHARS);
+const ZRawNotes = z
+  .array(z.string().max(SURVEY_IMPORT_PLAN_MAX_RAW_NOTE_CHARS))
+  .max(SURVEY_IMPORT_PLAN_MAX_ENTRIES)
+  .transform((notes) => notes.slice(0, SURVEY_IMPORT_QSF_PLAN_MAX_NOTES_PER_ENTRY));
+
+/**
+ * What a returned plan is checked against. Lenient where the checks are stricter: `type` is any short
+ * string here, and `plan-checks.ts` holds the allowlist, so the allowlist is enforced on every path —
+ * including a provider without structured output, or a response that skipped schema validation.
+ */
+export const ZQsfImportPlanEnvelope = z.object({
+  questions: z
+    .array(z.unknown())
+    .max(SURVEY_IMPORT_PLAN_MAX_ENTRIES)
+    .nullish()
+    .transform((questions) => questions ?? []),
+  skipped: z
+    .array(z.unknown())
+    .max(SURVEY_IMPORT_PLAN_MAX_ENTRIES)
+    .nullish()
+    .transform((skipped) => skipped ?? []),
+  // Optional here: a plan for questions with no page rules has nothing to say about pages.
+  pages: z
+    .array(z.unknown())
+    .max(SURVEY_IMPORT_PLAN_MAX_ENTRIES)
+    .nullish()
+    .transform((pages) => pages ?? [])
+    .optional(),
+});
+
+export const ZQsfPlanQuestion = z.object({
+  ref: ZRef,
+  type: z.string().max(SURVEY_IMPORT_PLAN_MAX_TYPE_CHARS),
+  required: z.boolean(),
+  choicesFrom: ZOptionSource.nullable(),
+  rowsFrom: ZOptionSource.nullable(),
+  columnsFrom: ZOptionSource.nullable(),
+  otherChoiceKey: ZKey.nullable(),
+  noneChoiceKey: ZKey.nullable(),
+  labelKey: ZKey.nullable(),
+  excludedKeys: z
+    .array(ZKey)
+    .max(SURVEY_IMPORT_QSF_PLAN_MAX_EXCLUDED_KEYS)
+    .nullish()
+    .transform((keys) => keys ?? []),
+  contactFields: z
+    .array(z.object({ field: z.enum(QSF_PLAN_FORM_FIELDS), key: ZKey }))
+    .max(QSF_PLAN_FORM_FIELDS.length)
+    .nullish()
+    .transform((fields) => fields ?? []),
+  inputType: z.enum(QSF_PLAN_INPUT_TYPES).nullable(),
+  scale: z.enum(QSF_PLAN_SCALES).nullable(),
+  range: z
+    .union([z.enum(QSF_PLAN_RANGES), z.number().int()])
+    .nullable()
+    .transform((range) => (range === null ? null : String(range))),
+  format: z.enum(QSF_PLAN_DATE_FORMATS).nullable(),
+  logicNotes: ZRawNotes.nullish().transform((notes) => notes ?? []),
+});
+
+export const ZQsfPlanPage = z.object({
+  id: ZRef,
+  logicNotes: ZRawNotes.nullish().transform((notes) => notes ?? []),
+});
+
+export const ZQsfPlanSkip = z.object({
+  ref: ZRef,
+  reason: z.string().max(SURVEY_IMPORT_PLAN_MAX_RAW_NOTE_CHARS),
+});
+
+export type TQsfPlanQuestion = z.infer<typeof ZQsfPlanQuestion>;

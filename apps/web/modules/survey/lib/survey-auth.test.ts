@@ -5,6 +5,7 @@ import { Prisma } from "@formbricks/database/prisma";
 import type { Session } from "@formbricks/types/auth";
 import { DatabaseError } from "@formbricks/types/errors";
 import { can } from "@/lib/authorization";
+import { isSurveyVisibilityReady } from "@/lib/authzed/scope-readiness";
 import { getSession } from "@/modules/auth/lib/session";
 import { getWorkspaceAuth } from "@/modules/workspaces/lib/utils";
 import { TWorkspaceAuth } from "@/modules/workspaces/types/workspace-auth";
@@ -39,6 +40,8 @@ vi.mock("next/navigation", () => ({
     throw new Error("NEXT_NOT_FOUND");
   }),
 }));
+
+vi.mock("@/lib/authzed/scope-readiness", () => ({ isSurveyVisibilityReady: vi.fn(async () => false) }));
 
 vi.mock("@/modules/workspaces/lib/utils", () => ({
   getWorkspaceAuth: vi.fn(),
@@ -80,7 +83,11 @@ const buildSession = (userId: string): Session => ({
 // Only `workspace.id` is read by the code under test; the rest of TWorkspaceAuth is getWorkspaceAuth's
 // contract, covered where that helper is tested.
 const buildWorkspaceAuth = (workspaceId: string) =>
-  ({ workspace: { id: workspaceId }, isOwner: true }) as unknown as TWorkspaceAuth;
+  ({
+    workspace: { id: workspaceId },
+    session: buildSession(ATTACKER_USER_ID),
+    isOwner: true,
+  }) as unknown as TWorkspaceAuth;
 
 describe("canReadSurveyInWorkspace", () => {
   beforeEach(() => {
@@ -97,9 +104,9 @@ describe("canReadSurveyInWorkspace", () => {
       where: { id: SURVEY_ID },
       select: { workspaceId: true },
     });
-    expect(mockCan).toHaveBeenCalledWith({ type: "user", id: ATTACKER_USER_ID }, "workspace.read", {
-      type: "workspace",
-      id: VICTIM_WORKSPACE_ID,
+    expect(mockCan).toHaveBeenCalledWith({ type: "user", id: ATTACKER_USER_ID }, "survey.read", {
+      type: "survey",
+      id: SURVEY_ID,
     });
   });
 
@@ -134,6 +141,7 @@ describe("canReadSurveyInWorkspace", () => {
 describe("getSurveyAuth", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockCan.mockResolvedValue(true);
   });
 
   test("returns the workspace authorization when the survey belongs to the workspace", async () => {
@@ -187,5 +195,48 @@ describe("getSurveyAuth", () => {
     mockPrismaSurvey.findUnique.mockRejectedValueOnce(error);
 
     await expect(getSurveyAuth(VICTIM_WORKSPACE_ID, SURVEY_ID)).rejects.toThrow(error);
+  });
+});
+
+describe("survey visibility enforced (ENG-3282)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(isSurveyVisibilityReady).mockResolvedValue(true);
+    mockGetSession.mockResolvedValue(buildSession(ATTACKER_USER_ID));
+  });
+
+  test("canReadSurveyInWorkspace asks about the survey itself, not the workspace", async () => {
+    mockSurveyLookup({ workspaceId: VICTIM_WORKSPACE_ID });
+    mockCan.mockResolvedValue(false);
+
+    await expect(canReadSurveyInWorkspace(VICTIM_WORKSPACE_ID, SURVEY_ID)).resolves.toBe(false);
+    expect(mockCan).toHaveBeenCalledWith({ type: "user", id: ATTACKER_USER_ID }, "survey.read", {
+      type: "survey",
+      id: SURVEY_ID,
+    });
+  });
+
+  test("getSurveyAuth answers 404 for a restricted survey the caller may not read", async () => {
+    mockGetWorkspaceAuth.mockResolvedValue({
+      ...buildWorkspaceAuth(VICTIM_WORKSPACE_ID),
+      session: buildSession(ATTACKER_USER_ID),
+    } as TWorkspaceAuth);
+    mockSurveyLookup({ workspaceId: VICTIM_WORKSPACE_ID });
+    mockCan.mockResolvedValue(false);
+
+    await expect(getSurveyAuth(VICTIM_WORKSPACE_ID, SURVEY_ID)).rejects.toThrow("NEXT_NOT_FOUND");
+    expect(mockCan).toHaveBeenCalledWith({ type: "user", id: ATTACKER_USER_ID }, "survey.read", {
+      type: "survey",
+      id: SURVEY_ID,
+    });
+  });
+
+  test("getSurveyAuth returns the workspace auth when the survey is readable", async () => {
+    const auth = { ...buildWorkspaceAuth(VICTIM_WORKSPACE_ID), session: buildSession(ATTACKER_USER_ID) };
+    mockGetWorkspaceAuth.mockResolvedValue(auth as TWorkspaceAuth);
+    mockSurveyLookup({ workspaceId: VICTIM_WORKSPACE_ID });
+    mockCan.mockResolvedValue(true);
+
+    await expect(getSurveyAuth(VICTIM_WORKSPACE_ID, SURVEY_ID)).resolves.toBe(auth);
   });
 });

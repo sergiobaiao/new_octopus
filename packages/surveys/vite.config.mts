@@ -1,4 +1,6 @@
 import preact from "@preact/preset-vite";
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { visualizer } from "rollup-plugin-visualizer";
@@ -6,6 +8,7 @@ import { type Plugin, loadEnv } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 import { defineConfig } from "vitest/config";
 import { copyCompiledAssetsPlugin } from "../vite-plugins/copy-compiled-assets";
+import { UMD_WITHOUT_AMD_OUTPUT } from "../vite-plugins/umd-without-amd";
 
 // Stubs the @formbricks/survey-ui/styles?inline import during vitest runs so that
 // tests do not require packages/survey-ui to be built first. The plugin only
@@ -36,6 +39,51 @@ const stubSurveyUiStylesForVitest = (): Plugin => {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+const localesDir = resolve(__dirname, "locales");
+const fontsDir = resolve(__dirname, "assets/fonts");
+
+/**
+ * Code-unit order, deliberately not `localeCompare`.
+ *
+ * This orders the input to a content hash, and `localeCompare` resolves its collation from the host's
+ * locale and ICU data — so the same locale files could hash differently on another machine and bust the
+ * CDN cache for no reason. Mirrors the helpers of the same name under `apps/web`, which a build config
+ * in another workspace cannot import.
+ */
+const byCodeUnit = (left: string, right: string): number => {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+};
+
+/**
+ * Content hash of the files in `dir` that `include` accepts: each file's name, then its bytes, in
+ * code-unit order. Both `/js/*` hashes below are this one function, so they cannot drift apart.
+ */
+const computeDirHash = (dir: string, include: (name: string) => boolean): string => {
+  const hash = createHash("sha256");
+  const files = readdirSync(dir).filter(include);
+  files.sort(byCodeUnit);
+  for (const file of files) {
+    hash.update(file);
+    hash.update(readFileSync(resolve(dir, file)));
+  }
+  return hash.digest("hex").slice(0, 12);
+};
+
+/**
+ * Content hash of every shipped locale, injected as `__FB_LOCALES_HASH__` and appended to each
+ * on-demand locale fetch as `?v=`. `/js/*` is served with a 30-day `s-maxage`, so without a token that
+ * moves with the strings a fresh bundle could be handed a month-old bundle of them; with one, the URL
+ * changes only when a translation actually does.
+ */
+const computeLocalesHash = (): string => computeDirHash(localesDir, (name) => name.endsWith(".json"));
+
+/**
+ * Content hash of the shipped font files, injected as `__FB_FONTS_HASH__` and appended to the on-demand
+ * font fetch as `?v=`, for the same reason as the locales hash: `/js/*` is cached for 30 days.
+ */
+const computeFontsHash = (): string => computeDirHash(fontsDir, (name) => name.endsWith(".woff2"));
+
 const config = ({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
 
@@ -51,6 +99,8 @@ const config = ({ mode }) => {
     },
     define: {
       "process.env.NODE_ENV": JSON.stringify(mode),
+      __FB_LOCALES_HASH__: JSON.stringify(computeLocalesHash()),
+      __FB_FONTS_HASH__: JSON.stringify(computeFontsHash()),
     },
     plugins: [preact(), tsconfigPaths()],
   };
@@ -65,19 +115,25 @@ const config = ({ mode }) => {
       build: {
         emptyOutDir: false,
         lib: {
-          entry: resolve(__dirname, "src/index.ts"),
+          entry: resolve(__dirname, "src/umd.ts"),
           name: "formbricksSurveys",
           formats: ["umd"],
           fileName: () => "index.umd.cjs",
         },
         rollupOptions: {
           external: ["node-html-parser"],
+          output: UMD_WITHOUT_AMD_OUTPUT,
         },
         outDir: "dist",
       },
       plugins: [
         ...sharedConfig.plugins,
-        copyCompiledAssetsPlugin({ filename: "surveys", distDir: resolve(__dirname, "dist") }),
+        copyCompiledAssetsPlugin({
+          filename: "surveys",
+          distDir: resolve(__dirname, "dist"),
+          localesDir,
+          fontsDir,
+        }),
       ],
     });
   }
@@ -144,7 +200,12 @@ const config = ({ mode }) => {
     plugins: [
       ...sharedConfig.plugins,
       stubSurveyUiStylesForVitest(),
-      copyCompiledAssetsPlugin({ filename: "surveys", distDir: resolve(__dirname, "dist") }),
+      copyCompiledAssetsPlugin({
+        filename: "surveys",
+        distDir: resolve(__dirname, "dist"),
+        localesDir,
+        fontsDir,
+      }),
       process.env.ANALYZE === "true" &&
         visualizer({
           filename: resolve(__dirname, "stats.html"),

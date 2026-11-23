@@ -1,0 +1,475 @@
+import { describe, expect, test } from "vitest";
+import type { TSurveyImportReport } from "@/modules/survey/import/types";
+import {
+  formatSurveyImportReport,
+  getSurveyImportFacts,
+  getSurveyImportIssueLine,
+  getSurveyImportReportFileName,
+  getSwitchedOffLanguages,
+  getUnreadLineCount,
+  hasSurveyImportWarnings,
+  sortSurveyImportIssues,
+} from "./import-report";
+
+const t = (key: string, options?: Record<string, unknown>) =>
+  options ? `${key.split(".").pop()} ${JSON.stringify(options)}` : (key.split(".").pop() ?? key);
+
+const report = (issues: TSurveyImportReport["issues"]): TSurveyImportReport => ({
+  source: { kind: "qsf", fileName: "Customer survey.qsf" },
+  summary: {
+    blocks: 2,
+    questions: 12,
+    languages: ["en-US", "de-DE"],
+    logicRules: 3,
+    importedLogicRules: 0,
+    hiddenFields: 1,
+  },
+  issues,
+});
+
+describe("getSurveyImportIssueLine", () => {
+  test("fills in the AI's rule and names the Qualtrics question", () => {
+    const line = getSurveyImportIssueLine(
+      {
+        code: "logic_not_imported",
+        severity: "warning",
+        questionTag: "Q12",
+        params: { description: 'Skip to Q7 if Q3 is "No"' },
+      },
+      t
+    );
+
+    expect(line).toBe('Q12: logic_not_imported {"description":"Skip to Q7 if Q3 is \\"No\\""}');
+  });
+
+  test("passes both names of a renamed field", () => {
+    expect(
+      getSurveyImportIssueLine(
+        { code: "field_renamed", severity: "info", params: { from: "Customer ID", to: "customer_id" } },
+        t
+      )
+    ).toBe('field_renamed {"from":"Customer ID","to":"customer_id"}');
+  });
+
+  test.each([
+    [
+      { cause: "unsupported_type", qualtricsType: "CS" },
+      'question_skipped_unsupported_type {"type":"constant_sum"}',
+    ],
+    [
+      { cause: "unsupported_type", qualtricsType: "NewType" },
+      'question_skipped_unsupported_type {"type":"NewType"}',
+    ],
+    [
+      { cause: "ai_skipped", description: "Too many options" },
+      'question_skipped_by_ai {"description":"Too many options"}',
+    ],
+    [{ cause: "ai_skipped" }, "question_skipped_ai_skipped"],
+    [{ cause: "ai_budget" }, "question_skipped_ai_budget"],
+    [{ cause: "ai_timeout" }, "question_skipped_ai_timeout"],
+    [{ cause: "draft_too_large" }, "question_skipped_draft_too_large"],
+    [{ cause: "plan_invalid" }, "question_skipped_plan_invalid"],
+    [{ cause: "not_in_flow" }, "question_skipped_not_in_flow"],
+    [{ cause: "invalid_id" }, "question_skipped_invalid_id"],
+    [{ cause: "validation_failed" }, "question_skipped_validation_failed"],
+    [{ cause: "cells_taken" }, "question_skipped_cells_taken"],
+    [{ cause: "something_new" }, "question_skipped"],
+  ])("says why a question was skipped: %j", (params, expected) => {
+    expect(getSurveyImportIssueLine({ code: "question_skipped", severity: "warning", params }, t)).toBe(
+      expected
+    );
+  });
+
+  test.each([
+    [{ code: "de" }, 'language_skipped {"code":"de"}'],
+    [
+      { code: "fr", cause: "draft_too_large", order: "last_declared_first" },
+      'language_skipped_too_large {"code":"fr"}',
+    ],
+    [
+      { code: "de_DE", cause: "duplicate_language", language: "de-DE" },
+      'language_skipped_duplicate {"code":"de_DE","language":"de-DE"}',
+    ],
+    [{ code: "xx", fallback: "en-US" }, 'language_skipped_default {"code":"xx","fallback":"en-US"}'],
+    [{}, "language_skipped_unnamed"],
+  ])("names the language left out: %j", (params, expected) => {
+    expect(getSurveyImportIssueLine({ code: "language_skipped", severity: "warning", params }, t)).toBe(
+      expected
+    );
+  });
+
+  test("passes the count and language of texts missing in a language", () => {
+    expect(
+      getSurveyImportIssueLine(
+        { code: "translation_missing", severity: "info", params: { language: "de-DE", count: 12 } },
+        t
+      )
+    ).toBe('translation_missing {"count":12,"language":"de-DE"}');
+  });
+
+  test("names the options left out, and a slider's old and new size", () => {
+    expect(
+      getSurveyImportIssueLine(
+        {
+          code: "options_left_out",
+          severity: "warning",
+          questionTag: "Q1",
+          params: { count: 2, options: "N/A, N/A" },
+        },
+        t
+      )
+    ).toBe('Q1: options_left_out {"count":2,"options":"N/A, N/A"}');
+    expect(
+      getSurveyImportIssueLine(
+        { code: "scale_changed", severity: "warning", questionTag: "Q7", params: { from: 8, to: 10 } },
+        t
+      )
+    ).toBe('Q7: scale_changed {"from":"8","to":"10"}');
+  });
+
+  test("says a logic rule was not imported even without its description", () => {
+    expect(
+      getSurveyImportIssueLine({ code: "logic_not_imported", severity: "warning", questionTag: "Q4" }, t)
+    ).toBe("Q4: logic_not_imported_no_description");
+  });
+
+  test("flags each imported logic rule for checking, and names a cell imported whole and the sheets skipped", () => {
+    expect(
+      getSurveyImportIssueLine(
+        {
+          code: "logic_imported",
+          severity: "warning",
+          questionTag: "10",
+          params: { description: "Skip to 18" },
+        },
+        t
+      )
+    ).toBe('10: logic_imported {"description":"Skip to 18"}');
+    expect(
+      getSurveyImportIssueLine({ code: "logic_imported", severity: "warning", questionTag: "10" }, t)
+    ).toBe("10: logic_imported_no_description");
+    expect(
+      getSurveyImportIssueLine(
+        { code: "text_not_split", severity: "warning", questionTag: "01", params: { cell: "C3" } },
+        t
+      )
+    ).toBe('01: text_not_split {"cell":"C3"}');
+    expect(
+      getSurveyImportIssueLine(
+        { code: "sheets_skipped", severity: "info", params: { sheets: "Notes, Archive", count: 2 } },
+        t
+      )
+    ).toBe('sheets_skipped {"sheets":"Notes, Archive"}');
+  });
+
+  test("names a question a Word table became a matrix of, and counts the images left out", () => {
+    expect(
+      getSurveyImportIssueLine({ code: "table_as_matrix", severity: "warning", questionTag: "Q4" }, t)
+    ).toBe("Q4: table_as_matrix");
+    expect(
+      getSurveyImportIssueLine({ code: "images_not_imported", severity: "warning", params: { count: 3 } }, t)
+    ).toBe('images_not_imported {"count":3}');
+  });
+
+  test("says which encoding a text file was read as", () => {
+    expect(
+      getSurveyImportIssueLine(
+        { code: "file_encoding", severity: "info", params: { encoding: "windows-1252" } },
+        t
+      )
+    ).toBe('file_encoding {"encoding":"windows_1252"}');
+    expect(
+      getSurveyImportIssueLine(
+        { code: "file_encoding", severity: "info", params: { encoding: "utf-16le" } },
+        t
+      )
+    ).toBe('file_encoding {"encoding":"utf_16"}');
+  });
+
+  test("names the languages whose ending shows a stand-in", () => {
+    expect(
+      getSurveyImportIssueLine(
+        {
+          code: "ending_not_translated",
+          severity: "warning",
+          params: { subject: "ending", languages: "de-DE, nb-NO" },
+        },
+        t
+      )
+    ).toBe('ending: ending_not_translated {"languages":"de-DE, nb-NO"}');
+  });
+
+  test("names the end message for the default ending it added", () => {
+    expect(
+      getSurveyImportIssueLine({ code: "ending_added", severity: "info", params: { subject: "ending" } }, t)
+    ).toBe("ending: ending_added");
+  });
+
+  test("names the end message for a piped text removed from it", () => {
+    expect(
+      getSurveyImportIssueLine(
+        { code: "piped_text_removed", severity: "warning", params: { count: 2, subject: "ending" } },
+        t
+      )
+    ).toBe('ending: piped_text_removed {"count":2}');
+  });
+
+  test("names the block for a page rule with no imported question", () => {
+    expect(
+      getSurveyImportIssueLine(
+        {
+          code: "logic_not_imported",
+          severity: "warning",
+          params: { block: "Screening", description: "Branch to the end" },
+        },
+        t
+      )
+    ).toBe('Screening: logic_not_imported {"description":"Branch to the end"}');
+  });
+
+  test("still renders a line for a code this client does not know yet", () => {
+    const unknownIssue = {
+      code: "something_new",
+      severity: "info",
+    } as unknown as TSurveyImportReport["issues"][number];
+
+    expect(getSurveyImportIssueLine(unknownIssue, t)).toBe("unknown");
+  });
+});
+
+describe("every report code", () => {
+  test.each([
+    "image_dropped",
+    "script_dropped",
+    "formatting_dropped",
+    "headline_fallback",
+    "external_url_removed",
+    "choice_label_renamed",
+    "choice_dropped",
+    "text_too_long",
+    "markup_escaped",
+    "matrix_single_answer",
+    "custom_css_removed",
+    "targeting_removed",
+    "content_only",
+  ] as const)("%s has a line of its own", (code) => {
+    expect(getSurveyImportIssueLine({ code, severity: "info" }, t)).toBe(code);
+  });
+
+  test.each(["field_dropped", "piped_text_removed"] as const)("%s passes its count", (code) => {
+    expect(getSurveyImportIssueLine({ code, severity: "warning", params: { count: 3 } }, t)).toBe(
+      `${code} {"count":3}`
+    );
+  });
+
+  test("names a dropped key by its path in the file, and counts the ones past the first fifty", () => {
+    expect(
+      getSurveyImportIssueLine(
+        { code: "unknown_key_dropped", severity: "warning", params: { field: "survey.theme" } },
+        t
+      )
+    ).toBe('unknown_key_dropped {"field":"survey.theme"}');
+    expect(
+      getSurveyImportIssueLine({ code: "unknown_key_dropped", severity: "warning", params: { count: 7 } }, t)
+    ).toBe('unknown_keys_dropped {"count":7}');
+  });
+
+  test("names the action or attribute an import creates, and counts the filters it removes", () => {
+    expect(
+      getSurveyImportIssueLine(
+        { code: "action_class_created", severity: "info", params: { name: "Checkout" } },
+        t
+      )
+    ).toBe('action_class_created {"name":"Checkout"}');
+    expect(
+      getSurveyImportIssueLine(
+        { code: "attribute_key_created", severity: "info", params: { key: "plan" } },
+        t
+      )
+    ).toBe('attribute_key_created {"key":"plan"}');
+    expect(
+      getSurveyImportIssueLine(
+        { code: "targeting_filter_removed", severity: "warning", params: { count: 2 } },
+        t
+      )
+    ).toBe('targeting_filter_removed {"count":2}');
+  });
+
+  test("names what an Update removes under the question it is about", () => {
+    expect(
+      getSurveyImportIssueLine(
+        {
+          code: "question_removed",
+          severity: "warning",
+          questionTag: "feedback",
+          params: { headline: "Anything else?" },
+        },
+        t
+      )
+    ).toBe('feedback: question_removed {"headline":"Anything else?"}');
+    expect(
+      getSurveyImportIssueLine(
+        { code: "question_removed", severity: "warning", questionTag: "feedback", params: { headline: "" } },
+        t
+      )
+    ).toBe("feedback: question_removed_no_headline");
+    expect(
+      getSurveyImportIssueLine(
+        { code: "option_removed", severity: "warning", questionTag: "color", params: { option: "Green" } },
+        t
+      )
+    ).toBe('color: option_removed {"option":"Green"}');
+  });
+
+  test("names every Qualtrics type the import skips, each differently", () => {
+    const types = ["CS", "SBS", "HeatMap", "HotSpot", "DD", "PGR", "Highlight", "Draw", "GAP"];
+    const lines = [...types, "Timing", "Meta", "Captcha"].map((qualtricsType) =>
+      getSurveyImportIssueLine(
+        {
+          code: "question_skipped",
+          severity: "warning",
+          params: { cause: "unsupported_type", qualtricsType },
+        },
+        t
+      )
+    );
+
+    expect(new Set(lines).size).toBe(lines.length);
+    for (const line of lines)
+      expect(line).toMatch(/^question_skipped_unsupported_type \{"type":"[a-z_]+"\}$/);
+  });
+});
+
+describe("getSwitchedOffLanguages", () => {
+  test("names each language with missing texts once, in the report's order", () => {
+    expect(
+      getSwitchedOffLanguages(
+        report([
+          { code: "translation_missing", severity: "warning", params: { language: "zh-Hant-TW", count: 7 } },
+          { code: "image_dropped", severity: "warning", questionTag: "Q1" },
+          { code: "translation_missing", severity: "warning", params: { language: "zh-Hans-CN", count: 1 } },
+        ])
+      )
+    ).toEqual(["zh-Hant-TW", "zh-Hans-CN"]);
+    expect(getSwitchedOffLanguages(report([]))).toEqual([]);
+  });
+});
+
+describe("getUnreadLineCount", () => {
+  test("is what raises the review's alert, and 0 when every line was read", () => {
+    expect(
+      getUnreadLineCount(
+        report([
+          { code: "image_dropped", severity: "warning", questionTag: "Q1" },
+          { code: "lines_unread", severity: "warning", params: { count: 33 } },
+        ])
+      )
+    ).toBe(33);
+    expect(getUnreadLineCount(report([]))).toBe(0);
+  });
+
+  test("its report line counts the lines", () => {
+    expect(
+      getSurveyImportIssueLine({ code: "lines_unread", severity: "warning", params: { count: 33 } }, t)
+    ).toBe('lines_unread {"count":33}');
+  });
+});
+
+describe("hasSurveyImportWarnings", () => {
+  test("is what opens the report by itself", () => {
+    expect(hasSurveyImportWarnings(report([{ code: "image_dropped", severity: "warning" }]))).toBe(true);
+    expect(hasSurveyImportWarnings(report([{ code: "field_renamed", severity: "info" }]))).toBe(false);
+  });
+});
+
+describe("getSurveyImportFacts", () => {
+  test("lists questions, blocks, languages, hidden fields and the logic left out", () => {
+    expect(getSurveyImportFacts(report([]).summary, t)).toEqual([
+      'questions {"count":12}',
+      'blocks {"count":2}',
+      "en-US, de-DE",
+      'hidden_fields {"count":1}',
+      'logic_not_imported {"count":3}',
+    ]);
+  });
+
+  test("counts the logic rules imported, to check, before the ones left out", () => {
+    const summary = { ...report([]).summary, importedLogicRules: 5 };
+
+    expect(getSurveyImportFacts(summary, t).slice(-2)).toEqual([
+      'logic_to_check {"count":5}',
+      'logic_not_imported {"count":3}',
+    ]);
+  });
+
+  test("leaves out hidden fields and logic when there are none", () => {
+    const summary = {
+      blocks: 1,
+      questions: 1,
+      languages: [],
+      logicRules: 0,
+      importedLogicRules: 0,
+      hiddenFields: 0,
+    };
+
+    expect(getSurveyImportFacts(summary, t)).toEqual(['questions {"count":1}', 'blocks {"count":1}']);
+  });
+});
+
+describe("sortSurveyImportIssues", () => {
+  test("puts warnings before notes, keeping the server's order inside each", () => {
+    const sorted = sortSurveyImportIssues([
+      { code: "field_renamed", severity: "info", params: { from: "a b", to: "a_b" } },
+      { code: "image_dropped", severity: "warning", questionTag: "Q2" },
+      { code: "markup_escaped", severity: "info", questionTag: "Q3" },
+      { code: "script_dropped", severity: "warning", questionTag: "Q4" },
+    ]);
+
+    expect(sorted.map((issue) => issue.code)).toEqual([
+      "image_dropped",
+      "script_dropped",
+      "field_renamed",
+      "markup_escaped",
+    ]);
+  });
+});
+
+describe("formatSurveyImportReport", () => {
+  test("puts warnings before notes, each with its severity", () => {
+    const text = formatSurveyImportReport(
+      report([
+        { code: "field_renamed", severity: "info", params: { from: "a b", to: "a_b" } },
+        { code: "image_dropped", severity: "warning", questionTag: "Q2" },
+      ]),
+      t
+    );
+
+    expect(text.split("\n")).toEqual([
+      'text_title {"fileName":"Customer survey.qsf"}',
+      'questions {"count":12} · blocks {"count":2} · en-US, de-DE · hidden_fields {"count":1} · logic_not_imported {"count":3}',
+      "",
+      "- warning: Q2: image_dropped",
+      '- note: field_renamed {"from":"a b","to":"a_b"}',
+      "",
+    ]);
+  });
+
+  test("says so when nothing was left out", () => {
+    expect(formatSurveyImportReport(report([]), t)).toContain("\nempty\n");
+  });
+});
+
+describe("getSurveyImportReportFileName", () => {
+  test.each([
+    ["Customer survey.qsf", "Customer survey-import-report.txt"],
+    ["export.QSF", "export-import-report.txt"],
+    [".qsf", "survey-import-report.txt"],
+    ["Onboarding NPS.formbricks.json", "Onboarding NPS-import-report.txt"],
+    ["edited.json", "edited-import-report.txt"],
+    ["Visitor Survey.xlsx", "Visitor Survey-import-report.txt"],
+    ["list.CSV", "list-import-report.txt"],
+    ["Questionnaire v2.DOCX", "Questionnaire v2-import-report.txt"],
+  ])("names %s's report %s", (fileName, expected) => {
+    expect(getSurveyImportReportFileName(fileName)).toBe(expected);
+  });
+});

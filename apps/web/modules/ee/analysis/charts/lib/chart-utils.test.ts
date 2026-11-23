@@ -4,12 +4,15 @@ import {
   AXIS_LABEL_GAP,
   AXIS_LABEL_LINE_HEIGHT,
   CATEGORY_AXIS_LABEL_LINES,
-  CATEGORY_AXIS_MAX_WIDTH,
+  CATEGORY_AXIS_MAX_SHARE,
+  CATEGORY_AXIS_MIN_CEILING,
   CATEGORY_AXIS_MIN_WIDTH,
   CHART_BRAND_DARK,
   CHART_MEASURE_COLORS,
   CHART_NOT_ENRICHED_COLOR,
   CHART_SENTIMENT_COLORS,
+  CHART_VALUE_BAND_COLORS,
+  PIE_MEASURE_ID_KEY,
   PIE_MEASURE_NAME_KEY,
   PIE_MEASURE_VALUE_KEY,
   PIVOTED_MEASURE_KEY,
@@ -20,10 +23,12 @@ import {
   formatCellValue,
   formatPercentShare,
   formatXAxisTick,
+  getBandMeasureColor,
   getCategoryAxisWidth,
   getCategoryLabelBoxHeight,
   getCategoryLabelLineClamp,
   getSemanticDimensionColor,
+  getSemanticMeasureColor,
   getSentimentMeasureColor,
   getValueLabelPadding,
   pivotMeasuresToCategories,
@@ -41,10 +46,40 @@ describe("chart-utils", () => {
       const rows = [{ "m.joy": 1163, "m.anger": 1050, "m.fear": 3 }];
       const result = prepareMeasureSliceData(rows, ["m.joy", "m.anger", "m.fear"], label);
       expect(result).toEqual([
-        { [PIE_MEASURE_NAME_KEY]: "L:m.joy", [PIE_MEASURE_VALUE_KEY]: 1163, tooltipLabel: "L:m.joy" },
-        { [PIE_MEASURE_NAME_KEY]: "L:m.anger", [PIE_MEASURE_VALUE_KEY]: 1050, tooltipLabel: "L:m.anger" },
-        { [PIE_MEASURE_NAME_KEY]: "L:m.fear", [PIE_MEASURE_VALUE_KEY]: 3, tooltipLabel: "L:m.fear" },
+        {
+          [PIE_MEASURE_NAME_KEY]: "L:m.joy",
+          [PIE_MEASURE_ID_KEY]: "m.joy",
+          [PIE_MEASURE_VALUE_KEY]: 1163,
+          tooltipLabel: "L:m.joy",
+        },
+        {
+          [PIE_MEASURE_NAME_KEY]: "L:m.anger",
+          [PIE_MEASURE_ID_KEY]: "m.anger",
+          [PIE_MEASURE_VALUE_KEY]: 1050,
+          tooltipLabel: "L:m.anger",
+        },
+        {
+          [PIE_MEASURE_NAME_KEY]: "L:m.fear",
+          [PIE_MEASURE_ID_KEY]: "m.fear",
+          [PIE_MEASURE_VALUE_KEY]: 3,
+          tooltipLabel: "L:m.fear",
+        },
       ]);
+    });
+
+    test("carries the response base onto every slice, summed across rows like the measures", () => {
+      const rows = [
+        { "m.promoterCount": 30, "m.detractorCount": 2, "m.npsCount": 40 },
+        { "m.promoterCount": 7, "m.detractorCount": 0, "m.npsCount": 8 },
+      ];
+      const result = prepareMeasureSliceData(
+        rows,
+        ["m.promoterCount", "m.detractorCount"],
+        label,
+        "m.npsCount"
+      );
+      expect(result.map((row) => row["m.npsCount"])).toEqual([48, 48]);
+      expect(prepareMeasureSliceData(rows, ["m.promoterCount"], label)[0]).not.toHaveProperty("m.npsCount");
     });
 
     // The tooltip labels each row from its dataKey, which for these slices is the internal
@@ -63,8 +98,18 @@ describe("chart-utils", () => {
       ];
       const result = prepareMeasureSliceData(rows, ["m.joy", "m.anger"], label);
       expect(result).toEqual([
-        { [PIE_MEASURE_NAME_KEY]: "L:m.joy", [PIE_MEASURE_VALUE_KEY]: 15, tooltipLabel: "L:m.joy" },
-        { [PIE_MEASURE_NAME_KEY]: "L:m.anger", [PIE_MEASURE_VALUE_KEY]: 2, tooltipLabel: "L:m.anger" },
+        {
+          [PIE_MEASURE_NAME_KEY]: "L:m.joy",
+          [PIE_MEASURE_ID_KEY]: "m.joy",
+          [PIE_MEASURE_VALUE_KEY]: 15,
+          tooltipLabel: "L:m.joy",
+        },
+        {
+          [PIE_MEASURE_NAME_KEY]: "L:m.anger",
+          [PIE_MEASURE_ID_KEY]: "m.anger",
+          [PIE_MEASURE_VALUE_KEY]: 2,
+          tooltipLabel: "L:m.anger",
+        },
       ]);
     });
 
@@ -311,6 +356,85 @@ describe("chart-utils", () => {
     });
   });
 
+  describe("value band colors (ENG-3331)", () => {
+    const bandDim = "FeedbackRecords.valueBand";
+
+    test("colors each band by polarity, NPS and CSAT alike", () => {
+      expect(getSemanticDimensionColor(bandDim, "promoter")).toBe(CHART_VALUE_BAND_COLORS.positive);
+      expect(getSemanticDimensionColor(bandDim, "satisfied")).toBe(CHART_VALUE_BAND_COLORS.positive);
+      expect(getSemanticDimensionColor(bandDim, "passive")).toBe(CHART_VALUE_BAND_COLORS.neutral);
+      expect(getSemanticDimensionColor(bandDim, "neutral")).toBe(CHART_VALUE_BAND_COLORS.neutral);
+      expect(getSemanticDimensionColor(bandDim, "detractor")).toBe(CHART_VALUE_BAND_COLORS.negative);
+      expect(getSemanticDimensionColor(bandDim, "dissatisfied")).toBe(CHART_VALUE_BAND_COLORS.negative);
+      expect(getSemanticDimensionColor(bandDim, "very_positive")).toBeUndefined();
+      expect(getSemanticDimensionColor(bandDim, null)).toBeUndefined();
+    });
+
+    test("gives the bucket count measures the color of their band", () => {
+      expect(getBandMeasureColor("FeedbackRecords.promoterCount")).toBe(CHART_VALUE_BAND_COLORS.positive);
+      expect(getBandMeasureColor("FeedbackRecords.passiveCount")).toBe(CHART_VALUE_BAND_COLORS.neutral);
+      expect(getBandMeasureColor("FeedbackRecords.csatDissatisfiedCount")).toBe(
+        CHART_VALUE_BAND_COLORS.negative
+      );
+      expect(getBandMeasureColor("FeedbackRecords.npsCount")).toBeUndefined();
+      expect(getSemanticMeasureColor("FeedbackRecords.positiveCount")).toBe(CHART_SENTIMENT_COLORS.positive);
+      expect(getSemanticMeasureColor("FeedbackRecords.detractorCount")).toBe(
+        CHART_VALUE_BAND_COLORS.negative
+      );
+    });
+
+    test("band slices keep their colors and leave the palette to the other slices", () => {
+      const rows = [
+        { [bandDim]: "promoter", count: 50 },
+        { [bandDim]: "mystery", count: 40 },
+        { [bandDim]: "detractor", count: 30 },
+      ];
+      expect(preparePieData(rows, "count", bandDim)?.colors).toEqual([
+        CHART_VALUE_BAND_COLORS.positive,
+        CHART_MEASURE_COLORS[0],
+        CHART_VALUE_BAND_COLORS.negative,
+      ]);
+    });
+
+    test("a pie of the three NPS bucket measures colors each slice by its band", () => {
+      const slices = prepareMeasureSliceData(
+        [
+          {
+            "FeedbackRecords.promoterCount": 184,
+            "FeedbackRecords.passiveCount": 98,
+            "FeedbackRecords.detractorCount": 64,
+            "FeedbackRecords.count": 10,
+          },
+        ],
+        [
+          "FeedbackRecords.promoterCount",
+          "FeedbackRecords.passiveCount",
+          "FeedbackRecords.detractorCount",
+          "FeedbackRecords.count",
+        ],
+        (key) => key
+      );
+      expect(preparePieData(slices, PIE_MEASURE_VALUE_KEY, PIE_MEASURE_NAME_KEY)?.colors).toEqual([
+        CHART_VALUE_BAND_COLORS.positive,
+        CHART_VALUE_BAND_COLORS.neutral,
+        CHART_VALUE_BAND_COLORS.negative,
+        CHART_MEASURE_COLORS[0],
+      ]);
+    });
+
+    test("band count measures do not consume a palette slot when pivoted to categories", () => {
+      const rows = pivotMeasuresToCategories(
+        [{ "FeedbackRecords.promoterCount": 3, "FeedbackRecords.count": 9 }],
+        ["FeedbackRecords.promoterCount", "FeedbackRecords.count"],
+        (key) => key
+      );
+      expect(rows.map((row) => row.fill)).toEqual([
+        CHART_VALUE_BAND_COLORS.positive,
+        CHART_MEASURE_COLORS[0],
+      ]);
+    });
+  });
+
   describe("getSentimentMeasureColor", () => {
     test("maps every sentiment count measure to the matching bucket color", () => {
       expect(getSentimentMeasureColor("FeedbackRecords.veryNegativeCount")).toBe(
@@ -352,6 +476,19 @@ describe("chart-utils", () => {
           fill: CHART_MEASURE_COLORS[1],
         },
       ]);
+    });
+
+    test("carries the response base column onto every pivoted row for the tooltip", () => {
+      const data = [{ "F.promoterCount": 37, "F.detractorCount": 2, "F.npsCount": 48 }];
+      const result = pivotMeasuresToCategories(
+        data,
+        ["F.promoterCount", "F.detractorCount"],
+        label,
+        "F.npsCount"
+      );
+      expect(result.map((row) => row["F.npsCount"])).toEqual([48, 48]);
+      // Without a key nothing extra is carried, so existing pivoted rows keep their shape.
+      expect(pivotMeasuresToCategories(data, ["F.promoterCount"], label)[0]).not.toHaveProperty("F.npsCount");
     });
 
     test("keeps the given measure order so bars fill the axis from the left", () => {
@@ -422,20 +559,75 @@ describe("chart-utils", () => {
 describe("flipped bar axis sizing", () => {
   test("sizes the category gutter to the labels present", () => {
     // Three numeric categories used to leave ~150px of empty gutter before the bars started.
-    expect(getCategoryAxisWidth(["3", "10", "25"])).toBeLessThan(CATEGORY_AXIS_MAX_WIDTH / 2);
+    expect(getCategoryAxisWidth(["3", "10", "25"])).toBeLessThan(CATEGORY_AXIS_MIN_CEILING / 2);
   });
 
   test("never drops below the floor or above the ceiling", () => {
     expect(getCategoryAxisWidth(["1"])).toBe(CATEGORY_AXIS_MIN_WIDTH);
     expect(getCategoryAxisWidth([])).toBe(CATEGORY_AXIS_MIN_WIDTH);
     expect(getCategoryAxisWidth(["How satisfied are you with the checkout experience overall?"])).toBe(
-      CATEGORY_AXIS_MAX_WIDTH
+      CATEGORY_AXIS_MIN_CEILING
     );
   });
 
   test("takes the longest label, not the first or last", () => {
     const width = getCategoryAxisWidth(["ok", "a considerably longer label", "no"]);
     expect(width).toBe(getCategoryAxisWidth(["a considerably longer label"]));
+  });
+
+  // ENG-3223: the flat 160px cap meant widening a chart from a dashboard widget to the editor gave
+  // every new pixel to the bars while the labels stayed cut at the same point.
+  describe("gutter scales with the chart", () => {
+    // Two real questions from the KAS pre-match survey; the longest is 45 characters.
+    const LONG_LABELS = [
+      "CSAT With clarity of screening procedures",
+      "CSAT with AHLAN pre-match accommodation",
+    ];
+    const WIDGET_WIDTH = 502;
+    const EDITOR_WIDTH = 924;
+
+    test("a wider chart gets a wider gutter, up to what the longest label needs", () => {
+      const needed = getCategoryAxisWidth(LONG_LABELS, 100_000);
+      const inWidget = getCategoryAxisWidth(LONG_LABELS, WIDGET_WIDTH);
+      const inEditor = getCategoryAxisWidth(LONG_LABELS, EDITOR_WIDTH);
+
+      // The widget cannot fit the label, so the gutter takes its full share of the width.
+      expect(inWidget).toBe(Math.floor(WIDGET_WIDTH * CATEGORY_AXIS_MAX_SHARE));
+      expect(inWidget).toBeLessThan(needed);
+      // The editor can, so the gutter stops at the label rather than at the share.
+      expect(inEditor).toBe(needed);
+      expect(inEditor).toBeLessThan(Math.floor(EDITOR_WIDTH * CATEGORY_AXIS_MAX_SHARE));
+      expect(inEditor).toBeGreaterThan(inWidget);
+    });
+
+    test("leaves the plot the clear majority of the chart at any width from a widget up", () => {
+      for (const chartWidth of [480, WIDGET_WIDTH, EDITOR_WIDTH, 1600]) {
+        const gutter = getCategoryAxisWidth(LONG_LABELS, chartWidth);
+        expect(chartWidth - gutter).toBeGreaterThanOrEqual(gutter * 2);
+      }
+    });
+
+    test("a widget too narrow for a third to be worth anything keeps the gutter it had", () => {
+      // A quarter-width dashboard widget; a third of it is under the flat ceiling.
+      expect(getCategoryAxisWidth(LONG_LABELS, 377)).toBe(CATEGORY_AXIS_MIN_CEILING);
+    });
+
+    test("never claims more than the longest label needs, however wide the chart", () => {
+      const unbounded = getCategoryAxisWidth(["Gender", "Nationality"]);
+      expect(getCategoryAxisWidth(["Gender", "Nationality"], 4000)).toBe(unbounded);
+      expect(unbounded).toBeLessThan(CATEGORY_AXIS_MIN_CEILING);
+    });
+
+    test("keeps the flat ceiling until the chart has been measured", () => {
+      for (const unmeasured of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(getCategoryAxisWidth(LONG_LABELS, unmeasured)).toBe(CATEGORY_AXIS_MIN_CEILING);
+      }
+    });
+
+    test("short labels keep the floor on any chart", () => {
+      expect(getCategoryAxisWidth(["1"], 60)).toBe(CATEGORY_AXIS_MIN_WIDTH);
+      expect(getCategoryAxisWidth(["1"], 4000)).toBe(CATEGORY_AXIS_MIN_WIDTH);
+    });
   });
 
   test("reserves room for the widest value label so the longest bar keeps its number", () => {
@@ -451,7 +643,7 @@ describe("flipped bar axis sizing", () => {
 });
 
 describe("category label truncation", () => {
-  // The gutter caps at CATEGORY_AXIS_MAX_WIDTH and the tick hands the helper `axisWidth - gap`.
+  // The gutter caps at CATEGORY_AXIS_MIN_CEILING and the tick hands the helper `axisWidth - gap`.
   const BOX_WIDTH = 152;
   // Two real questions from the KAS pre-match survey, which share nineteen leading characters.
   const CLARITY_SCREENING = "CSAT With clarity of screening procedures";

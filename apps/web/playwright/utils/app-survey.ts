@@ -1,9 +1,10 @@
 import { createId } from "@paralleldrive/cuid2";
 import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
+import { type TShowConditionGroup } from "@formbricks/types/show-conditions";
 import { type TSurveyEnding } from "@formbricks/types/surveys/types";
 import { transformQuestionsToBlocks } from "@/app/lib/api/survey-transformation";
-import { type UsersFixture } from "../fixtures/users";
+import { type UserFixture, type UsersFixture } from "../fixtures/users";
 
 /**
  * Self-seeding helper for app-survey widget specs.
@@ -29,13 +30,18 @@ const i18nValue = (value: string): { default: string } => ({ default: value });
 
 export interface SeededAppSurvey {
   workspaceId: string;
+  surveyId: string;
   /** `key` of the code action that triggers the survey — pass to `formbricks.track()`. */
   actionKey: string;
+  /** The workspace owner, for a spec that also needs a session (`user.login()`). */
+  user: UserFixture;
 }
 
 export interface SeedAppSurveyOptions {
   overlay?: "none" | "light" | "dark";
   placement?: "bottomRight" | "bottomLeft" | "topRight" | "topLeft" | "center";
+  /** Show conditions the survey is checked against when its trigger fires (ENG-3926). */
+  showConditions?: TShowConditionGroup;
 }
 
 const buildQuestions = () =>
@@ -73,7 +79,7 @@ export const seedAppSurvey = async (
   users: UsersFixture,
   options: SeedAppSurveyOptions = {}
 ): Promise<SeededAppSurvey> => {
-  const { overlay = "none", placement = "bottomRight" } = options;
+  const { overlay = "none", placement = "bottomRight", showConditions } = options;
 
   const user = await users.create({ skipSurveySeed: true });
   const workspaceId = user.workspaceId;
@@ -95,7 +101,7 @@ export const seedAppSurvey = async (
   const endings = buildEndings();
   const blocks = transformQuestionsToBlocks(buildQuestions(), endings);
 
-  await prisma.survey.create({
+  const survey = await prisma.survey.create({
     data: {
       workspaceId,
       createdBy: user.id,
@@ -108,9 +114,10 @@ export const seedAppSurvey = async (
       blocks: blocks as unknown as Prisma.InputJsonValue[],
       endings: endings as unknown as Prisma.InputJsonValue[],
       triggers: { create: { actionClassId: actionClass.id } },
+      ...(showConditions && { showConditions: showConditions as unknown as Prisma.InputJsonValue }),
     },
     select: { id: true },
   });
 
-  return { workspaceId, actionKey };
+  return { workspaceId, actionKey, surveyId: survey.id, user };
 };

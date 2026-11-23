@@ -23,13 +23,7 @@ interface SettingsShellProps {
 // exactly as they do inside the workspace layout.
 export const SettingsShell = ({ data, children }: Readonly<SettingsShellProps>) => {
   const { lastChecked, isPendingDowngrade, active, status } = data.license;
-  const organization = {
-    ...data.organization,
-    billing: {
-      ...data.organization.billing,
-      stripe: data.organization.billing.stripe ?? undefined,
-    },
-  };
+  const { organization } = data;
 
   const shell = (
     <div className="flex h-screen min-h-screen flex-col overflow-hidden">
@@ -55,7 +49,6 @@ export const SettingsShell = ({ data, children }: Readonly<SettingsShellProps>) 
           organizationName={data.organization.name}
           membershipRole={data.membershipRole}
           isFormbricksCloud={data.isFormbricksCloud}
-          publicDomain={data.publicDomain}
           isFormbricksSurveysConfigured={IS_FORMBRICKS_SURVEYS_CONFIGURED}
           backUrl={data.backUrl}
         />
@@ -69,6 +62,7 @@ export const SettingsShell = ({ data, children }: Readonly<SettingsShellProps>) 
               organizationWorkspacesLimit={data.organizationWorkspacesLimit}
               isFormbricksCloud={data.isFormbricksCloud}
               isLicenseActive={active}
+              isNoLicense={status === "no-license"}
               isOwnerOrManager={data.isOwnerOrManager}
               isAccessControlAllowed={data.isAccessControlAllowed}
               membershipRole={data.membershipRole}

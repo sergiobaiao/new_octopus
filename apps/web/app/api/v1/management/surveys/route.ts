@@ -1,7 +1,9 @@
 import { logger } from "@formbricks/logger";
+import { collectDeclaredFieldNames } from "@formbricks/types/surveys/declared-field-guard";
 import { ZSurveyCreateInputWithWorkspaceId } from "@formbricks/types/surveys/types";
 import { resolveBodyIds } from "@/app/api/v1/management/lib/workspace-resolver";
-import { checkFeaturePermissions } from "@/app/api/v1/management/surveys/lib/utils";
+import { checkSurveyWritePermissions } from "@/app/api/v1/management/surveys/lib/utils";
+import { loggableError } from "@/app/api/v3/lib/loggable-error";
 import {
   addLegacyProjectOverwrites,
   addLegacyProjectOverwritesToList,
@@ -26,6 +28,11 @@ import { can } from "@/lib/authorization";
 import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
 import { createSurvey } from "@/lib/survey/service";
+import { resolveSurveyActorContext } from "@/lib/survey/visibility/actor-context";
+import { getApiKeyVisibleSurveyWhere } from "@/lib/survey/visibility/api-key";
+import { resolveSurveyCreationFacts } from "@/lib/survey/visibility/creation";
+import { WorkspaceSurveyLimitError, assertWorkspaceSurveyLimit } from "@/lib/survey/visibility/limit";
+import { SurveyWriteAfterCommitError } from "@/lib/survey/write-transaction";
 import { resolveStorageUrlsInObject } from "@/modules/storage/utils";
 import { getSurveys } from "./lib/surveys";
 
@@ -45,7 +52,7 @@ export const GET = withV1ApiWrapper({
         ...new Set(authentication.workspacePermissions.map((permission) => permission.workspaceId)),
       ];
 
-      const surveys = await getSurveys(workspaceIds, limit, offset);
+      const surveys = await getSurveys(workspaceIds, limit, offset, await getApiKeyVisibleSurveyWhere());
 
       // Always expose `questions` (derived from blocks) alongside `blocks` so API v1
       // consumers get a consistent shape regardless of how the survey was built.
@@ -66,6 +73,44 @@ export const GET = withV1ApiWrapper({
   },
 });
 
+/** The request body, or the 413/400 to answer with when it is too large or not JSON. */
+const parseSurveyBody = async (
+  req: Parameters<typeof parseJsonBodyWithLimit>[0]
+): Promise<{ body: Record<string, unknown> } | { response: Response }> => {
+  try {
+    return { body: await parseJsonBodyWithLimit<Record<string, unknown>>(req) };
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return { response: responses.payloadTooLargeResponse("Payload Too Large", { error: error.message }) };
+    }
+
+    logger.error({ error, url: req.url }, "Error parsing JSON");
+    return { response: responses.badRequestResponse("Malformed JSON input, please check your request body") };
+  }
+};
+
+/**
+ * Create the survey; a create whose work after the commit failed (response alerts, scheduling) is
+ * still answered as created, with what it committed, and the failure logged: answered as an error, a
+ * client's retry would make a second survey, which nothing here could tell apart from the first.
+ */
+const createSurveyAnsweringAfterCommit = async (
+  ...args: Parameters<typeof createSurvey>
+): Promise<Awaited<ReturnType<typeof createSurvey>>> => {
+  try {
+    return await createSurvey(...args);
+  } catch (error) {
+    if (!(error instanceof SurveyWriteAfterCommitError)) throw error;
+    const survey = error.result as Awaited<ReturnType<typeof createSurvey>>;
+    // As the v3 create logs it: the error's name and frames, never its message.
+    logger.error(
+      { ...loggableError(error.cause), surveyId: survey.id },
+      "Survey created, but the work after its commit failed"
+    );
+    return survey;
+  }
+};
+
 export const POST = withV1ApiWrapper({
   handler: async ({ req, auditLog, authentication }) => {
     if (!authentication || !("apiKeyId" in authentication)) {
@@ -73,21 +118,9 @@ export const POST = withV1ApiWrapper({
     }
 
     try {
-      let surveyInput;
-      try {
-        surveyInput = await parseJsonBodyWithLimit<Record<string, unknown>>(req);
-      } catch (error) {
-        if (error instanceof RequestBodyTooLargeError) {
-          return {
-            response: responses.payloadTooLargeResponse("Payload Too Large", { error: error.message }),
-          };
-        }
-
-        logger.error({ error, url: req.url }, "Error parsing JSON");
-        return {
-          response: responses.badRequestResponse("Malformed JSON input, please check your request body"),
-        };
-      }
+      const parsedBody = await parseSurveyBody(req);
+      if ("response" in parsedBody) return { response: parsedBody.response };
+      let surveyInput = parsedBody.body;
 
       // Backwards compat: accept projectOverwrites as alias for workspaceOverwrites
       surveyInput = normaliseProjectOverwritesToWorkspace(surveyInput);
@@ -141,11 +174,18 @@ export const POST = withV1ApiWrapper({
       const { hasQuestions } = validateResult.data;
 
       if (hasQuestions) {
-        surveyData.blocks = transformQuestionsToBlocks(surveyData.questions, surveyData.endings || []);
+        surveyData.blocks = transformQuestionsToBlocks(
+          surveyData.questions,
+          surveyData.endings || [],
+          collectDeclaredFieldNames(surveyData)
+        );
         surveyData.questions = [];
       }
 
-      const featureCheckResult = await checkFeaturePermissions(surveyData, organization);
+      const featureCheckResult = await checkSurveyWritePermissions(surveyData, organization, {
+        apiKeyId: authentication.apiKeyId,
+        workspaceId,
+      });
       if (featureCheckResult) {
         return {
           response: featureCheckResult,
@@ -153,7 +193,20 @@ export const POST = withV1ApiWrapper({
       }
 
       const { workspaceId: __, ...surveyCreateInput } = surveyData;
-      const survey = await createSurvey(workspaceId, surveyCreateInput);
+      await assertWorkspaceSurveyLimit(workspaceId);
+      // ENG-3282: an API key always creates a workspace-visible, ownerless survey. A `createdBy` in the
+      // body stays attribution only; it never makes that user the owner.
+      const creationFacts = await resolveSurveyCreationFacts({
+        actor: { type: "apiKey", id: authentication.apiKeyId },
+        organizationId: organization.id,
+      });
+      const survey = await createSurveyAnsweringAfterCommit(workspaceId, surveyCreateInput, {
+        creationFacts,
+        targetingActor: await resolveSurveyActorContext(
+          { type: "apiKey", id: authentication.apiKeyId },
+          organization.id
+        ),
+      });
       if (auditLog) {
         auditLog.targetId = survey.id;
         auditLog.newObject = survey;
@@ -172,6 +225,9 @@ export const POST = withV1ApiWrapper({
         ),
       };
     } catch (error) {
+      if (error instanceof WorkspaceSurveyLimitError) {
+        return { response: responses.workspaceSurveyLimitResponse(error.limit, error.count) };
+      }
       // Invalid survey media (e.g. an unsupported/unparseable choice imageUrl) surfaces as an
       // InvalidInputError, which handleApiError returns as a 400 with its message instead of a 500
       // that would page Sentry. DatabaseError and unexpected errors become a generic, reported 500.

@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { ZId } from "@formbricks/types/common";
+import { ZCustomCssScope } from "@formbricks/types/custom-css";
+import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/constants";
+import { ZSurveyRatingElement } from "@formbricks/types/surveys/elements";
+import { EXPRESSION_FUNCTIONS } from "@formbricks/types/surveys/expressions";
 import { ZSurveyFilters, ZSurveyStatus, ZSurveyType } from "@formbricks/types/surveys/types";
 import {
   MAX_FEEDBACK_RECORDS_PER_BATCH,
@@ -11,6 +15,30 @@ import {
   ZV3FeedbackRecordSimilarityFilters,
   ZV3FeedbackRecordUpdateBodyFields,
 } from "@/app/api/v3/feedbackRecords/lib/schemas";
+import { lengthBoundedArray } from "@/app/api/v3/lib/bounded-array";
+import { ZV3SurveyEmbeddedField } from "@/app/api/v3/surveys/embedded-fields";
+import {
+  V3_SURVEY_MAX_BLOCKS,
+  V3_SURVEY_MAX_EMBEDDED_FIELDS,
+  V3_SURVEY_MAX_ENDINGS,
+  V3_SURVEY_MAX_LANGUAGES,
+  V3_SURVEY_MAX_START_LOGIC_RULES,
+  V3_SURVEY_MAX_VARIABLES,
+  ZV3EditSurveyBlocksBody,
+  ZV3SetSurveyBlockOrderBody,
+  ZV3SurveyCustomCss,
+} from "@/app/api/v3/surveys/schemas";
+import { ZV3WorkspaceCustomCssPatchBody } from "@/app/api/v3/workspaces/lib/custom-css-schemas";
+
+/**
+ * Every array argument is declared through `lengthBoundedArray`, never a bare `z.array().max()`: the
+ * SDK validates arguments with Zod's `~standard.validate`, which parses every element before an
+ * array-level `.max()` runs and collects one issue per element — ahead of the scope gate, so a
+ * read-only token can trigger it (ENG-3384). The route-level array budget in `app/api/mcp/route.ts` is
+ * the backstop; these bounds are the ones the tool schemas advertise to the model as `maxItems`.
+ */
+const MCP_MAX_FILTER_VALUES = 10;
+const MCP_MAX_LANGUAGE_CODES = 20;
 
 /**
  * Every schema here is `.strict()`, so an argument a tool does not declare is a loud error instead of a
@@ -87,16 +115,19 @@ export const ZMcpListSurveysInput = z
           .optional(),
         status: z
           .strictObject({
-            in: z
-              .array(ZSurveyStatus)
-              .optional()
-              .describe("Survey statuses to include, for example draft or inProgress."),
+            in: lengthBoundedArray(ZSurveyStatus, {
+              max: MCP_MAX_FILTER_VALUES,
+              description: "Survey statuses to include, for example draft or inProgress.",
+            }).optional(),
           })
           .describe("Filter by survey status.")
           .optional(),
         type: z
           .strictObject({
-            in: z.array(ZSurveyType).optional().describe("Survey types to include, for example link."),
+            in: lengthBoundedArray(ZSurveyType, {
+              max: MCP_MAX_FILTER_VALUES,
+              description: "Survey types to include, for example link.",
+            }).optional(),
           })
           .describe("Filter by survey type.")
           .optional(),
@@ -113,10 +144,10 @@ export const ZMcpListSurveysInput = z
 export const ZMcpGetSurveyInput = z
   .object({
     surveyId: z.cuid2().describe("Survey ID to fetch."),
-    lang: z
-      .array(z.string().trim().min(1))
-      .optional()
-      .describe("Optional language codes or configured aliases used to filter translatable survey fields."),
+    lang: lengthBoundedArray(z.string().trim().min(1), {
+      max: MCP_MAX_LANGUAGE_CODES,
+      description: "Optional language codes or configured aliases used to filter translatable survey fields.",
+    }).optional(),
   })
   .strict();
 
@@ -127,6 +158,216 @@ const ZMcpSurveyLanguageInput = z.strictObject({
 });
 
 const ZMcpObjectInput = z.record(z.string(), z.unknown());
+
+/**
+ * The block and element shape, spelled out on the tool surface (ENG-2180).
+ *
+ * `blocks` is the one field a survey cannot omit, and it was advertised as a free-form object pointing
+ * at a "v3 survey document contract" that no tool description defined. The only way to learn the
+ * element types was to probe the live validator — and probing undercounts silently: one agent doing
+ * exactly that reported 16 of the 17 types and had no way to know it had missed one.
+ *
+ * The list is derived from the enum the request is actually validated against, never restated, so the
+ * advertised vocabulary cannot drift from the accepted one. `SURVEY_BLOCK_EXAMPLE` is asserted against
+ * the real create schema in `schemas.test.ts` for the same reason — a worked example that stops
+ * validating is worse than none.
+ */
+const SURVEY_ELEMENT_TYPES = Object.values(TSurveyElementTypeEnum).join(", ");
+
+/** A complete, valid block. Kept minimal: every field here is one the schema requires, plus the optional `code`. */
+export const SURVEY_BLOCK_EXAMPLE = {
+  name: "Feedback",
+  elements: [
+    {
+      id: "improve",
+      code: "improve",
+      type: "openText",
+      headline: { "en-US": "What should we improve?" },
+      required: false,
+    },
+  ],
+};
+
+/**
+ * Show-if (ENG-6931), worked: a follow-up shown only when the answer above it on the same block
+ * matches. Kept as data so a test can prove it still validates.
+ */
+export const SURVEY_SHOW_IF_EXAMPLE = {
+  id: "clshowifgroup00000000001",
+  connector: "and",
+  conditions: [
+    {
+      id: "clshowifcond000000000001",
+      leftOperand: { type: "element", value: "improve" },
+      operator: "contains",
+      rightOperand: { type: "static", value: "price" },
+    },
+  ],
+};
+
+/**
+ * A `rating`'s two extra fields, read off the element schema rather than restated.
+ *
+ * Restating them would reintroduce the drift this whole description exists to avoid, and would already
+ * be wrong: `ZSurveyRatingElement.range` admits `6`, which the base element's optional `range` and
+ * every prose description of it omit. Deriving keeps the advertised values equal to the accepted ones
+ * by construction, the same rule `SURVEY_ELEMENT_TYPES` follows.
+ */
+const RATING_SCALES = (ZSurveyRatingElement.shape.scale as unknown as { options: string[] }).options;
+const RATING_RANGES = (
+  ZSurveyRatingElement.shape.range as unknown as { options: { value: number }[] }
+).options.map((option) => option.value);
+
+/**
+ * Block logic and Set value expressions (ENG-6935, ADR 0030 / 0031), described for agents. The
+ * function list is read off the schema's catalogue, so the advertised functions are the accepted ones.
+ */
+const SURVEY_LOGIC_DESCRIPTION = [
+  "Block logic: a block's `logic` is a list of rules `{ id, conditions, actions[] }`; `conditions` is a",
+  "group `{ id, connector: and|or, conditions[] }` of conditions `{ id, leftOperand, operator, rightOperand? }`",
+  "or nested groups, and an empty group always matches. Operands are `{ type: element|variable|",
+  "hiddenField|reserved|static, value }` (element id, computed or ingested storage key, reserved name).",
+  "A matrix row condition names the row and column by id next to their 0-based positions: left",
+  '`{ type: "element", value: <matrix id>, meta: { row: "1", rowId: <row id> } }`, right',
+  '`{ type: "static", value: "2", columnId: <column id> }` (isAnyOf: `value: ["0","2"], columnIds: [..]`).',
+  "Ids win over positions, survive reordering, and must exist in the matrix; positions alone are accepted.",
+  "Actions: `jumpToBlock` (target block or ending id), `requireAnswer` (target element id) and",
+  "`calculate` (`variableId` = a computed field's storageKey). Set value is a `calculate` with",
+  '`operator: "assign"` and `value: { type: "expression", value: <tree> }`; the tree is a leaf (an operand,',
+  "or `static` number/text) or `{ type: call, fn, args[] }` with fn one of",
+  `${EXPRESSION_FUNCTIONS.join(", ")}.`,
+  "add/multiply/min/max take 2–50 numbers, subtract/divide exactly 2, round a number and optional fixed",
+  "decimals 0–10, abs 1, ifEmpty a value and a same-type fallback, concat 2–50 values (to text), now none",
+  "(UTC ISO timestamp), daysBetween 2 dates (UTC calendar days). Answers: rating/nps/csat/ces and number",
+  "openText are numbers, other openText text, date a date, multipleChoiceSingle its answer code (text);",
+  "other types can't be used. Empty in, empty out (use ifEmpty for defaults); ÷ 0 gives empty; an empty",
+  "result clears the field. The result must match the field's dataType (number, string or date); text in",
+  "arithmetic is refused. At most 12 levels and 200 nodes. Example `score = round(q1 + q2 * 2)`:",
+  `${JSON.stringify({
+    type: "call",
+    fn: "round",
+    args: [
+      {
+        type: "call",
+        fn: "add",
+        args: [
+          { type: "element", value: "q1" },
+          {
+            type: "call",
+            fn: "multiply",
+            args: [
+              { type: "element", value: "q2" },
+              { type: "static", value: 2 },
+            ],
+          },
+        ],
+      },
+    ],
+  })}.`,
+].join(" ");
+
+const SURVEY_BLOCKS_DESCRIPTION = [
+  "Survey blocks. A block is `{ name, elements[], id? }` and an element is `{ id, type, headline, ... }`,",
+  `where \`type\` is one of: ${SURVEY_ELEMENT_TYPES}.`,
+  "Element ids are caller-supplied and become immutable once the survey leaves draft; block ids are",
+  "generated when omitted. Every element except `cta` may carry an optional `code` (the question code",
+  "used in exports and links), and every choice, matrix row/column and picture choice an optional `code`",
+  "(the answer code). Codes start with a lowercase letter (answer codes may start with a digit) followed",
+  "by lowercase letters, digits and `_`, with no `__` and no trailing `_`, at most 30 (question) or 20",
+  "(answer) characters; they may not be SPSS reserved words (all, and, by, eq, ge, gt, le, lt, ne, not,",
+  "or, to, with) or export column names (response_id, language, outcome, ...). Question codes are unique",
+  "across the survey, its Embedded Data names and other questions' ids; answer codes are unique within",
+  "their question. Once the survey leaves draft (active, paused, completed or scheduled) question codes,",
+  "answer codes, question types and option text in every language are locked, and an option that existed",
+  "at launch cannot be deleted (`immutable_*` errors); new questions and options can still be added.",
+  'Translatable fields are keyed by locale code — `{ "en-US": "..." }` — and',
+  "must carry every configured language; the internal `default` key is rejected. Each element type adds",
+  `its own required fields — a \`rating\` needs \`scale\` (${RATING_SCALES.join("|")}) and \`range\``,
+  `(${RATING_RANGES.join("|")}), a \`pictureSelection\` needs two or more choices. An element that is`,
+  "missing one is reported by its position, not by the field name, so add the type's own fields before",
+  "retrying.",
+  "Show-if: a block or an element may carry an optional `showIf`, a condition group in the block `logic`",
+  "format (`{ id, connector: and|or, conditions: [{ id, leftOperand: { type: element|variable|hiddenField|reserved,",
+  "value }, operator, rightOperand? } or a nested group] }`), and is shown only when it matches; an empty group",
+  "or none means always shown. A block whose show-if fails, or whose elements are all hidden, is skipped and its",
+  "`logic` still runs as if submitted with no answers. A hidden element is not validated (a hidden required",
+  "element never blocks) and its answer is not submitted. Reference rule: a block's show-if may use answers from",
+  "earlier blocks only; an element's show-if from earlier blocks and elements above it in the same block, never",
+  "itself or anything below (`misordered_reference` at the exact condition path).",
+  `Example element show-if: ${JSON.stringify(SURVEY_SHOW_IF_EXAMPLE)}.`,
+  "Option show-if and Hidden: each choice (single select, multi select, ranking, picture selection) and each",
+  "matrix row and column may carry its own `showIf` (same format; it may use what its element's show-if may,",
+  "never its own element) and `hidden: true`. A Hidden option is never offered, whatever its show-if says; on a",
+  "published survey hide an option instead of deleting it (deleting a launch option is refused), which keeps its",
+  "id, code and earlier answers. A question left with no option to offer is skipped. Both are allowed on",
+  "published surveys. Ranking conditions may use `includesOneOf` / `includesAllOf` / `doesNotIncludeOneOf` /",
+  '`doesNotIncludeAllOf` with option ids ("was ranked").',
+  'Copied options ("only the brands you know"): a single select, multi select or ranking may set',
+  "`optionsCopiedFrom` to the id of an earlier choice element (earlier block, or above it in the same block), and",
+  "a picture selection to an earlier picture selection. Write the copies yourself: each copied option keeps the",
+  'source option\'s `id` and `code` and carries the show-if "picked in the source":',
+  '`{ "connector": "and", "conditions": [{ "leftOperand": { "type": "element", "value": "<source id>" },',
+  '"operator": "includesOneOf", "rightOperand": { "type": "static", "value": ["<same option id>"] } }] }`',
+  "(`equals` with the id as a string when the source is a single select). Fixed options may sit next to the copies,",
+  'such as "None of these" with id `none`; their codes are filled with the next code free in both elements, and a',
+  "copy's code always follows its source's. Matrix rows are never copied: give them a row `showIf` instead.",
+  "Block rules (`logic`) run when the block is submitted; their actions are `jumpToBlock` (a block or ending id),",
+  "`requireAnswer` (a later element id), `calculate` (set a computed field) and `markLowQuality`,",
+  '`{ "id": "<cuid2>", "objective": "markLowQuality" }` with no target: when the rule fires the response is marked',
+  "Low quality, as a reviewer would mark it (it leaves the Analysis export and Dashboards and can be restored);",
+  "the respondent sees nothing and carries on.",
+  `Example block: ${JSON.stringify(SURVEY_BLOCK_EXAMPLE)}`,
+  SURVEY_LOGIC_DESCRIPTION,
+].join(" ");
+
+/**
+ * Rules before the first question (ENG-6932, json-shapes.md section 4). Spelled out because the tool
+ * surface otherwise never says what a rule is, and these differ from block rules in what they may do.
+ */
+const START_LOGIC_DESCRIPTION = [
+  "Rules before the first question (`startLogic`): run as soon as the survey loads, before the welcome card,",
+  "and also when a start-at link skips ahead. Same rule shape as `blocks[].logic`:",
+  "`{ id, conditions: { id, connector: and|or, conditions[] }, actions[] }`, ids cuid2.",
+  "Allowed actions: `jumpToBlock` to a block id, or to an ending id to screen the respondent out (they see only",
+  "that ending, and a finished response is stored that counts as completed), `calculate` to set a",
+  "computed field (variable), and `markLowQuality` with no target, which marks the response Low quality with",
+  "its first write (a screen-out's finished response included), for example for a known-bad panel source.",
+  "`requireAnswer` and any other action are refused, with the exact path.",
+  "Conditions and values may read `hiddenField` (URL parameters), `variable` and `reserved` operands only:",
+  "nothing has been answered yet, so an `element` operand is refused. The first jump wins; every calculate",
+  "runs; with no jump the respondent goes to the first block (or the start-at target).",
+  'Example: [{ "id": "<cuid2>", "conditions": { "id": "<cuid2>", "connector": "and", "conditions": [{ "id": "<cuid2>",',
+  '"leftOperand": { "type": "hiddenField", "value": "panel_id" }, "operator": "isNotSet" }] },',
+  '"actions": [{ "id": "<cuid2>", "objective": "jumpToBlock", "target": "<ending id>" }] }].',
+].join(" ");
+
+/**
+ * Typed Embedded Data (ENG-6930), described once for create, patch and validate. The legacy
+ * `variables` / `hiddenFields` stay accepted and are derived from these when both are absent.
+ */
+export const SURVEY_EMBEDDED_FIELDS_DESCRIPTION = [
+  "Typed Embedded Data fields: `{ storageKey?, key?, name, source, dataType?, defaultValue?, locked? }`.",
+  "`source` is `computed` (set by logic: `variable` operands and calculate actions name its storageKey, a cuid2",
+  "generated when omitted; dataType string, number or date — a date is set with a Set value expression and",
+  "is left out of the legacy `variables`) or `ingested` (arrives by URL parameter or SDK:",
+  "`hiddenField` operands name its storageKey, which defaults to its name; dataType string, number, boolean",
+  "or date; only these can be `locked`). Link a workspace library field by sending `{ key }` alone: the",
+  "server fills in its definition. This list is the survey's complete set and the legacy",
+  "`variables` / `hiddenFields` are derived from it; send either format, or both describing the same",
+  "fields — a mismatch is refused with 400 naming the path.",
+].join(" ");
+
+/**
+ * `confirm` on every tool that changes or deletes an existing survey (ENG-6930). A survey that is not a
+ * draft and has responses is left untouched without it, and the call answers 428 with the editor's
+ * caution text — so the agent asks the user, then retries.
+ */
+const ZMcpSurveyWriteConfirm = z
+  .boolean()
+  .optional()
+  .describe(
+    "Set true only after the user agreed. Required to change or delete a survey that is not a draft and already has responses; without it nothing changes and the call returns the caution to show the user."
+  );
 
 export const ZMcpCreateSurveyInput = z
   .object({
@@ -141,21 +382,47 @@ export const ZMcpCreateSurveyInput = z
       .optional()
       .describe("Default language code or configured language alias. Defaults to en-US."),
     metadata: ZMcpObjectInput.optional().describe("Survey metadata using the v3 survey document contract."),
-    languages: z
-      .array(ZMcpSurveyLanguageInput)
+    languages: lengthBoundedArray(ZMcpSurveyLanguageInput, {
+      max: V3_SURVEY_MAX_LANGUAGES,
+      description: "Configured survey languages using the v3 survey document contract.",
+    }).optional(),
+    showLanguageSwitch: z
+      .boolean()
+      .nullable()
       .optional()
-      .describe("Configured survey languages using the v3 survey document contract."),
+      .describe("Show respondents a language switch on multi-language surveys. null or omitted means off."),
+    autoSelectLanguage: z
+      .boolean()
+      .nullable()
+      .optional()
+      .describe(
+        "Open the survey in the respondent's browser language when it matches an enabled survey language. null or omitted means off."
+      ),
     welcomeCard: ZMcpObjectInput.optional().describe("Welcome card using the v3 survey document contract."),
-    blocks: z.array(ZMcpObjectInput).min(1).describe("Survey blocks using the v3 survey document contract."),
-    endings: z
-      .array(ZMcpObjectInput)
-      .optional()
-      .describe("Survey endings using the v3 survey document contract."),
+    blocks: lengthBoundedArray(ZMcpObjectInput, {
+      min: 1,
+      max: V3_SURVEY_MAX_BLOCKS,
+      description: SURVEY_BLOCKS_DESCRIPTION,
+    }),
+    endings: lengthBoundedArray(ZMcpObjectInput, {
+      max: V3_SURVEY_MAX_ENDINGS,
+      description: "Survey endings using the v3 survey document contract.",
+    }).optional(),
     hiddenFields: ZMcpObjectInput.optional().describe("Hidden fields using the v3 survey document contract."),
-    variables: z
-      .array(ZMcpObjectInput)
-      .optional()
-      .describe("Survey variables using the v3 survey document contract."),
+    variables: lengthBoundedArray(ZMcpObjectInput, {
+      max: V3_SURVEY_MAX_VARIABLES,
+      description: "Survey variables using the v3 survey document contract.",
+    }).optional(),
+    startLogic: lengthBoundedArray(ZMcpObjectInput, {
+      max: V3_SURVEY_MAX_START_LOGIC_RULES,
+      description: START_LOGIC_DESCRIPTION,
+    }).optional(),
+    // The v3 entry schema itself (strict), so the advertised shape is the accepted one.
+    embeddedFields: lengthBoundedArray(ZV3SurveyEmbeddedField, {
+      max: V3_SURVEY_MAX_EMBEDDED_FIELDS,
+      description: SURVEY_EMBEDDED_FIELDS_DESCRIPTION,
+    }).optional(),
+    customCss: ZV3SurveyCustomCss.optional(),
   })
   .strict();
 
@@ -165,24 +432,79 @@ export const ZMcpPatchSurveyInput = z
     data: z
       .record(z.string(), z.unknown())
       .describe(
-        "Strict top-level v3 survey patch payload. Omitted top-level fields are preserved; provided objects and arrays replace that whole subtree."
+        `Strict top-level v3 survey patch payload. Omitted top-level fields are preserved; provided objects and arrays replace that whole subtree. \`customCss\` is \`{ light, dark }\` source (both keys) or null to clear; omit it to keep the current CSS. \`startLogic\` replaces every rule before the first question; null or [] removes them. \`embeddedFields\`: ${SURVEY_EMBEDDED_FIELDS_DESCRIPTION} ${SURVEY_BLOCKS_DESCRIPTION} ${START_LOGIC_DESCRIPTION}`
       ),
+    confirm: ZMcpSurveyWriteConfirm,
   })
   .strict();
 
+/**
+ * Block-level editing (ENG-3069). The bodies are the v3 REST schemas plus `surveyId`, so the two
+ * surfaces cannot drift: one Zod definition, one set of messages.
+ *
+ * `response_format` defaults to `concise` here but not on REST. A 31-block survey serializes to
+ * ~15k tokens, and returning that from every edit would refill the agent's context as fast as the
+ * old whole-array patch did — the concise payload carries `updatedAt`, which is precisely the
+ * `expectedUpdatedAt` the next call needs, so edits chain without re-reading.
+ */
+const ZMcpBlockResponseFormat = z
+  .enum(["concise", "detailed"])
+  .default("concise")
+  .describe(
+    "concise (default) returns id, updatedAt, blockCount and the ops applied. detailed returns the full survey resource."
+  );
+
+export const ZMcpEditSurveyBlocksInput = ZV3EditSurveyBlocksBody.extend({
+  surveyId: z.cuid2().describe("Survey ID whose blocks should be edited."),
+  response_format: ZMcpBlockResponseFormat.optional(),
+  confirm: ZMcpSurveyWriteConfirm,
+}).strict();
+
+export const ZMcpSetSurveyBlockOrderInput = ZV3SetSurveyBlockOrderBody.extend({
+  surveyId: z.cuid2().describe("Survey ID whose block order should be set."),
+  response_format: ZMcpBlockResponseFormat.optional(),
+  confirm: ZMcpSurveyWriteConfirm,
+}).strict();
+
 export const ZMcpValidateSurveyInput = z
   .object({
-    operation: z.enum(["create", "patch"]).describe("Validation operation to run."),
-    surveyId: z.cuid2().optional().describe("Survey ID to validate against. Required for patch validation."),
+    operation: z
+      .enum(["create", "patch", "customCss"])
+      .describe(
+        "Validation operation to run. `customCss` processes custom CSS only and returns the compiled result and warnings."
+      ),
+    surveyId: z
+      .cuid2()
+      .optional()
+      .describe(
+        "Survey ID to validate against. Required for patch validation; optional for customCss with scope survey (must belong to workspaceId)."
+      ),
+    workspaceId: ZId.optional().describe(
+      "Workspace ID. Required for, and only accepted by, customCss validation."
+    ),
+    scope: ZCustomCssScope.optional().describe(
+      "customCss validation only: `workspace` (shared survey CSS) or `survey` (one survey's CSS)."
+    ),
     data: ZMcpObjectInput.describe(
-      "Create or patch payload to validate using the v3 survey document contract."
+      `Create or patch payload to validate, or \`{ customCss: { light, dark } | null }\` for customCss. \`embeddedFields\`: ${SURVEY_EMBEDDED_FIELDS_DESCRIPTION} ${SURVEY_BLOCKS_DESCRIPTION} ${START_LOGIC_DESCRIPTION}`
     ),
   })
   .strict();
 
+export const ZMcpGetWorkspaceCustomCssInput = z
+  .object({
+    workspaceId: ZId.describe("Workspace ID whose shared survey CSS should be read."),
+  })
+  .strict();
+
+export const ZMcpPatchWorkspaceCustomCssInput = ZV3WorkspaceCustomCssPatchBody.extend({
+  workspaceId: ZId.describe("Workspace ID whose shared survey CSS should be saved or cleared."),
+}).strict();
+
 export const ZMcpDeleteSurveyInput = z
   .object({
     surveyId: z.cuid2().describe("Survey ID to delete."),
+    confirm: ZMcpSurveyWriteConfirm,
   })
   .strict();
 
@@ -247,16 +569,14 @@ export const ZMcpCreateFeedbackRecordsInput = z
   .object({
     workspaceId: ZId.describe("Workspace ID to create the feedback records in."),
     datasetId: datasetIdField,
-    records: z
-      // The strict variant: an unknown key *inside a record* must be rejected, not dropped. Without it
-      // the outer `.strict()` below covers only the top level, so a misspelled `user_id` in a batch
-      // import vanished silently — ENG-2256 in the one place it does the most damage.
-      .array(ZV3FeedbackRecordCreateBodyStrict)
-      .min(1)
-      .max(MAX_FEEDBACK_RECORDS_PER_BATCH)
-      .describe(
-        `Feedback records to create, 1–${MAX_FEEDBACK_RECORDS_PER_BATCH} per call. Every record is validated before any is written, so an invalid record fails the whole call rather than storing part of the batch.`
-      ),
+    // The strict variant: an unknown key *inside a record* must be rejected, not dropped. Without it
+    // the outer `.strict()` below covers only the top level, so a misspelled `user_id` in a batch
+    // import vanished silently — ENG-2256 in the one place it does the most damage.
+    records: lengthBoundedArray(ZV3FeedbackRecordCreateBodyStrict, {
+      min: 1,
+      max: MAX_FEEDBACK_RECORDS_PER_BATCH,
+      description: `Feedback records to create, 1–${MAX_FEEDBACK_RECORDS_PER_BATCH} per call. Every record is validated before any is written, so an invalid record fails the whole call rather than storing part of the batch.`,
+    }),
   })
   .strict();
 
@@ -305,8 +625,12 @@ export type TMcpListWorkspacesInput = z.infer<typeof ZMcpListWorkspacesInput>;
 export type TMcpGetSurveyInput = z.infer<typeof ZMcpGetSurveyInput>;
 export type TMcpCreateSurveyInput = z.infer<typeof ZMcpCreateSurveyInput>;
 export type TMcpPatchSurveyInput = z.infer<typeof ZMcpPatchSurveyInput>;
+export type TMcpEditSurveyBlocksInput = z.infer<typeof ZMcpEditSurveyBlocksInput>;
+export type TMcpSetSurveyBlockOrderInput = z.infer<typeof ZMcpSetSurveyBlockOrderInput>;
 export type TMcpValidateSurveyInput = z.infer<typeof ZMcpValidateSurveyInput>;
 export type TMcpDeleteSurveyInput = z.infer<typeof ZMcpDeleteSurveyInput>;
+export type TMcpGetWorkspaceCustomCssInput = z.infer<typeof ZMcpGetWorkspaceCustomCssInput>;
+export type TMcpPatchWorkspaceCustomCssInput = z.infer<typeof ZMcpPatchWorkspaceCustomCssInput>;
 export type TMcpListFeedbackDatasetsInput = z.infer<typeof ZMcpListFeedbackDatasetsInput>;
 export type TMcpListFeedbackRecordsInput = z.infer<typeof ZMcpListFeedbackRecordsInput>;
 export type TMcpGetFeedbackRecordInput = z.infer<typeof ZMcpGetFeedbackRecordInput>;

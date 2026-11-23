@@ -4,7 +4,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, test, vi } from "vitest";
 
-vi.mock("@/lib/utils/helper", () => ({
+vi.mock("@/lib/utils/error-message", () => ({
   getFormattedErrorMessage: (result: { serverError?: string }) => result?.serverError ?? "",
 }));
 
@@ -51,6 +51,28 @@ describe("useSwitcherData", () => {
     });
 
     expect(loader).toHaveBeenCalledTimes(1);
+  });
+
+  test("refetches on the next load after reloadKey changes", async () => {
+    const loader = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [{ id: "1", name: "Old name" }] })
+      .mockResolvedValueOnce({ data: [{ id: "1", name: "New name" }] });
+    const { result, rerender } = renderHook(
+      ({ reloadKey }) => useSwitcherData(loader, FALLBACK, undefined, reloadKey),
+      { initialProps: { reloadKey: "Old name" } }
+    );
+
+    await act(async () => {
+      await result.current.load();
+    });
+    rerender({ reloadKey: "New name" });
+    await act(async () => {
+      await result.current.load();
+    });
+
+    expect(loader).toHaveBeenCalledTimes(2);
+    expect(result.current.items).toEqual([{ id: "1", name: "New name" }]);
   });
 
   test("surfaces a server error, falling back to the provided key", async () => {

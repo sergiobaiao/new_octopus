@@ -1,6 +1,6 @@
 import { type NextRequest } from "next/server";
 import { logger } from "@formbricks/logger";
-import { ZDeleteFileRequest, ZDownloadFileRequest } from "@formbricks/types/storage";
+import { ZDeleteFileRequest, ZDownloadFileRequest, getMimeTypeForFileName } from "@formbricks/types/storage";
 import { responses } from "@/app/lib/api/response";
 import { transformErrorToDetails } from "@/app/lib/api/validator";
 import { authorizePrivateDownload } from "@/app/storage/[workspaceId]/[accessType]/[...filePath]/lib/auth";
@@ -8,9 +8,18 @@ import { resolveClientApiIds } from "@/lib/utils/resolve-client-id";
 import { getSession } from "@/modules/auth/lib/session";
 import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
 import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
+import { isAttachmentExportFilePath } from "@/modules/storage/attachment-export/storage-key";
 import { deleteFile, getFileStreamForDownload } from "@/modules/storage/service";
 import { getErrorResponseFromStorageError } from "@/modules/storage/utils";
 import { logFileDeletion } from "./lib/audit-logs";
+
+const safeDecode = (value: string): string => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
 
 export const GET = async (
   request: NextRequest,
@@ -34,6 +43,13 @@ export const GET = async (
   const { accessType } = paramValidation.data;
   const idParam = params.workspaceId;
 
+  // Attachment export archives (ENG-6862) are fetched only through their audited, requester-scoped
+  // download route. Checked on one more decode too, so the refusal does not depend on how a proxy or
+  // backend reads an escaped `/`.
+  if (isAttachmentExportFilePath(fileName) || isAttachmentExportFilePath(safeDecode(fileName))) {
+    return responses.notFoundResponse("File", null);
+  }
+
   // Resolve: the URL param may be an environmentId (old uploads) or workspaceId (new uploads)
   const resolved = await resolveClientApiIds(idParam);
   if (!resolved) {
@@ -42,7 +58,7 @@ export const GET = async (
 
   // check auth
   if (accessType === "private") {
-    const authResult = await authorizePrivateDownload(request, resolved.workspaceId, "GET");
+    const authResult = await authorizePrivateDownload(request, resolved.workspaceId, "GET", params.filePath);
     if (!authResult.ok) {
       return authResult.error.unauthorized
         ? responses.unauthorizedResponse()
@@ -58,12 +74,19 @@ export const GET = async (
     return errorResponse;
   }
 
-  const { body, contentType, contentLength } = streamResult.data;
+  const { body, contentLength } = streamResult.data;
+  const contentType = getMimeTypeForFileName(fileName) ?? "application/octet-stream";
 
   return new Response(body, {
     status: 200,
     headers: {
+      // The type comes from the extension, never from the stored object: objects uploaded before
+      // ENG-7108 may carry a client-chosen type such as `image/png;,text/html`, which browsers render
+      // as HTML on the app origin.
       "Content-Type": contentType,
+      // The sandboxing CSP for these paths lives in next.config.mjs, as the config's CSP replaces any
+      // a route handler sets.
+      "X-Content-Type-Options": "nosniff",
       ...(contentLength > 0 && { "Content-Length": String(contentLength) }),
       "Cache-Control":
         accessType === "private"
@@ -111,7 +134,7 @@ export const DELETE = async (
 
   const session = await getSession();
 
-  const authResult = await authorizePrivateDownload(request, resolved.workspaceId, "DELETE");
+  const authResult = await authorizePrivateDownload(request, resolved.workspaceId, "DELETE", params.filePath);
 
   if (!authResult.ok) {
     await logFileDeletion({
@@ -139,12 +162,9 @@ export const DELETE = async (
     }
   }
 
-  const deleteResult = await deleteFile(
-    resolved.workspaceId,
-    accessType,
-    decodeURIComponent(fileName),
-    idParam
-  );
+  // `fileName` comes from the route param, which Next.js has already decoded once. Objects are stored
+  // under that name, so it goes to storage as is.
+  const deleteResult = await deleteFile(resolved.workspaceId, accessType, fileName, idParam);
 
   if (!deleteResult.ok) {
     if (!("error" in deleteResult)) {

@@ -1,10 +1,67 @@
 import * as Sentry from "@sentry/nextjs";
+import { randomUUID } from "node:crypto";
+import { type CommandParser, defineScript } from "redis";
 import { createCacheKey } from "@formbricks/cache";
 import { logger } from "@formbricks/logger";
-import { Result, ok } from "@formbricks/types/error-handlers";
+import { Result, err, ok } from "@formbricks/types/error-handlers";
 import { cache } from "@/lib/cache";
 import { RATE_LIMITING_DISABLED, SENTRY_DSN } from "@/lib/constants";
+import { recordRateLimiterUnavailable } from "./rate-limit-metrics";
+import { runRateLimitScript } from "./redis-script";
 import { TRateLimitConfig, type TRateLimitResponse } from "./types/rate-limit";
+
+export type TRateLimitReservation = {
+  identifier: string;
+  key: string;
+  namespace: string;
+  requested: number;
+  settled: boolean;
+};
+
+type TRateLimitReservationResponse = TRateLimitResponse & {
+  reservation?: TRateLimitReservation;
+};
+
+const consumeScript = defineScript({
+  NUMBER_OF_KEYS: 1,
+  SCRIPT: `
+    local key = KEYS[1]
+    local limit = tonumber(ARGV[1])
+    local ttl = tonumber(ARGV[2])
+    local requested = tonumber(ARGV[3])
+    local current = tonumber(redis.call('GET', key) or '0')
+    local next = current + requested
+    if next > limit then return {next, 0} end
+    local updated = redis.call('INCRBY', key, requested)
+    if current == 0 then redis.call('EXPIRE', key, ttl) end
+    return {updated, 1}
+  `,
+  parseCommand(parser: CommandParser, key: string, limit: string, ttl: string, requested: string) {
+    parser.pushKey(key);
+    parser.push(limit, ttl, requested);
+  },
+  transformReply: (reply: unknown) => reply,
+});
+
+const settleScript = defineScript({
+  NUMBER_OF_KEYS: 1,
+  SCRIPT: `
+    local key = KEYS[1]
+    local unused = tonumber(ARGV[1])
+    local current = tonumber(redis.call('GET', key) or '0')
+    if current == 0 then return {0, 0} end
+    local released = math.min(current, unused)
+    local updated = current - released
+    if updated == 0 then redis.call('DEL', key)
+    else redis.call('DECRBY', key, released) end
+    return {updated, released}
+  `,
+  parseCommand(parser: CommandParser, key: string, unused: string) {
+    parser.pushKey(key);
+    parser.push(unused);
+  },
+  transformReply: (reply: unknown) => reply,
+});
 
 const getRateLimitWindow = (config: TRateLimitConfig, identifier: string, now = Date.now()) => {
   const windowStart = Math.floor(now / (config.interval * 1000)) * config.interval;
@@ -29,6 +86,19 @@ const buildRateLimitResponse = (
 };
 
 /**
+ * The answer to a check that could not reach Redis. Abuse limits (`failClosed`: email, account creation,
+ * brute-force guards) refuse; every other limit lets the request through unchecked, so a Redis outage does
+ * not take the whole app down with it (docs/adr/0016-abuse-limits-fail-closed.md).
+ */
+const limiterUnavailable = (
+  config: TRateLimitConfig,
+  reason: "no_client" | "error"
+): Result<TRateLimitReservationResponse, string> => {
+  recordRateLimiterUnavailable({ failMode: config.failClosed ? "closed" : "open", reason });
+  return config.failClosed ? err("Rate limiter unavailable") : ok({ allowed: true });
+};
+
+/**
  * Read the current rate limit usage without incrementing the counter.
  */
 export const peekRateLimit = async (
@@ -45,20 +115,22 @@ export const peekRateLimit = async (
   try {
     const redis = await cache.getRedisClient();
     if (!redis) {
-      logger.debug(`Redis unavailable`);
-      return ok({
-        allowed: true,
-      });
+      logger.error(
+        { namespace: config.namespace, failClosed: config.failClosed === true },
+        `Redis unavailable`
+      );
+      return limiterUnavailable(config, "no_client");
     }
 
     const { key, ttlSeconds } = getRateLimitWindow(config, identifier);
-    const rawCount = await redis.get(key);
+    const rawCount = await cache.runRedisOperation((client) => client.get(key));
     const currentCount = rawCount ? Number.parseInt(rawCount, 10) : 0;
     const response = buildRateLimitResponse(config, currentCount, ttlSeconds);
 
     if (!response.allowed) {
       logger.error(
         {
+          violationId: randomUUID(),
           identifier,
           currentCount,
           limit: config.allowedPerInterval,
@@ -73,7 +145,12 @@ export const peekRateLimit = async (
     return ok(response);
   } catch (error) {
     const errorMessage = `Rate limit check failed`;
-    const errorContext = { error, identifier, namespace: config.namespace };
+    const errorContext = {
+      error,
+      identifier,
+      namespace: config.namespace,
+      failClosed: config.failClosed === true,
+    };
 
     logger.error(errorContext, errorMessage);
 
@@ -87,21 +164,16 @@ export const peekRateLimit = async (
       });
     }
 
-    return ok({
-      allowed: true,
-    });
+    return limiterUnavailable(config, "error");
   }
 };
 
-/**
- * Atomic Redis-based rate limiter using Lua scripts
- * Prevents race conditions in multi-pod Kubernetes environments
- */
-export const checkRateLimit = async (
+const consumeRateLimit = async (
   config: TRateLimitConfig,
   identifier: string,
-  requested = 1
-): Promise<Result<TRateLimitResponse, string>> => {
+  requested: number,
+  createReservation: boolean
+): Promise<Result<TRateLimitReservationResponse, string>> => {
   if (!Number.isInteger(requested) || requested < 1) {
     throw new Error("Rate limit usage must be a positive integer");
   }
@@ -118,43 +190,24 @@ export const checkRateLimit = async (
     // Get Redis client
     const redis = await cache.getRedisClient();
     if (!redis) {
-      logger.debug(`Redis unavailable`);
-      return ok({
-        allowed: true,
-      });
+      logger.error(
+        { namespace: config.namespace, failClosed: config.failClosed === true },
+        `Redis unavailable`
+      );
+      return limiterUnavailable(config, "no_client");
     }
 
     const { key, windowEnd, ttlSeconds } = getRateLimitWindow(config, identifier);
 
-    // Lua script for atomic weighted increment and conditional expire.
     // Refusing before INCRBY prevents an oversized request from consuming the remaining budget.
-    const luaScript = `
-      local key = KEYS[1]
-      local limit = tonumber(ARGV[1])
-      local ttl = tonumber(ARGV[2])
-      local requested = tonumber(ARGV[3])
-
-      local current = tonumber(redis.call('GET', key) or '0')
-      local next = current + requested
-
-      if next > limit then
-        return {next, 0}
-      end
-
-      local updated = redis.call('INCRBY', key, requested)
-
-      -- Set TTL only when creating the counter (avoids extending windows)
-      if current == 0 then
-        redis.call('EXPIRE', key, ttl)
-      end
-
-      return {updated, 1}
-    `;
-
-    const result = (await redis.eval(luaScript, {
-      keys: [key],
-      arguments: [config.allowedPerInterval.toString(), ttlSeconds.toString(), requested.toString()],
-    })) as [number, number];
+    const result = (await cache.runRedisOperation((client) =>
+      runRateLimitScript(
+        client,
+        consumeScript,
+        [key],
+        [config.allowedPerInterval.toString(), ttlSeconds.toString(), requested.toString()]
+      )
+    )) as [number, number];
     const [currentCount, isAllowed] = result;
 
     // Log debug information for every Redis count increase
@@ -172,14 +225,25 @@ export const checkRateLimit = async (
       `Rate limit check`
     );
 
-    const response: TRateLimitResponse = {
+    const response: TRateLimitReservationResponse = {
       allowed: isAllowed === 1,
       retryAfter: isAllowed === 1 ? undefined : ttlSeconds,
+      reservation:
+        isAllowed === 1 && createReservation
+          ? {
+              identifier,
+              key,
+              namespace: config.namespace,
+              requested,
+              settled: false,
+            }
+          : undefined,
     };
 
     // Log rate limit violations for security monitoring
     if (!response.allowed) {
       const violationContext = {
+        violationId: randomUUID(),
         identifier,
         currentCount,
         limit: config.allowedPerInterval,
@@ -204,7 +268,12 @@ export const checkRateLimit = async (
     return ok(response);
   } catch (error) {
     const errorMessage = `Rate limit check failed`;
-    const errorContext = { error, identifier, namespace: config.namespace };
+    const errorContext = {
+      error,
+      identifier,
+      namespace: config.namespace,
+      failClosed: config.failClosed === true,
+    };
 
     logger.error(errorContext, errorMessage);
 
@@ -219,10 +288,109 @@ export const checkRateLimit = async (
       });
     }
 
-    // Fail open - allow request if rate limiting fails
-    // This ensures system availability over perfect rate limiting
-    return ok({
-      allowed: true,
-    });
+    return limiterUnavailable(config, "error");
+  }
+};
+
+/**
+ * Atomic Redis-based rate limiter using Lua scripts.
+ * Prevents race conditions in multi-pod Kubernetes environments.
+ */
+export const checkRateLimit = async (
+  config: TRateLimitConfig,
+  identifier: string,
+  requested = 1
+): Promise<Result<TRateLimitResponse, string>> => {
+  const result = await consumeRateLimit(config, identifier, requested, false);
+
+  if (!result.ok) {
+    return result;
+  }
+
+  return ok({
+    allowed: result.data.allowed,
+    retryAfter: result.data.retryAfter,
+  });
+};
+
+/**
+ * Reserve rate-limit capacity and return the exact fixed-window key that was charged.
+ * The receipt can later be settled without risking a decrement in a newer window.
+ */
+export const reserveRateLimit = async (
+  config: TRateLimitConfig,
+  identifier: string,
+  requested = 1
+): Promise<Result<TRateLimitReservationResponse, string>> =>
+  consumeRateLimit(config, identifier, requested, true);
+
+/**
+ * Settle a reservation to the number of successful units. Settlement is deliberately best-effort:
+ * callers may already have persisted their work, so a Redis error must not turn that success into an
+ * application error. The receipt is one-shot within the running process to prevent duplicate releases.
+ */
+export const settleRateLimit = async (
+  reservation: TRateLimitReservation,
+  successful: number
+): Promise<void> => {
+  if (!Number.isInteger(successful) || successful < 0 || successful > reservation.requested) {
+    throw new Error("Successful rate limit usage must be an integer within the reserved amount");
+  }
+
+  if (reservation.settled) {
+    return;
+  }
+  reservation.settled = true;
+
+  const unused = reservation.requested - successful;
+  if (unused === 0 || RATE_LIMITING_DISABLED) {
+    return;
+  }
+
+  try {
+    const redis = await cache.getRedisClient();
+    if (!redis) {
+      logger.debug(`Redis unavailable`);
+      return;
+    }
+
+    const [currentCount, released] = (await cache.runRedisOperation((client) =>
+      runRateLimitScript(client, settleScript, [reservation.key], [unused.toString()])
+    )) as [number, number];
+
+    logger.debug(
+      {
+        identifier: reservation.identifier,
+        currentCount,
+        key: reservation.key,
+        namespace: reservation.namespace,
+        released,
+        requested: reservation.requested,
+        successful,
+      },
+      `Rate limit reservation settled`
+    );
+  } catch (error) {
+    const errorMessage = `Rate limit settlement failed`;
+    const errorContext = {
+      error,
+      identifier: reservation.identifier,
+      namespace: reservation.namespace,
+      requested: reservation.requested,
+      successful,
+    };
+
+    logger.error(errorContext, errorMessage);
+
+    if (SENTRY_DSN) {
+      Sentry.captureException(error, {
+        tags: {
+          component: "rate-limiter",
+          namespace: reservation.namespace,
+          operation: "settlement",
+        },
+        extra: errorContext,
+      });
+    }
   }
 };

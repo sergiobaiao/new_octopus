@@ -3,7 +3,7 @@ import { type TJsFileUploadParams } from "@formbricks/types/js";
 import { type TResponseData, type TResponseDataValue, type TResponseTtc } from "@formbricks/types/responses";
 import { type TUploadFileConfig } from "@formbricks/types/storage";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/constants";
-import { type TSurveyElement, type TSurveyElementChoice } from "@formbricks/types/surveys/elements";
+import { type TSurveyElement } from "@formbricks/types/surveys/elements";
 import { TSurveyLanguage } from "@formbricks/types/surveys/types";
 import { AddressElement } from "@/components/elements/address-element";
 import { CalElement } from "@/components/elements/cal-element";
@@ -20,7 +20,9 @@ import { OpenTextElement } from "@/components/elements/open-text-element";
 import { PictureSelectionElement } from "@/components/elements/picture-selection-element";
 import { RankingElement } from "@/components/elements/ranking-element";
 import { RatingElement } from "@/components/elements/rating-element";
-import { getLocalizedValue } from "@/lib/i18n";
+import { SignatureElement } from "@/components/elements/signature-element";
+import { type SubmitContributor } from "@/lib/block-submit";
+import { type SignatureDraftStore } from "@/lib/signature-answer";
 
 interface ElementConditionalProps {
   element: TSurveyElement;
@@ -39,6 +41,9 @@ interface ElementConditionalProps {
   onTtcCollect?: (elementId: string, ttc: number) => void; // Callback to collect TTC synchronously
   errorMessage?: string; // Validation error message from centralized validation
   surveyLanguages: TSurveyLanguage[];
+  signatureDrafts: SignatureDraftStore; // The survey's in-memory Signature drawings
+  registerSubmitContributor: (elementId: string, contributor: SubmitContributor | null) => void; // Lets an element produce its answer on Next
+  disabled?: boolean; // The block is submitting: elements a <fieldset disabled> cannot lock (a canvas) must lock themselves
 }
 
 export function ElementConditional({
@@ -58,6 +63,9 @@ export function ElementConditional({
   onTtcCollect,
   surveyLanguages,
   errorMessage,
+  signatureDrafts,
+  registerSubmitContributor,
+  disabled,
 }: Readonly<ElementConditionalProps>) {
   // Ref to the container div, used to find and expose the form element inside
   const containerRef = useRef<HTMLDivElement>(null);
@@ -81,19 +89,6 @@ export function ElementConditional({
     if (onTtcCollect && newTtc[element.id] !== undefined) {
       onTtcCollect(element.id, newTtc[element.id]);
     }
-  };
-
-  const getResponseValueForRankingElement = (value: string[], choices: TSurveyElementChoice[]): string[] => {
-    return value
-      .map((entry) => {
-        // First check if entry is already a valid choice ID
-        if (choices.some((c) => c.id === entry)) {
-          return entry;
-        }
-        // Otherwise, treat it as a localized label and find the choice by label
-        return choices.find((choice) => getLocalizedValue(choice.label, languageCode) === entry)?.id;
-      })
-      .filter((id): id is TSurveyElementChoice["id"] => id !== undefined);
   };
 
   const isRecognizedType = Object.values(TSurveyElementTypeEnum).includes(element.type);
@@ -273,6 +268,26 @@ export function ElementConditional({
             errorMessage={errorMessage}
           />
         );
+      case TSurveyElementTypeEnum.Signature:
+        return (
+          <SignatureElement
+            key={element.id}
+            surveyId={surveyId}
+            element={element}
+            value={typeof value === "string" ? value : ""}
+            onChange={onChange}
+            onFileUpload={onFileUpload}
+            languageCode={languageCode}
+            ttc={ttc}
+            setTtc={wrappedSetTtc}
+            currentElementId={currentElementId}
+            errorMessage={errorMessage}
+            dir={dir}
+            signatureDrafts={signatureDrafts}
+            registerSubmitContributor={registerSubmitContributor}
+            disabled={disabled}
+          />
+        );
       case TSurveyElementTypeEnum.Cal:
         return (
           <CalElement
@@ -321,7 +336,7 @@ export function ElementConditional({
           <RankingElement
             dir={dir}
             element={element}
-            value={Array.isArray(value) ? getResponseValueForRankingElement(value, element.choices) : []}
+            value={Array.isArray(value) ? value : []}
             onChange={onChange}
             languageCode={languageCode}
             ttc={ttc}

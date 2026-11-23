@@ -13,7 +13,12 @@ import { getSurveyQuestions } from "@/modules/api/v2/management/responses/[respo
 import { findAndDeleteUploadedFilesInResponse } from "@/modules/api/v2/management/responses/[responseId]/lib/utils";
 import { ZResponseUpdateSchema } from "@/modules/api/v2/management/responses/[responseId]/types/responses";
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
-import { evaluateResponseQuotas } from "@/modules/ee/quotas/lib/evaluation-service";
+import {
+  evaluateResponseQuotas,
+  loadQuotaEvaluationContext,
+} from "@/modules/ee/quotas/lib/evaluation-service";
+import { requestEmailAuditErasureRequired } from "@/modules/email/lib/email-audit-maintenance";
+import { enqueueReplacedSignatureFileCleanup } from "@/modules/storage/lib/replaced-signature-files";
 
 export const getResponse = reactCache(async (responseId: string) => {
   try {
@@ -94,10 +99,10 @@ export const getResponseForPipeline = async (
 
 export const deleteResponse = async (responseId: string): Promise<Result<Response, ApiErrorResponseV2>> => {
   try {
-    const deletedResponse = await prisma.response.delete({
-      where: {
-        id: responseId,
-      },
+    const deletedResponse = await prisma.$transaction(async (tx) => {
+      const response = await tx.response.delete({ where: { id: responseId } });
+      await requestEmailAuditErasureRequired({ responseId }, tx);
+      return response;
     });
 
     if (deletedResponse.displayId) {
@@ -115,6 +120,7 @@ export const deleteResponse = async (responseId: string): Promise<Result<Respons
     await findAndDeleteUploadedFilesInResponse(
       deletedResponse.data,
       surveyQuestionsResult.data,
+      deletedResponse.surveyId,
       surveyQuestionsResult.data.workspaceId
     );
 
@@ -268,6 +274,16 @@ export const updateResponse = async (
       return err(linkScopeError);
     }
 
+    // `data` replaces the stored data here, so the image of a signature this write drops or swaps is read
+    // off the row as it was just before. Skipped when the write carries no data.
+    const previous =
+      responseInput.data === undefined
+        ? null
+        : await prismaClient.response.findUnique({
+            where: { id: responseId },
+            select: { surveyId: true, data: true },
+          });
+
     const updatedResponse = await prismaClient.response.update({
       where: {
         id: responseId,
@@ -275,6 +291,15 @@ export const updateResponse = async (
       // Canonicalize the language on write (ENG-1067) — see normalizeResponseLanguage.
       data: { ...responseInput, language: normalizeResponseLanguage(responseInput.language) },
     });
+
+    if (previous) {
+      // After the write, on the same client: in the transaction a failed update queues nothing.
+      await enqueueReplacedSignatureFileCleanup(
+        prismaClient,
+        { surveyId: previous.surveyId, previousData: previous.data, nextData: updatedResponse.data },
+        { bestEffort: !tx }
+      );
+    }
 
     return ok(updatedResponse);
   } catch (error) {
@@ -298,10 +323,18 @@ export const updateResponse = async (
   }
 };
 
+/**
+ * `surveyId` is the stored response's survey, as the route already loaded it — passed in so the quota
+ * definitions are read before the transaction opens. Evaluation still checks it against the updated
+ * row and skips on a mismatch.
+ */
 export const updateResponseWithQuotaEvaluation = async (
   responseId: string,
+  surveyId: string,
   responseInput: z.infer<typeof ZResponseUpdateSchema>
 ): Promise<Result<Response, ApiErrorResponseV2>> => {
+  const quotaContext = await loadQuotaEvaluationContext(surveyId);
+
   const txResponse = await prisma.$transaction<Result<Response, ApiErrorResponseV2>>(async (tx) => {
     const responseResult = await updateResponse(responseId, responseInput, tx);
 
@@ -321,6 +354,7 @@ export const updateResponseWithQuotaEvaluation = async (
       // The row just written, so `reserved` quota operands resolve (ENG-1840).
       response,
       tx,
+      quotaContext,
     });
 
     if (quotaResult.shouldEndSurvey) {

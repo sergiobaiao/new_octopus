@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
-import { AuthenticationError, AuthorizationError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { notFound, redirect } from "next/navigation";
+import { AuthenticationError } from "@formbricks/types/errors";
 import { withAuthorizationSurface } from "@/lib/authorization/context";
 import { canUserAccessOrganization } from "@/lib/organization/auth";
 import { getOrganization } from "@/lib/organization/service";
@@ -9,8 +9,8 @@ import { getSession } from "@/modules/auth/lib/session";
 import { ToasterClient } from "@/modules/ui/components/toaster-client";
 
 const WorkspaceOnboardingLayout = async (props: {
-  params: Promise<{ organizationId: string }>;
-  children: React.ReactNode;
+  readonly params: Promise<{ organizationId: string }>;
+  readonly children: React.ReactNode;
 }) => {
   const params = await props.params;
 
@@ -38,12 +38,12 @@ const WorkspaceOnboardingLayout = async (props: {
   );
 
   if (!isAuthorized) {
-    throw new AuthorizationError(t("common.not_authorized"));
+    return notFound();
   }
 
   const organization = await getOrganization(params.organizationId);
   if (!organization) {
-    throw new ResourceNotFoundError(t("common.organization"), params.organizationId);
+    return notFound();
   }
 
   return (

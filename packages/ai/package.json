@@ -46,7 +46,8 @@
     "@aws-sdk/credential-providers": "3.1017.0",
     "@formbricks/logger": "workspace:*",
     "@formbricks/types": "workspace:*",
-    "ai": "catalog:"
+    "ai": "catalog:",
+    "undici": "catalog:"
   },
   "devDependencies": {
     "@formbricks/config-eslint": "workspace:*",
@@ -55,6 +56,7 @@
     "rimraf": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
-    "vitest": "catalog:"
+    "vitest": "catalog:",
+    "zod": "catalog:"
   }
 }

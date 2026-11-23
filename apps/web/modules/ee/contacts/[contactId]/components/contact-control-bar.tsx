@@ -7,7 +7,7 @@ import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TContactAttributeDataType, TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
 import { useWorkspace } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { deleteContactAction } from "@/modules/ee/contacts/actions";
 import { EditContactAttributesModal } from "@/modules/ee/contacts/components/edit-contact-attributes-modal";
 import { PublishedLinkSurvey } from "@/modules/ee/contacts/lib/surveys";
@@ -23,12 +23,12 @@ interface TContactAttributeWithKeyInfo {
 }
 
 interface ContactControlBarProps {
-  contactId: string;
-  isReadOnly: boolean;
-  isQuotasAllowed: boolean;
-  publishedLinkSurveys: PublishedLinkSurvey[];
-  allAttributeKeys: TContactAttributeKey[];
-  currentAttributes: TContactAttributeWithKeyInfo[];
+  readonly contactId: string;
+  readonly isReadOnly: boolean;
+  readonly isQuotasAllowed: boolean;
+  readonly publishedLinkSurveys: PublishedLinkSurvey[];
+  readonly allAttributeKeys: TContactAttributeKey[];
+  readonly currentAttributes: TContactAttributeWithKeyInfo[];
 }
 
 export const ContactControlBar = ({

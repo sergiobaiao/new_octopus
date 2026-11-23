@@ -6,15 +6,15 @@ import { useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { useWorkspace } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { deleteContactAction } from "@/modules/ee/contacts/actions";
 import { Button } from "@/modules/ui/components/button";
 import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
 
 interface DeleteContactButtonProps {
-  contactId: string;
-  isReadOnly: boolean;
-  isQuotasAllowed: boolean;
+  readonly contactId: string;
+  readonly isReadOnly: boolean;
+  readonly isQuotasAllowed: boolean;
 }
 
 export const DeleteContactButton = ({ contactId, isReadOnly, isQuotasAllowed }: DeleteContactButtonProps) => {

@@ -110,6 +110,8 @@ export interface WorkflowDelegate {
     take: number;
     include: LastRunInclude;
   }) => Promise<WorkflowRowWithLastRun[]>;
+  /** Total for `includeTotalCount`: the list's filters without the cursor. */
+  count: (args: { where: WorkflowWhereInput }) => Promise<number>;
   findUnique: (args: {
     where: { id: string };
     include: LastRunInclude;
@@ -223,7 +225,9 @@ export interface WorkflowRunWhereInput {
   isDryRun?: boolean;
   createdAt?: { lt: Date } | Date;
   id?: { lt: string };
+  surveyId?: null | { notIn: string[] };
   OR?: WorkflowRunWhereInput[];
+  AND?: WorkflowRunWhereInput[];
 }
 
 export interface WorkflowRunOrderByInput {

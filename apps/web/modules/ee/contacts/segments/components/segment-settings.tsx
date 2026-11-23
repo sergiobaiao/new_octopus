@@ -10,7 +10,7 @@ import type { TBaseFilter, TSegment, TSegmentWithSurveyRefs } from "@formbricks/
 import { ZSegmentFilters } from "@formbricks/types/segment";
 import { cn } from "@/lib/cn";
 import { structuredClone } from "@/lib/pollyfills/structuredClone";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { deleteSegmentAction, updateSegmentAction } from "@/modules/ee/contacts/segments/actions";
 import { Button } from "@/modules/ui/components/button";
 import { ConfirmDeleteSegmentModal } from "@/modules/ui/components/confirm-delete-segment-modal";
@@ -20,12 +20,12 @@ import { TSegmentActivitySummary } from "./segment-activity-utils";
 import { SegmentEditor } from "./segment-editor";
 
 interface TSegmentSettingsTabProps {
-  activitySummary: TSegmentActivitySummary;
-  setOpen: (open: boolean) => void;
-  initialSegment: TSegmentWithSurveyRefs;
-  segments: TSegment[];
-  contactAttributeKeys: TContactAttributeKey[];
-  isReadOnly: boolean;
+  readonly activitySummary: TSegmentActivitySummary;
+  readonly setOpen: (open: boolean) => void;
+  readonly initialSegment: TSegmentWithSurveyRefs;
+  readonly segments: TSegment[];
+  readonly contactAttributeKeys: TContactAttributeKey[];
+  readonly isReadOnly: boolean;
 }
 
 export function SegmentSettings({

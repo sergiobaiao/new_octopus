@@ -24,12 +24,12 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@formbricks/database": "workspace:*",
     "@formbricks/logger": "workspace:*",
     "@formbricks/types": "workspace:*",
-    "bullmq": "5.61.0",
-    "ioredis": "5.8.1",
-    "zod": "catalog:"
+    "bullmq": "5.81.5",
+    "ioredis": "5.11.1",
+    "zod": "catalog:",
+    "@formbricks/redis-config": "workspace:*"
   },
   "devDependencies": {
     "@formbricks/config-eslint": "workspace:*",

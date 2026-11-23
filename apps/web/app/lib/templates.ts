@@ -16,7 +16,12 @@ import {
   createBlockChoiceJumpLogic,
   createBlockJumpLogic,
 } from "@/app/lib/survey-block-builder";
-import { buildSurvey, getDefaultSurveyPreset, hiddenFieldsDefault } from "@/app/lib/survey-builder";
+import {
+  buildSurvey,
+  getDefaultSurveyPreset,
+  hiddenFieldsDefault,
+  withTemplateCodes,
+} from "@/app/lib/survey-builder";
 import { createI18nString } from "@/lib/i18n/utils";
 
 export const CUSTOM_SURVEY_TEMPLATE_ID = "custom";
@@ -4795,7 +4800,7 @@ const supportiveWorkCulture = (t: TFunction): TTemplate => {
   );
 };
 
-export const templates = (t: TFunction): TTemplate[] => [
+const catalogTemplates = (t: TFunction): TTemplate[] => [
   cartAbandonmentSurvey(t),
   siteAbandonmentSurvey(t),
   productMarketFitSuperhuman(t),
@@ -4850,7 +4855,7 @@ export const templates = (t: TFunction): TTemplate[] => [
   careerDevelopmentSurvey(t),
 ];
 
-export const customSurveyTemplate = (t: TFunction): TTemplate => {
+const buildCustomSurveyTemplate = (t: TFunction): TTemplate => {
   return {
     id: CUSTOM_SURVEY_TEMPLATE_ID,
     name: t("templates.custom_survey_name"),
@@ -4883,6 +4888,11 @@ export const customSurveyTemplate = (t: TFunction): TTemplate => {
   };
 };
 
+export const templates = (t: TFunction): TTemplate[] => catalogTemplates(t).map(withTemplateCodes);
+
+export const customSurveyTemplate = (t: TFunction): TTemplate =>
+  withTemplateCodes(buildCustomSurveyTemplate(t));
+
 export const getTemplateById = (templateId: string, t: TFunction): TTemplate | null => {
   if (templateId === CUSTOM_SURVEY_TEMPLATE_ID) {
     return customSurveyTemplate(t);
@@ -4901,6 +4911,12 @@ export const previewSurvey = (workspaceName: string, t: TFunction): TSurvey => {
     workspaceId: "cmnh38nzx00003b6r3svd9pv2",
     createdBy: "cltwumfbz0000echxysz6ptvq",
     status: "inProgress" as const,
+    visibility: "workspace" as const,
+    ownerId: null,
+    visibilityVersion: 0,
+    visibilityProjectedVersion: 0,
+    visibilityChangedAt: null,
+    visibilityChangedById: null,
     publishOn: null,
     closeOn: null,
     welcomeCard: {
@@ -5001,6 +5017,7 @@ export const previewSurvey = (workspaceName: string, t: TFunction): TSurvey => {
     languages: [],
     triggers: [],
     showLanguageSwitch: false,
+    autoSelectLanguage: false,
     followUps: [],
     isBackButtonHidden: false,
     isAutoProgressingEnabled: true,

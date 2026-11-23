@@ -1,8 +1,10 @@
 import { NextRequest } from "next/server";
+import { logger } from "@formbricks/logger";
 import { sendToPipeline } from "@/app/lib/pipelines";
 import { can } from "@/lib/authorization";
 import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { applyAnonymizePolicy } from "@/lib/response/anonymize";
+import { canApiKeyReachSurveyResource, getApiKeyVisibleSurveyWhere } from "@/lib/survey/visibility/api-key";
 import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
 import { formatValidationErrorsForV2Api, validateResponseData } from "@/modules/api/lib/validation";
 import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
@@ -36,7 +38,7 @@ export const GET = async (request: NextRequest) =>
 
       const workspaceIds = await getAuthorizedApiKeyWorkspaceIds(authentication);
 
-      const res = await getResponses(workspaceIds, query);
+      const res = await getResponses(workspaceIds, query, await getApiKeyVisibleSurveyWhere());
 
       if (!res.ok) {
         return handleApiError(request, res.error);
@@ -82,7 +84,11 @@ export const POST = async (request: Request) =>
           { type: "apiKey", id: authentication.apiKeyId },
           getWorkspaceAuthorizationActionForMethod("POST"),
           { type: "workspace", id: workspaceId }
-        ))
+        )) ||
+        !(await canApiKeyReachSurveyResource(authentication.apiKeyId, "survey.write", {
+          type: "survey",
+          id: body.surveyId,
+        }))
       ) {
         return handleApiError(
           request,
@@ -183,27 +189,55 @@ export const POST = async (request: Request) =>
         return handleApiError(request, createResponseResult.error, auditLog);
       }
 
+      // Fire-and-forget by design (the other response endpoints await the enqueue), but a failure here
+      // loses every webhook, integration and email for the response — it must at least be visible.
+      const pipelineLogContext = {
+        responseId: createResponseResult.data.id,
+        surveyId: body.surveyId,
+        workspaceId,
+      };
       getResponseForPipeline(createResponseResult.data.id)
         .then((createdResponseForPipeline) => {
-          if (createdResponseForPipeline.ok) {
+          if (!createdResponseForPipeline.ok) {
+            logger.error(
+              { ...pipelineLogContext, error: createdResponseForPipeline.error },
+              "Response pipeline skipped: could not load the created response"
+            );
+            return;
+          }
+
+          sendToPipeline({
+            event: "responseCreated",
+            workspaceId,
+            surveyId: body.surveyId,
+            response: createdResponseForPipeline.data,
+          }).catch((error: unknown) => {
+            logger.error(
+              { ...pipelineLogContext, err: error, event: "responseCreated" },
+              "Response pipeline enqueue failed"
+            );
+          });
+
+          if (createResponseResult.data.finished) {
             sendToPipeline({
-              event: "responseCreated",
+              event: "responseFinished",
               workspaceId,
               surveyId: body.surveyId,
               response: createdResponseForPipeline.data,
-            }).catch(() => {});
-
-            if (createResponseResult.data.finished) {
-              sendToPipeline({
-                event: "responseFinished",
-                workspaceId,
-                surveyId: body.surveyId,
-                response: createdResponseForPipeline.data,
-              }).catch(() => {});
-            }
+            }).catch((error: unknown) => {
+              logger.error(
+                { ...pipelineLogContext, err: error, event: "responseFinished" },
+                "Response pipeline enqueue failed"
+              );
+            });
           }
         })
-        .catch(() => {});
+        .catch((error: unknown) => {
+          logger.error(
+            { ...pipelineLogContext, err: error },
+            "Response pipeline skipped: could not load the created response"
+          );
+        });
 
       if (auditLog) {
         auditLog.targetId = createResponseResult.data.id;

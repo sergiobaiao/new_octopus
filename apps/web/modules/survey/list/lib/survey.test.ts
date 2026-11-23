@@ -5,10 +5,17 @@ import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { TActionClassType } from "@formbricks/types/action-classes";
-import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
+import {
+  DatabaseError,
+  OperationNotAllowedError,
+  ResourceNotFoundError,
+  TooManyRequestsError,
+} from "@formbricks/types/errors";
+import { can } from "@/lib/authorization";
 import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
 import { checkForInvalidMediaInBlocks } from "@/lib/survey/utils";
 import { validateInputs } from "@/lib/utils/validate";
+import { resolveCopiedSurveyCustomCss } from "@/modules/custom-css/lib/service";
 import { getIsQuotasEnabled } from "@/modules/ee/license-check/lib/utils";
 import { getQuotas } from "@/modules/ee/quotas/lib/quotas";
 import { buildWhereClause } from "@/modules/survey/lib/utils";
@@ -17,7 +24,26 @@ import { TWorkspaceWithLanguages } from "../types/surveys";
 // Import the module to be tested
 import { copySurveyToOtherWorkspace, getSurveyCount, getWorkspaceSurveyCount } from "./survey";
 
+const UNENFORCED_CONTEXT = {
+  enforced: false,
+  isOrganizationAdmin: false,
+  kind: "user",
+  userId: "user_1",
+} as const;
+
+// Survey visibility (ENG-3282) is not enforced here: the readiness marker is off, not read from a database.
+vi.mock("@/lib/authzed/scope-readiness", () => ({ isSurveyVisibilityReady: vi.fn(async () => false) }));
 vi.mock("server-only", () => ({}));
+const targetingMocks = vi.hoisted(() => ({
+  assertSegmentSurveyFiltersVisible: vi.fn(),
+  resolveSurveyActorContext: vi.fn(),
+}));
+vi.mock("@/modules/ee/contacts/segments/lib/helper", () => ({
+  assertSegmentSurveyFiltersVisible: targetingMocks.assertSegmentSurveyFiltersVisible,
+}));
+vi.mock("@/lib/survey/visibility/actor-context", () => ({
+  resolveSurveyActorContext: targetingMocks.resolveSurveyActorContext,
+}));
 
 vi.mock("react", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react")>();
@@ -33,6 +59,10 @@ vi.mock("@/lib/survey/utils", () => ({
 
 vi.mock("@/lib/utils/validate", () => ({
   validateInputs: vi.fn(),
+}));
+
+vi.mock("@/lib/authorization", () => ({
+  can: vi.fn(),
 }));
 
 vi.mock("@/lib/organization/service", () => ({
@@ -56,6 +86,12 @@ vi.mock("@/modules/ee/license-check/lib/utils", () => ({
   getIsQuotasEnabled: vi.fn(),
 }));
 
+// ENG-2949: the copy's CSS decision is the shared service's (its rules have their own suite); here only
+// that the copy asks it, with the destination's organization, and acts on the answer.
+vi.mock("@/modules/custom-css/lib/service", () => ({
+  resolveCopiedSurveyCustomCss: vi.fn(async () => ({ customCss: null })),
+}));
+
 vi.mock("@/modules/ee/quotas/lib/quotas", () => ({
   getQuotas: vi.fn(),
 }));
@@ -71,6 +107,7 @@ vi.mock("@/lingodotdev/server", () => ({
 vi.mock("@formbricks/database", () => ({
   prisma: {
     survey: {
+      update: vi.fn(),
       findMany: vi.fn(),
       findUnique: vi.fn(),
       findFirst: vi.fn(),
@@ -96,11 +133,15 @@ vi.mock("@formbricks/database", () => ({
     organization: {
       findFirst: vi.fn(),
     },
-    // Added for the Embedded Data reconcile the copy runs (ENG-1978)
+    // Added for the Embedded Data reconcile the copy runs (ENG-1978). `findMany` is ENG-3228: a
+    // cross-workspace copy looks the source's shared fields up in the target's library before it
+    // decides whether to link them or clone them.
     embeddedData: {
       create: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
       deleteMany: vi.fn(),
+      findMany: vi.fn(),
     },
     surveyEmbeddedData: {
       findMany: vi.fn(),
@@ -109,6 +150,7 @@ vi.mock("@formbricks/database", () => ({
       updateMany: vi.fn(),
     },
     $transaction: vi.fn(),
+    $executeRaw: vi.fn(),
   },
 }));
 
@@ -139,6 +181,8 @@ const resetMocks = () => {
   vi.mocked(prisma.actionClass.findMany).mockReset();
   vi.mocked(getQuotas).mockReset();
   vi.mocked(logger.error).mockClear();
+  vi.mocked(can).mockReset();
+  vi.mocked(can).mockResolvedValue(true);
 
   // copySurveyToOtherWorkspace wraps its writes in a transaction (ENG-1978) so the survey and its
   // Embedded Data rows land together. Reset first like every mock above — otherwise the call history
@@ -152,6 +196,7 @@ const resetMocks = () => {
 
   vi.mocked(prisma.$transaction).mockImplementation(async (callback) => callback(prisma));
   vi.mocked(prisma.surveyEmbeddedData.findMany).mockResolvedValue([]);
+  vi.mocked(prisma.embeddedData.findMany).mockResolvedValue([]);
   vi.mocked(prisma.embeddedData.create).mockResolvedValue({ id: "ed_1" } as never);
   vi.mocked(prisma.surveyEmbeddedData.create).mockResolvedValue({} as never);
 };
@@ -175,10 +220,10 @@ describe("getSurveyCount", () => {
 
   test("should return survey count successfully", async () => {
     vi.mocked(prisma.survey.count).mockResolvedValue(5);
-    const count = await getSurveyCount(workspaceId);
+    const count = await getSurveyCount(workspaceId, undefined, UNENFORCED_CONTEXT);
     expect(count).toBe(5);
     expect(prisma.survey.count).toHaveBeenCalledWith({
-      where: { workspaceId },
+      where: { workspaceId, AND: [] },
     });
     expect(validateInputs).toHaveBeenCalledWith([workspaceId, expect.any(Object)]);
   });
@@ -186,14 +231,14 @@ describe("getSurveyCount", () => {
   test("should throw DatabaseError on Prisma error", async () => {
     const prismaError = makePrismaKnownError();
     vi.mocked(prisma.survey.count).mockRejectedValue(prismaError);
-    await expect(getSurveyCount(workspaceId)).rejects.toThrow(DatabaseError);
+    await expect(getSurveyCount(workspaceId, undefined, UNENFORCED_CONTEXT)).rejects.toThrow(DatabaseError);
     expect(logger.error).toHaveBeenCalledWith(prismaError, "Error getting survey count");
   });
 
   test("should rethrow unknown error", async () => {
     const unknownError = new Error("Unknown error");
     vi.mocked(prisma.survey.count).mockRejectedValue(unknownError);
-    await expect(getSurveyCount(workspaceId)).rejects.toThrow(unknownError);
+    await expect(getSurveyCount(workspaceId, undefined, UNENFORCED_CONTEXT)).rejects.toThrow(unknownError);
   });
 });
 
@@ -211,8 +256,34 @@ const mockExistingSurveyDetails = {
   ],
   questions: [],
   endings: [{ type: "default", headline: { default: "Thanks!" } }],
-  variables: [{ id: "var1", name: "Var One" }],
-  hiddenFields: { enabled: true, fieldIds: ["hf1"] },
+  // ENG-3228: the copy plans its Embedded Data off the source's ROWS, so this relation is what
+  // decides which fields the duplicate gets and who owns each one — since ENG-2404 it is all there is.
+  embeddedDataLinks: [
+    {
+      storageKey: "var_cuid",
+      embeddedData: {
+        id: "ed_var",
+        key: null,
+        name: "score",
+        source: "computed" as const,
+        dataType: "number" as const,
+        defaultValue: 0,
+        locked: false,
+      },
+    },
+    {
+      storageKey: "plan",
+      embeddedData: {
+        id: "ed_plan",
+        key: null,
+        name: "plan",
+        source: "ingested" as const,
+        dataType: "string" as const,
+        defaultValue: null,
+        locked: false,
+      },
+    },
+  ],
   surveyClosedMessage: { enabled: false },
   singleUse: { enabled: false },
   workspaceOverwrites: null,
@@ -264,10 +335,6 @@ describe("copySurveyToOtherWorkspace", () => {
   const mockNewSurveyResult = {
     id: "new_cuid2_id",
     workspaceId: targetWorkspaceId,
-    // The copy carries the source survey's Embedded Data, which the reconcile re-creates for the new
-    // survey (ENG-1978).
-    variables: [{ id: "var_cuid", name: "score", type: "number", value: 0 }],
-    hiddenFields: { enabled: true, fieldIds: ["plan"] },
     segment: null,
     triggers: [
       { actionClass: { id: "new_ac1", name: "Code Action", workspaceId: targetWorkspaceId } },
@@ -343,7 +410,273 @@ describe("copySurveyToOtherWorkspace", () => {
         }),
       })
     );
-    expect(checkForInvalidMediaInBlocks).toHaveBeenCalledWith(mockExistingSurveyDetails.blocks);
+    expect(checkForInvalidMediaInBlocks).toHaveBeenCalledWith([
+      expect.objectContaining({ id: "block1", name: "Block 1" }),
+    ]);
+  });
+
+  // Resolve only what the query selects, the way Prisma does. Returning the whole survey regardless
+  // of the `select` would let these tests pass even when a column is never read — which is the bug.
+  const mockSourceSurvey = (columns: Record<string, unknown>) => {
+    const sourceSurvey: Record<string, unknown> = { ...mockExistingSurveyDetails, ...columns };
+    vi.mocked(prisma.survey.findUnique).mockImplementation((({ select }: { select: object }) =>
+      Promise.resolve(
+        Object.fromEntries(Object.keys(select).map((column) => [column, sourceSurvey[column]]))
+      )) as never);
+  };
+
+  test("keeps every code of the source and codes what an older survey never had (ENG-6782)", async () => {
+    mockSourceSurvey({
+      blocks: [
+        {
+          id: "block1",
+          name: "Block 1",
+          elements: [
+            {
+              id: "a",
+              type: "multipleChoiceSingle",
+              code: "age",
+              headline: { default: "Age?" },
+              choices: [
+                { id: "c1", code: "7", label: { default: "Young" } },
+                { id: "c2", label: { default: "Old" } },
+              ],
+            },
+            { id: "b", type: "openText", headline: { default: "Why?" } },
+          ],
+        },
+      ],
+    });
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId);
+
+    const { data } = vi.mocked(prisma.survey.create).mock.calls[0][0] as unknown as {
+      data: { blocks: { elements: { code: string; choices?: { code: string }[] }[] }[] };
+    };
+    const [first, second] = data.blocks[0].elements;
+    expect(first.code).toBe("age");
+    expect(first.choices?.map((choice) => choice.code)).toEqual(["7", "8"]);
+    expect(second.code).toBe("q1");
+  });
+
+  test("carries the source survey's behaviour and security settings onto the copy", async () => {
+    const configuredSettings = {
+      pin: "1234",
+      autoComplete: 50,
+      autoClose: 30,
+      keepEndingCardOpen: true,
+      delay: 5,
+      redirectUrl: "https://example.com/thanks",
+      displayPercentage: 25,
+      showLanguageSwitch: true,
+      autoSelectLanguage: true,
+      recaptcha: { enabled: true, threshold: 0.5 },
+      isVerifyEmailEnabled: true,
+      isAnonymizeResponsesEnabled: true,
+      isCaptureIpEnabled: true,
+      isBackButtonHidden: true,
+      isAutoProgressingEnabled: true,
+      metadata: { title: { default: "Shared title" } },
+      customHeadScripts: "<script>analytics()</script>",
+      customHeadScriptsMode: "replace",
+      inlineTriggers: { codeConfig: { identifier: "inline" } },
+    };
+    mockSourceSurvey(configuredSettings);
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId);
+
+    expect(prisma.survey.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining(configuredSettings) })
+    );
+  });
+
+  test("carries the show conditions onto the copy, as their own object", async () => {
+    const showConditions = {
+      id: "grp1",
+      connector: "and",
+      conditions: [
+        {
+          id: "cnd1",
+          leftOperand: { type: "page", value: "currentUrl" },
+          operator: "pathIsAnyOf",
+          rightOperand: { type: "static", value: ["/pricing"] },
+        },
+      ],
+    };
+    mockSourceSurvey({ showConditions });
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+    const { data } = vi.mocked(prisma.survey.create).mock.calls[0][0];
+    expect(data.showConditions).toEqual(showConditions);
+    expect(data.showConditions).not.toBe(showConditions);
+  });
+
+  test("does not carry the scheduling dates onto the copy", async () => {
+    // The scheduler closes an `inProgress` survey whose `closeOn` has passed, so a copy that
+    // inherited a past date would complete itself on the first tick after the user publishes it.
+    mockSourceSurvey({ publishOn: new Date("2020-01-01"), closeOn: new Date("2020-02-01") });
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId);
+
+    const { data } = vi.mocked(prisma.survey.create).mock.calls[0][0];
+    expect(data).not.toHaveProperty("publishOn");
+    expect(data).not.toHaveProperty("closeOn");
+  });
+
+  test("keeps head scripts on a copy to another workspace, but adds them to the target's own", async () => {
+    // "replace" would switch off the target workspace's head scripts on the copy. A same-workspace
+    // duplicate keeps "replace"; the settings test above covers that.
+    mockSourceSurvey({ customHeadScripts: "<script>analytics()</script>", customHeadScriptsMode: "replace" });
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+    expect(prisma.survey.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          customHeadScripts: "<script>analytics()</script>",
+          customHeadScriptsMode: "add",
+        }),
+      })
+    );
+  });
+
+  test("refuses to carry head scripts into a workspace the user cannot manage", async () => {
+    mockSourceSurvey({ customHeadScripts: "<script>analytics()</script>", customHeadScriptsMode: "add" });
+    vi.mocked(can).mockResolvedValue(false);
+
+    await expect(
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
+    ).rejects.toThrow(OperationNotAllowedError);
+
+    expect(can).toHaveBeenCalledWith({ type: "user", id: userId }, "workspace.manage", {
+      type: "workspace",
+      id: targetWorkspaceId,
+    });
+    expect(prisma.survey.create).not.toHaveBeenCalled();
+  });
+
+  test("duplicates a survey with head scripts in its own workspace without Manage access", async () => {
+    // The scripts were already approved for this workspace, so a Read & write member can duplicate.
+    vi.mocked(getWorkspaceWithLanguages).mockReset();
+    vi.mocked(getWorkspaceWithLanguages).mockResolvedValue(mockSourceWorkspace);
+    mockSourceSurvey({ customHeadScripts: "<script>analytics()</script>", customHeadScriptsMode: "add" });
+    vi.mocked(can).mockResolvedValue(false);
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId);
+
+    expect(can).not.toHaveBeenCalled();
+    expect(prisma.survey.create).toHaveBeenCalled();
+  });
+
+  describe("custom CSS (ENG-2949)", () => {
+    const sourceCss = {
+      light: { source: ".a{}", compiled: "@layer fb-survey{.a}" },
+      dark: null,
+      processorVersion: 1,
+    };
+    const processedCss = { ...sourceCss, light: { source: ".a{}", compiled: "NEW" }, processorVersion: 2 };
+
+    test("carries the source's CSS as source, processed for the destination organization", async () => {
+      mockSourceSurvey({ customCss: sourceCss });
+      vi.mocked(resolveCopiedSurveyCustomCss).mockResolvedValueOnce({ customCss: processedCss });
+
+      const result = await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+      // Charged to the user copying it, on the budget every other custom CSS write spends.
+      expect(resolveCopiedSurveyCustomCss).toHaveBeenCalledWith({
+        source: sourceCss,
+        destinationOrganizationId: "org_123",
+        principal: userId,
+      });
+      const { data } = vi.mocked(prisma.survey.create).mock.calls[0][0];
+      expect(data.customCss).toEqual(processedCss);
+      expect(result).not.toHaveProperty("customCssNotice");
+      // The source survey is only ever read: the client mock here has no survey write but `create`.
+      expect(prisma.survey.create).toHaveBeenCalledTimes(1);
+    });
+
+    test("a destination without the plan still gets the copy — without the CSS, and with a notice", async () => {
+      mockSourceSurvey({ customCss: sourceCss });
+      vi.mocked(resolveCopiedSurveyCustomCss).mockResolvedValueOnce({
+        customCss: null,
+        notice: "plan_required",
+      });
+
+      const result = await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+      expect(prisma.survey.create).toHaveBeenCalled();
+      expect(vi.mocked(prisma.survey.create).mock.calls[0][0].data).not.toHaveProperty("customCss");
+      expect(result).toMatchObject({ id: "new_cuid2_id", customCssNotice: "plan_required" });
+    });
+
+    test("a spent custom CSS budget refuses the copy before anything is written", async () => {
+      mockSourceSurvey({ customCss: sourceCss });
+      vi.mocked(resolveCopiedSurveyCustomCss).mockRejectedValueOnce(new TooManyRequestsError("Slow down"));
+
+      await expect(
+        copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
+      ).rejects.toBeInstanceOf(TooManyRequestsError);
+      expect(prisma.survey.create).not.toHaveBeenCalled();
+    });
+
+    test("a duplicate in the same workspace follows the same policy", async () => {
+      vi.mocked(getWorkspaceWithLanguages).mockReset();
+      vi.mocked(getWorkspaceWithLanguages).mockResolvedValue(mockSourceWorkspace);
+      mockSourceSurvey({ customCss: sourceCss });
+      vi.mocked(resolveCopiedSurveyCustomCss).mockResolvedValueOnce({
+        customCss: null,
+        notice: "plan_required",
+      });
+
+      const result = await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId);
+
+      expect(result).toMatchObject({ customCssNotice: "plan_required" });
+    });
+  });
+
+  test("accounts for every Survey column, so a new one cannot be dropped silently", async () => {
+    // The copy is built by spreading whatever `getExistingSurvey` selects, so a column that is
+    // neither selected nor listed below is reset to its database default without anyone noticing.
+    // That is the ENG-2144 bug, and #6802 before it. Adding a Survey column fails this test until
+    // you decide which side it belongs on.
+    const RESET_ON_COPY = new Set([
+      "variables",
+      "hiddenFields",
+      "ownershipInitialized",
+      // Identity and ownership: the copy is a new row in a workspace the caller chose.
+      "id",
+      "createdAt",
+      "updatedAt",
+      "workspaceId",
+      "createdBy",
+      // Not reset: the copy reconnects or recreates the segment through the `segment` relation.
+      "segmentId",
+      // Lifecycle: every copy starts as an unpublished, unarchived draft with its own link.
+      "status",
+      "archivedAt",
+      "slug",
+      "publishOn",
+      "closeOn",
+      // Visibility (ENG-3282): the copy gets its own creation facts — owned by the actor, restricted or
+      // workspace-visible by who made it — never the source survey's owner, state or history.
+      "visibility",
+      "ownerId",
+      "visibilityVersion",
+      "visibilityProjectedVersion",
+      "visibilityPending",
+      "visibilityChangedAt",
+      "visibilityChangedById",
+    ]);
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId);
+
+    const { select } = vi.mocked(prisma.survey.findUnique).mock.calls[0][0];
+    const unaccounted = Object.keys(Prisma.SurveyScalarFieldEnum).filter(
+      (column) => !(column in (select ?? {})) && !RESET_ON_COPY.has(column)
+    );
+
+    expect(unaccounted).toEqual([]);
   });
 
   test("defines the copied survey's embedded data in the TARGET workspace, not the source", async () => {
@@ -376,6 +709,130 @@ describe("copySurveyToOtherWorkspace", () => {
     ]);
   });
 
+  test("never writes the dropped legacy columns, and returns the legacy keys derived from the plan", async () => {
+    // ENG-2404: `Survey` has no `variables` / `hiddenFields` column. The result still carries both
+    // (it is the audit log's `newObject`), derived from the plan the rows were written from.
+    const newSurvey = await copySurveyToOtherWorkspace(
+      sourceWorkspaceId,
+      surveyId,
+      targetWorkspaceId,
+      userId
+    );
+
+    const [[createArgs]] = vi.mocked(prisma.survey.create).mock.calls;
+    expect(createArgs.data).not.toHaveProperty("variables");
+    expect(createArgs.data).not.toHaveProperty("hiddenFields");
+    expect(createArgs.select).not.toHaveProperty("variables");
+    expect(newSurvey.variables).toEqual([{ id: "var_cuid", name: "score", type: "number", value: 0 }]);
+    expect(newSurvey.hiddenFields).toEqual({ enabled: true, fieldIds: ["plan"] });
+  });
+
+  test("a source with no rows copies no fields — zero rows is zero fields", async () => {
+    // The zero-row fallback to the legacy columns went with the columns (ENG-2404): the migration
+    // that dropped them gave every survey still without links its rows first.
+    vi.mocked(prisma.survey.findUnique).mockResolvedValue({
+      ...mockExistingSurveyDetails,
+      embeddedDataLinks: [],
+    } as any);
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+    expect(prisma.surveyEmbeddedData.create).not.toHaveBeenCalled();
+    expect(prisma.embeddedData.create).not.toHaveBeenCalled();
+  });
+
+  describe("a shared field, on copy (ENG-3228)", () => {
+    // A shared field is a link to a workspace-owned definition, so what a copy does with it depends
+    // on where the copy lands. Definitions never cross a workspace boundary.
+    const sharedSourceRow = {
+      id: "ed_shared_source",
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested" as const,
+      dataType: "string" as const,
+      defaultValue: "free",
+      locked: true,
+    };
+
+    const surveyWithSharedField = {
+      ...mockExistingSurveyDetails,
+      embeddedDataLinks: [{ storageKey: "plan_tier", embeddedData: sharedSourceRow }],
+    };
+
+    const createdLinks = () =>
+      vi
+        .mocked(prisma.surveyEmbeddedData.create)
+        .mock.calls.map(([args]) => (args as { data: { embeddedDataId: string } }).data);
+
+    beforeEach(() => {
+      vi.mocked(prisma.survey.findUnique).mockResolvedValue(surveyWithSharedField as any);
+    });
+
+    test("re-links the same library row when the copy stays in the workspace", async () => {
+      vi.mocked(getWorkspaceWithLanguages).mockReset();
+      vi.mocked(getWorkspaceWithLanguages).mockResolvedValue(mockSourceWorkspace);
+      // The reconcile re-reads every shared row it is asked to link before it writes anything, so
+      // the row has to exist even on the path where the copy never looked a library up.
+      vi.mocked(prisma.embeddedData.findMany).mockResolvedValue([sharedSourceRow] as never);
+
+      await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId);
+
+      // The library row is right there, so the two surveys go on sharing one definition.
+      expect(prisma.embeddedData.create).not.toHaveBeenCalled();
+      expect(createdLinks()).toEqual([expect.objectContaining({ embeddedDataId: "ed_shared_source" })]);
+    });
+
+    test("links the target workspace's own row when its library has the same field", async () => {
+      vi.mocked(prisma.embeddedData.findMany).mockResolvedValue([
+        { ...sharedSourceRow, id: "ed_shared_target" },
+      ] as never);
+
+      await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+      expect(prisma.embeddedData.create).not.toHaveBeenCalled();
+      expect(createdLinks()).toEqual([expect.objectContaining({ embeddedDataId: "ed_shared_target" })]);
+    });
+
+    test("localizes the field when the target's library answers the key with a different field", async () => {
+      // Same key, different source: a `plan_tier` that is ingested text here and computed there is a
+      // different field wearing the same name, so linking it would change what the copy resolves.
+      vi.mocked(prisma.embeddedData.findMany).mockResolvedValue([
+        { ...sharedSourceRow, id: "ed_other", source: "computed" },
+      ] as never);
+
+      await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+      // Localized rather than dropped, and named after the library KEY: a local field's name is the
+      // legacy hidden field id the copy's columns carry, and `Plan tier` is not a legal one.
+      expect(prisma.embeddedData.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            key: null,
+            name: "plan_tier",
+            source: "ingested",
+            dataType: "string",
+            defaultValue: "free",
+            locked: true,
+            workspaceId: targetWorkspaceId,
+          }),
+        })
+      );
+    });
+
+    test("localizes the field when the target's library has nothing under the key", async () => {
+      await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+      expect(prisma.embeddedData.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { workspaceId: targetWorkspaceId, surveyId: null, key: { in: ["plan_tier"] } },
+        })
+      );
+      expect(prisma.embeddedData.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ key: null, name: "plan_tier" }) })
+      );
+    });
+  });
+
   test("should copy survey to the same workspace successfully", async () => {
     vi.mocked(getWorkspaceWithLanguages).mockReset();
     vi.mocked(getWorkspaceWithLanguages).mockResolvedValue(mockSourceWorkspace);
@@ -396,6 +853,45 @@ describe("copySurveyToOtherWorkspace", () => {
         }),
       })
     );
+  });
+
+  // ENG-6870: a same-workspace copy keeps the targeting, so the copier must see what it reads.
+  test("refuses a copy whose targeting reads a survey hidden from the copier where it lands", async () => {
+    const memberActor = { enforced: true, isOrganizationAdmin: false, kind: "user", userId };
+    const filters = [{ id: "f1", connector: null, resource: [] }];
+    vi.mocked(prisma.survey.findUnique).mockResolvedValue({
+      ...mockExistingSurveyDetails,
+      segment: { id: "seg_public", title: "Public Segment", isPrivate: false, filters },
+    } as any);
+    targetingMocks.resolveSurveyActorContext.mockResolvedValue(memberActor);
+    const refused = new Error("Segment filters reference a survey you don't have access to");
+    targetingMocks.assertSegmentSurveyFiltersVisible.mockRejectedValueOnce(refused);
+
+    await expect(
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId)
+    ).rejects.toBe(refused);
+    expect(targetingMocks.assertSegmentSurveyFiltersVisible).toHaveBeenCalledWith(
+      filters,
+      sourceWorkspaceId,
+      memberActor,
+      "seg_public"
+    );
+    expect(prisma.survey.create).not.toHaveBeenCalled();
+
+    // Into another workspace the copied filters are checked there: an id foreign to the source can be a
+    // hidden survey in the target.
+    targetingMocks.assertSegmentSurveyFiltersVisible.mockClear();
+    targetingMocks.assertSegmentSurveyFiltersVisible.mockRejectedValueOnce(refused);
+    await expect(
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
+    ).rejects.toBe(refused);
+    expect(targetingMocks.assertSegmentSurveyFiltersVisible).toHaveBeenCalledWith(
+      filters,
+      targetWorkspaceId,
+      memberActor,
+      undefined
+    );
+    expect(prisma.survey.create).not.toHaveBeenCalled();
   });
 
   test("should handle private segment: create new private segment in target", async () => {
@@ -648,15 +1144,15 @@ describe("getWorkspaceSurveyCount", () => {
   test("counts archived surveys too, so an all-archived workspace is not empty", async () => {
     vi.mocked(prisma.survey.count).mockResolvedValue(3 as never);
 
-    await expect(getWorkspaceSurveyCount(workspaceId)).resolves.toBe(3);
+    await expect(getWorkspaceSurveyCount(workspaceId, UNENFORCED_CONTEXT)).resolves.toBe(3);
     // No archivedAt narrowing: an archived survey still makes the workspace non-empty.
-    expect(prisma.survey.count).toHaveBeenCalledWith({ where: { workspaceId } });
+    expect(prisma.survey.count).toHaveBeenCalledWith({ where: { workspaceId, AND: [] } });
   });
 
   test("returns 0 when the workspace has no surveys at all", async () => {
     vi.mocked(prisma.survey.count).mockResolvedValue(0 as never);
 
-    await expect(getWorkspaceSurveyCount(workspaceId)).resolves.toBe(0);
+    await expect(getWorkspaceSurveyCount(workspaceId, UNENFORCED_CONTEXT)).resolves.toBe(0);
   });
 
   test("throws DatabaseError on a Prisma known request error", async () => {
@@ -666,6 +1162,6 @@ describe("getWorkspaceSurveyCount", () => {
     });
     vi.mocked(prisma.survey.count).mockRejectedValue(prismaError);
 
-    await expect(getWorkspaceSurveyCount(workspaceId)).rejects.toThrow(DatabaseError);
+    await expect(getWorkspaceSurveyCount(workspaceId, UNENFORCED_CONTEXT)).rejects.toThrow(DatabaseError);
   });
 });

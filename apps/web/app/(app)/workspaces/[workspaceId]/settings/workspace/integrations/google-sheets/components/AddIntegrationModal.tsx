@@ -1,5 +1,6 @@
 "use client";
 
+import { useQueryClient } from "@tanstack/react-query";
 import Image from "next/image";
 import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -19,14 +20,21 @@ import {
   extractSpreadsheetIdFromUrl,
   isValidGoogleSheetsUrl,
 } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/google-sheets/lib/util";
+import { integrationKeys } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/lib/query";
 import GoogleSheetLogo from "@/images/googleSheetsLogo.png";
 import {
   GOOGLE_SHEET_INTEGRATION_INSUFFICIENT_PERMISSION,
+  GOOGLE_SHEET_INTEGRATION_INSUFFICIENT_SCOPES,
   GOOGLE_SHEET_INTEGRATION_INVALID_GRANT,
 } from "@/lib/googleSheet/constants";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { recallToHeadline } from "@/lib/utils/recall";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import {
+  RestrictedSurveyHint,
+  RestrictedSurveysNote,
+} from "@/modules/survey/visibility/components/restricted-survey-hint";
+import { isRestrictedSurveyPick } from "@/modules/survey/visibility/lib/outbound";
 import { AdditionalIntegrationSettings } from "@/modules/ui/components/additional-integration-settings";
 import { Button } from "@/modules/ui/components/button";
 import { Checkbox } from "@/modules/ui/components/checkbox";
@@ -47,6 +55,7 @@ interface AddIntegrationModalProps {
   workspaceId: string;
   open: boolean;
   surveys: TSurvey[];
+  surveyVisibilityEnabled: boolean;
   setOpen: (v: boolean) => void;
   googleSheetIntegration: TIntegrationGoogleSheets;
   selectedIntegration?: (TIntegrationGoogleSheetsConfigData & { index: number }) | null;
@@ -55,12 +64,16 @@ interface AddIntegrationModalProps {
 export const AddIntegrationModal = ({
   workspaceId,
   surveys,
+  surveyVisibilityEnabled,
   open,
   setOpen,
   googleSheetIntegration,
   selectedIntegration,
-}: AddIntegrationModalProps) => {
+}: Readonly<AddIntegrationModalProps>) => {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const refetchIntegration = () =>
+    queryClient.invalidateQueries({ queryKey: integrationKeys.byType(workspaceId, "googleSheets") });
   const integrationData: TIntegrationGoogleSheetsConfigData = {
     spreadsheetId: "",
     spreadsheetName: "",
@@ -71,6 +84,8 @@ export const AddIntegrationModal = ({
     createdAt: new Date(),
   };
   const { handleSubmit } = useForm();
+  // The mapping being edited keeps its survey selectable even if it has since been restricted.
+  const attachedSurveyIds = selectedIntegration ? [selectedIntegration.surveyId] : [];
   const [selectedElements, setSelectedElements] = useState<string[]>([]);
   const [isLinkingSheet, setIsLinkingSheet] = useState(false);
   const [selectedSurvey, setSelectedSurvey] = useState<TSurvey | null>(null);
@@ -87,7 +102,8 @@ export const AddIntegrationModal = ({
     config: {
       key: googleSheetIntegration?.config?.key,
       email: googleSheetIntegration.config.email,
-      data: existingIntegrationData || [],
+      // A copy: the save and delete paths edit this array, and the original is the query cache's.
+      data: [...(existingIntegrationData ?? [])],
     },
   };
 
@@ -130,6 +146,8 @@ export const AddIntegrationModal = ({
       toast.error(t("workspace.integrations.google_sheets.token_expired_error"));
     } else if (errorMessage === GOOGLE_SHEET_INTEGRATION_INSUFFICIENT_PERMISSION) {
       toast.error(t("workspace.integrations.google_sheets.spreadsheet_permission_error"));
+    } else if (errorMessage === GOOGLE_SHEET_INTEGRATION_INSUFFICIENT_SCOPES) {
+      toast.error(t("workspace.integrations.google_sheets.spreadsheet_scope_error"));
     } else {
       toast.error(errorMessage);
     }
@@ -196,6 +214,7 @@ export const AddIntegrationModal = ({
       }
       resetForm();
       setOpen(false);
+      void refetchIntegration();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Unknown error occurred");
     } finally {
@@ -238,6 +257,7 @@ export const AddIntegrationModal = ({
       }
       toast.success(t("workspace.integrations.integration_removed_successfully"));
       setOpen(false);
+      void refetchIntegration();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Unknown error occurred");
     } finally {
@@ -286,6 +306,15 @@ export const AddIntegrationModal = ({
                     selectedItem={selectedSurvey}
                     setSelectedItem={setSelectedSurvey}
                     disabled={surveys.length === 0}
+                    isItemDisabled={(survey: TSurvey) =>
+                      isRestrictedSurveyPick(surveyVisibilityEnabled, survey, attachedSurveyIds)
+                    }
+                    disabledItemHint={<RestrictedSurveyHint kind="restricted" />}
+                  />
+                  <RestrictedSurveysNote
+                    surveyVisibilityEnabled={surveyVisibilityEnabled}
+                    surveys={surveys}
+                    attachedSurveyIds={attachedSurveyIds}
                   />
                   <p className="m-1 text-xs text-slate-500">
                     {surveys.length === 0 && t("workspace.integrations.create_survey_warning")}

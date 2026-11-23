@@ -8,6 +8,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      force_local_builder:
+        description: Use an isolated GitHub runner instead of the persistent Blacksmith builder
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -31,28 +37,28 @@ jobs:
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
       - name: Checkout Repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup repository Node.js version
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
 
       - name: Install pnpm
-        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --config.platform=linux --config.architecture=x64
 
-      - name: Test maintenance and development preparation
-        run: pnpm exec vitest run docker/__tests__/maintenance-upgrade.test.ts scripts/setup-dev-env.test.ts scripts/dev-authzed-up.test.ts
+      - name: Test maintenance, development preparation and release tagging
+        run: pnpm exec vitest run docker/__tests__/maintenance-upgrade.test.ts scripts/setup-dev-env.test.ts scripts/dev-authzed-up.test.ts .github/actions/prepare-docker-image/ghcr-tags.test.ts
 
       - name: Build web workspace dependencies
         run: pnpm build --filter=@formbricks/web^...
@@ -66,11 +72,110 @@ jobs:
       - name: Run AuthZed application and persistence smoke test
         run: bash docker/authzed-smoke.sh
 
-  validate-docker-build:
-    name: Validate Docker Build
+  validate-spicedb-datastores:
+    name: Validate SpiceDB Datastores
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run bundled and external SpiceDB Compose smoke test
+        run: bash docker/spicedb-compose-smoke.sh
+
+  validate-deployment-check-image:
+    name: Validate Deployment Check Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build Deployment Check Image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./apps/deployment-check/Dockerfile
+          push: false
+          load: true
+          tags: deployment-check-test:${{ github.sha }}
+
+      # An unconfigured run must fail fast with a readable message instead of starting a browser.
+      - name: Verify the image rejects a missing configuration
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          set +e
+          output="$(docker run --rm "deployment-check-test:$GITHUB_SHA" 2>&1)"
+          status=$?
+          set -e
+
+          echo "$output"
+          test "$status" -eq 2
+          grep -q "FORMBRICKS_URL" <<<"$output"
+          grep -q "FORMBRICKS_API_KEY" <<<"$output"
+
+  validate-traefik-auth:
+    name: Validate One-Click Traefik Auth Routes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run one-click Traefik auth-route smoke test
+        run: bash docker/traefik-auth-smoke.sh
+
+  validate-docker-build:
+    name: Validate Docker Build
+    # Pin the isolated runner to Ubuntu 24.04, supported by the browser checks.
+    runs-on: ${{ !inputs.force_local_builder && github.event_name != 'merge_group' && !github.event.repository.fork && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    # Forks and merge groups (which can include forks) use isolated GitHub runners.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+
+    # Public fixtures for this disposable validation environment, including Dependabot/fork runs.
+    # These values must never authenticate to external services.
+    env:
+      BLACKSMITH_BUILD: ${{ !inputs.force_local_builder && github.event_name != 'merge_group' && !github.event.repository.fork && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      DUMMY_DATABASE_URL: postgresql://test:test@127.0.0.1:5432/formbricks
+      DUMMY_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
     # Add PostgreSQL and Redis service containers
     services:
@@ -90,24 +195,35 @@ jobs:
           --health-retries 5
 
       redis:
-        image: valkey/valkey@sha256:e0eb7c480958d32bdc4357a74bdd70653ae15f2f9b4c93c4a5a9fad1dc471c84
+        image: valkey/valkey@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
         ports:
           - 6379:6379
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        if: env.BLACKSMITH_BUILD != 'true'
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
       - name: Checkout Repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
+      - name: Set up image browser checks
+        uses: ./.github/actions/setup-image-smoke
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        if: env.BLACKSMITH_BUILD != 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Set up persistent PR Docker builder
+        if: env.BLACKSMITH_BUILD == 'true'
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0
+        with:
+          cache-key: apps/web/Dockerfile-pr-amd64
+          nofallback: true
 
       - name: Verify Valkey Image Platforms
         shell: bash
@@ -127,17 +243,36 @@ jobs:
             any(.manifests[]; .platform.os == "linux" and .platform.architecture == "arm64")
           ' <<<"$manifest"
 
-      # NOTE: deliberately no `cache-from`/`cache-to: type=gha`. Measured over four runs, exporting
-      # the cache cost 222-407s per run while the layers it could restore add up to 12s of work: the
-      # only steps that ever reported CACHED were the apk/corepack prelude, because `COPY . .` sits
-      # ahead of `pnpm install` in apps/web/Dockerfile and invalidates everything after it on any
-      # diff. Nothing populates a cache scope this job can read either — no workflow runs on pushes
-      # to main, and merge_group runs write to throwaway `gh-readonly-queue/...` scopes. Restoring
-      # the cache is worth revisiting only together with both halves of the fix: reorder the
-      # Dockerfile so the install layer survives a source change, and give the cache a producer PRs
-      # can read (a push-to-main build, or a registry cache, which is not branch-scoped).
+      # PRs have their own cache; forks cannot read or write trusted builder state.
+      # Load the current image so all runtime checks exercise this checkout.
       - name: Build Docker Image
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        id: build
+        if: env.BLACKSMITH_BUILD == 'true'
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
+        with:
+          context: .
+          file: ./apps/web/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: false
+          load: true
+          build-args: |
+            NODE_BUILD_JOBS=12
+            FORMBRICKS_DEPLOYMENT_ID=${{ github.sha }}-pr
+            FORMBRICKS_BUILD_VARIANT=pr
+          tags: formbricks-test:${{ github.sha }}
+          secrets: |
+            database_url=${{ env.DUMMY_DATABASE_URL }}
+            encryption_key=${{ env.DUMMY_ENCRYPTION_KEY }}
+            redis_url=redis://localhost:6379
+            hub_api_url=http://localhost:4000
+            hub_api_key=build-time-placeholder
+            cubejs_api_url=http://localhost:4000
+            cubejs_api_secret=build-time-placeholder
+
+      - name: Build Docker Image on isolated GitHub runner
+        if: env.BLACKSMITH_BUILD != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         env:
           GITHUB_SHA: ${{ github.sha }}
         with:
@@ -145,15 +280,30 @@ jobs:
           file: ./apps/web/Dockerfile
           push: false
           load: true
+          build-args: |
+            FORMBRICKS_DEPLOYMENT_ID=${{ github.sha }}-pr
+            FORMBRICKS_BUILD_VARIANT=pr
           tags: formbricks-test:${{ env.GITHUB_SHA }}
           secrets: |
-            database_url=${{ secrets.DUMMY_DATABASE_URL }}
-            encryption_key=${{ secrets.DUMMY_ENCRYPTION_KEY }}
+            database_url=${{ env.DUMMY_DATABASE_URL }}
+            encryption_key=${{ env.DUMMY_ENCRYPTION_KEY }}
             redis_url=redis://localhost:6379
             hub_api_url=http://localhost:4000
             hub_api_key=build-time-placeholder
             cubejs_api_url=http://localhost:4000
             cubejs_api_secret=build-time-placeholder
+
+      - name: Verify assembled Next runtime
+        env:
+          IMAGE: formbricks-test:${{ github.sha }}
+          BUILD_IDENTITY: ${{ github.sha }}-pr
+        run: docker run --rm --network none --entrypoint node "$IMAGE" verify-next-runtime.mjs "$BUILD_IDENTITY" pr
+
+      # Node must trust the OS CA bundle, or a CA-package fix such as the eMudhra distrust never reaches it.
+      - name: Verify Node trusts the OS CA bundle
+        env:
+          IMAGE: formbricks-test:${{ github.sha }}
+        run: bash apps/web/scripts/docker/verify-tls-image.sh "$IMAGE"
 
       - name: Verify Runtime Image Excludes npm
         shell: bash
@@ -172,7 +322,6 @@ jobs:
         shell: bash
         env:
           GITHUB_SHA: ${{ github.sha }}
-          DUMMY_ENCRYPTION_KEY: ${{ secrets.DUMMY_ENCRYPTION_KEY }}
         run: |
           set -euo pipefail
 
@@ -188,6 +337,7 @@ jobs:
           AUTHZED_CLI_ENV=(
             -e DATABASE_URL="postgresql://test:test@192.0.2.1:5432/formbricks"
             -e ENCRYPTION_KEY="$DUMMY_ENCRYPTION_KEY"
+            -e BETTER_AUTH_SECRET="$DUMMY_ENCRYPTION_KEY"
             -e REDIS_URL="redis://192.0.2.1:6379"
             -e HUB_API_URL="http://192.0.2.1:4000"
             -e HUB_API_KEY="build-time-placeholder"
@@ -245,7 +395,6 @@ jobs:
         shell: bash
         env:
           GITHUB_SHA: ${{ github.sha }}
-          DUMMY_ENCRYPTION_KEY: ${{ secrets.DUMMY_ENCRYPTION_KEY }}
         run: |
           set -euo pipefail
 
@@ -348,6 +497,17 @@ jobs:
             -e AI_OPENAI_COMPATIBLE_BASE_URL="base-url-secret-sentinel"
 
           run_invalid_case \
+            "oauth mode missing token URL" \
+            "AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL" \
+            "oauth-client-secret-sentinel" \
+            -e AI_PROVIDER="openai-compatible" \
+            -e AI_MODEL="test-model" \
+            -e AI_OPENAI_COMPATIBLE_BASE_URL="https://gateway.example/v1" \
+            -e AI_OPENAI_COMPATIBLE_AUTH_MODE="oauth2-client-credentials" \
+            -e AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID="test-client" \
+            -e AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET="oauth-client-secret-sentinel"
+
+          run_invalid_case \
             "invalid Azure base URL" \
             "AI_AZURE_BASE_URL" \
             "azure-base-url-secret-sentinel" \
@@ -360,7 +520,6 @@ jobs:
         shell: bash
         env:
           GITHUB_SHA: ${{ github.sha }}
-          DUMMY_ENCRYPTION_KEY: ${{ secrets.DUMMY_ENCRYPTION_KEY }}
         run: |
           set -euo pipefail
 
@@ -368,7 +527,7 @@ jobs:
           trap 'rm -f docker/.env' EXIT
           printf '%s\n' \
             'WEBAPP_URL=http://localhost:3000' \
-            'NEXTAUTH_URL=http://localhost:3000' \
+            'BETTER_AUTH_URL=http://localhost:3000' \
             'POSTGRES_PASSWORD=compose-postgres-placeholder' \
             "ENCRYPTION_KEY=$DUMMY_ENCRYPTION_KEY" \
             "BETTER_AUTH_SECRET=$DUMMY_ENCRYPTION_KEY" \
@@ -410,7 +569,6 @@ jobs:
         shell: bash
         env:
           GITHUB_SHA: ${{ github.sha }}
-          DUMMY_ENCRYPTION_KEY: ${{ secrets.DUMMY_ENCRYPTION_KEY }}
         run: |
           set -euo pipefail
 
@@ -460,7 +618,13 @@ jobs:
           fi
 
       - name: Verify and Initialize PostgreSQL
+        env:
+          POSTGRES_SERVICE_ID: ${{ job.services.postgres.id }}
+          REDIS_SERVICE_ID: ${{ job.services.redis.id }}
         run: |
+          # Runner hardening can restart Docker after Actions creates the service containers.
+          # Restore only this job's fixtures before testing the application against them.
+          docker start "$POSTGRES_SERVICE_ID" "$REDIS_SERVICE_ID"
           echo "Verifying PostgreSQL connection..."
           # Install PostgreSQL client to test connection
           sudo apt-get update && sudo apt-get install -y postgresql-client
@@ -514,8 +678,9 @@ jobs:
         shell: bash
         env:
           GITHUB_SHA: ${{ github.sha }}
-          DUMMY_ENCRYPTION_KEY: ${{ secrets.DUMMY_ENCRYPTION_KEY }}
         run: |
+          set -euo pipefail
+          trap 'docker rm -f formbricks-test >/dev/null 2>&1 || true' EXIT
           echo "🧪 Testing if the Docker image starts correctly..."
 
           # Add extra docker run args to support host.docker.internal on Linux
@@ -545,8 +710,6 @@ jobs:
           MAX_RETRIES=60  # 60 attempts × 5 seconds = 5 minutes
           RETRY_COUNT=0
           HEALTH_CHECK_SUCCESS=false
-
-          set +e  # Disable exit on error to allow for retries
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
             RETRY_COUNT=$((RETRY_COUNT + 1))
@@ -578,6 +741,12 @@ jobs:
             sleep 5
           done
 
+          if [ "$HEALTH_CHECK_SUCCESS" != "true" ]; then
+            echo "❌ Health check failed after $((MAX_RETRIES * 5)) seconds (5 minutes)"
+            docker logs formbricks-test || true
+            exit 1
+          fi
+
           # Show full container logs for debugging and verify startup work ran exactly once
           echo "📋 Full container logs:"
           CONTAINER_LOGS="$(docker logs formbricks-test 2>&1)"
@@ -597,14 +766,18 @@ jobs:
           assert_log_once "Running database migrations"
           assert_log_once "Running SAML database setup"
 
-          # Clean up the container
-          echo "🧹 Cleaning up..."
-          docker rm -f formbricks-test
-
-          # Exit with failure if health check did not succeed
-          if [ "$HEALTH_CHECK_SUCCESS" != "true" ]; then
-            echo "❌ Health check failed after $((MAX_RETRIES * 5)) seconds (5 minutes)"
-            exit 1
-          fi
+          # Exercise browser hydration against the image, not a separate Next build.
+          PGPASSWORD=test psql -h localhost -U test -d formbricks -v ON_ERROR_STOP=1 -f docker/fixtures/image-smoke.sql
+          node docker/smoke-next-browser.mjs http://localhost:3000
 
           echo "✨ Docker validation complete - all checks passed!"
+
+      - name: Remove PR image from the runner cache
+        if: ${{ always() && env.BLACKSMITH_BUILD == 'true' && steps.build.outcome == 'success' }}
+        run: docker image rm "formbricks-test:$GITHUB_SHA"
+
+      - name: Bound persistent PR build cache
+        if: ${{ !cancelled() && env.BLACKSMITH_BUILD == 'true' && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
+        run: |
+          docker buildx prune --force --max-used-space 30gb
+          docker buildx du >> "$GITHUB_STEP_SUMMARY"

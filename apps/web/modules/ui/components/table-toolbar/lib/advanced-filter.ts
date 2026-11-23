@@ -1,0 +1,113 @@
+import { createId } from "@paralleldrive/cuid2";
+import type {
+  TGenericCondition,
+  TGenericConditionGroup,
+} from "@/modules/ui/components/conditions-editor/types";
+import { operatorTakesValue, operatorTakesValues } from "./operators";
+import type { TFilterProperty, TRuleOperator, TTableFilter } from "./types";
+import { isCalendarDay } from "./url-codec";
+
+// Advanced filter edits rules in `ConditionsEditor`'s shape and saves them back as table filters. Rules
+// combine with AND only (ENG-3539), so the group is flat and its connector fixed.
+
+export const emptyCondition = (): TGenericCondition => ({
+  id: createId(),
+  leftOperand: { value: "", type: "property" },
+  operator: "",
+});
+
+const toRightOperand = (
+  rule: TTableFilter,
+  property: TFilterProperty | undefined
+): TGenericCondition["rightOperand"] => {
+  if (operatorTakesValues(rule.operator, property)) return { value: [...rule.values], type: "static" };
+  return rule.values[0] === undefined ? undefined : { value: rule.values[0], type: "static" };
+};
+
+type TRawValue = NonNullable<TGenericCondition["rightOperand"]>["value"] | undefined;
+
+/** A list operator's picked values, trimmed and de-duplicated. */
+const toValues = (value: TRawValue): string[] => {
+  const raw = Array.isArray(value) ? value : [value];
+  const values = raw.map((item) => (item === undefined || item === null ? "" : String(item).trim()));
+  return [...new Set(values.filter((item) => item.length > 0))];
+};
+
+/** The rules as the editor's rows; `properties` say which rules hold a list (`multiValueEquals`). */
+export const rulesToConditionGroup = (
+  rules: readonly TTableFilter[],
+  properties: readonly TFilterProperty[] = []
+): TGenericConditionGroup => ({
+  id: "advanced-filter",
+  connector: "and",
+  conditions:
+    rules.length > 0
+      ? rules.map((rule) => ({
+          id: createId(),
+          leftOperand: { value: rule.property, type: "property" },
+          operator: rule.operator,
+          rightOperand: toRightOperand(
+            rule,
+            properties.find((property) => property.id === rule.property)
+          ),
+        }))
+      : [emptyCondition()],
+});
+
+const toValue = (value: TRawValue): string => {
+  if (Array.isArray(value)) return value[0] ?? "";
+  return value === undefined || value === null ? "" : String(value).trim();
+};
+
+export type TRuleValidation = { rules: TTableFilter[]; incomplete: string[] };
+
+const isValidSingleValue = (property: TFilterProperty, value: string): boolean =>
+  value.length > 0 &&
+  (property.valueType !== "number" || Number.isFinite(Number(value))) &&
+  (property.valueType !== "date" || isCalendarDay(value));
+
+/**
+ * A property, an operator and the value or values picked for them as a rule, or null while it is
+ * unfinished: an operator the property does not offer, or a missing or malformed value.
+ */
+export const buildRule = (
+  property: TFilterProperty | undefined,
+  operator: TRuleOperator | "",
+  rawValue: TRawValue
+): TTableFilter | null => {
+  if (!operator || !property?.ruleOperators?.includes(operator)) return null;
+  if (!operatorTakesValue(operator)) return { property: property.id, operator, values: [] };
+  if (operatorTakesValues(operator, property)) {
+    const values = toValues(rawValue);
+    return values.length > 0 ? { property: property.id, operator, values } : null;
+  }
+  const value = toValue(rawValue);
+  return isValidSingleValue(property, value) ? { property: property.id, operator, values: [value] } : null;
+};
+
+/**
+ * The finished rows as rules, and the ids of rows started but left unfinished. A row nobody touched
+ * (no property) is simply dropped; a row with a property but no operator, or a missing or malformed
+ * value, blocks saving so a half-written rule never silently disappears.
+ */
+export const conditionGroupToRules = (
+  group: TGenericConditionGroup,
+  properties: readonly TFilterProperty[]
+): TRuleValidation => {
+  const propertyById = new Map(properties.map((property) => [property.id, property]));
+  const rules: TTableFilter[] = [];
+  const incomplete: string[] = [];
+
+  for (const item of group.conditions) {
+    if ("conditions" in item || !item.leftOperand.value) continue;
+    const rule = buildRule(
+      propertyById.get(item.leftOperand.value),
+      item.operator as TRuleOperator,
+      item.rightOperand?.value
+    );
+    if (rule) rules.push(rule);
+    else incomplete.push(item.id);
+  }
+
+  return { rules, incomplete };
+};

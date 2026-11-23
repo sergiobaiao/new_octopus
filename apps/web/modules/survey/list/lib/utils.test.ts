@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { normalizeSurveyFilters, parseStoredSurveyFilters } from "./utils";
+import { getNormalizedVisibility, normalizeSurveyFilters } from "./utils";
 
 describe("normalizeSurveyFilters", () => {
   test("returns the normalized default filters when input is empty", () => {
@@ -7,6 +7,8 @@ describe("normalizeSurveyFilters", () => {
       name: "",
       status: [],
       type: [],
+      visibility: [],
+      owner: [],
       sortBy: "relevance",
     });
   });
@@ -18,12 +20,16 @@ describe("normalizeSurveyFilters", () => {
         createdBy: ["you"],
         status: ["paused", "draft", "paused"],
         type: ["link", "app", "link"],
+        visibility: ["workspace", "private", "restricted", "workspace"],
+        owner: [],
         sortBy: "name",
       } as any)
     ).toEqual({
       name: "Customer feedback",
       status: ["draft", "paused"],
       type: ["app", "link"],
+      visibility: ["restricted", "workspace"],
+      owner: [],
       sortBy: "name",
     });
   });
@@ -35,6 +41,8 @@ describe("normalizeSurveyFilters", () => {
           name: "",
           status: [],
           type: ["app", "link"],
+          visibility: [],
+          owner: [],
           sortBy: "updatedAt",
         },
         "link"
@@ -43,32 +51,24 @@ describe("normalizeSurveyFilters", () => {
       name: "",
       status: [],
       type: [],
+      visibility: [],
+      owner: [],
       sortBy: "updatedAt",
     });
   });
 });
 
-describe("parseStoredSurveyFilters", () => {
-  test("returns null for invalid JSON", () => {
-    expect(parseStoredSurveyFilters("{")).toBeNull();
+describe("getNormalizedVisibility", () => {
+  test("keeps known values, dedupes and sorts them", () => {
+    expect(getNormalizedVisibility(["workspace", "restricted", "workspace"])).toEqual([
+      "restricted",
+      "workspace",
+    ]);
   });
 
-  test("sanitizes legacy stored filters", () => {
-    expect(
-      parseStoredSurveyFilters(
-        JSON.stringify({
-          name: "  NPS  ",
-          createdBy: ["you"],
-          status: ["completed", "draft"],
-          type: ["link"],
-          sortBy: "createdAt",
-        })
-      )
-    ).toEqual({
-      name: "NPS",
-      status: ["completed", "draft"],
-      type: ["link"],
-      sortBy: "createdAt",
-    });
+  test("drops unknown values and non-arrays", () => {
+    expect(getNormalizedVisibility(["private", 1, null])).toEqual([]);
+    expect(getNormalizedVisibility("restricted")).toEqual([]);
+    expect(getNormalizedVisibility(undefined)).toEqual([]);
   });
 });

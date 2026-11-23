@@ -9,10 +9,12 @@ import { TSurveyStyling } from "@formbricks/types/surveys/types";
 import { TWorkspaceStyling } from "@formbricks/types/workspace";
 import { cn } from "@/lib/cn";
 import { Button } from "@/modules/ui/components/button";
+import { useStylingAppearance } from "@/modules/ui/components/styling-appearance";
 import {
   ColorField,
   DimensionInput,
   NumberField,
+  PageFontField,
   StylingSection,
   TextField,
 } from "@/modules/ui/components/styling-fields";
@@ -24,6 +26,13 @@ type FormStylingSettingsProps = {
   disabled?: boolean;
   form: UseFormReturn<TWorkspaceStyling | TSurveyStyling>;
   onSuggestColorsClick?: () => void;
+  /** Rendered right under the brand color, e.g. its dark contrast warnings. */
+  brandColorNotice?: React.ReactNode;
+  /**
+   * Shows the Font field (ENG-3864), for app surveys only: link surveys always use the survey font. The
+   * value is what the survey renders in while its own styling has no Page font yet: the workspace's.
+   */
+  pageFontFallback?: boolean;
 };
 
 export const FormStylingSettings = ({
@@ -33,8 +42,13 @@ export const FormStylingSettings = ({
   setOpen,
   form,
   onSuggestColorsClick,
-}: FormStylingSettingsProps) => {
+  brandColorNotice,
+  pageFontFallback,
+}: Readonly<FormStylingSettingsProps>) => {
   const { t } = useTranslation();
+  // In Dark the brand color field shows an "Automatic" hint under the input; the button keeps the
+  // same bottom offset so it stays level with the input instead of the hint.
+  const appearance = useStylingAppearance();
 
   const [headlinesOpen, setHeadlinesOpen] = useState(false);
   const [inputsOpen, setInputsOpen] = useState(false);
@@ -92,13 +106,23 @@ export const FormStylingSettings = ({
               <Button
                 type="button"
                 variant="default"
-                className="h-10 justify-center gap-1"
+                className={cn("h-10 justify-center gap-1", appearance === "dark" && "mb-5")}
                 onClick={onSuggestColorsClick}
                 disabled={disabled || !onSuggestColorsClick}>
                 <SparklesIcon className="mr-2 size-4" />
                 {t("workspace.look.suggest_colors")}
               </Button>
             </div>
+          )}
+          {!isSettingsPage && brandColorNotice}
+
+          {pageFontFallback !== undefined && (
+            <PageFontField
+              form={form}
+              description={t("workspace.look.font_survey_description")}
+              fallback={pageFontFallback}
+              disabled={disabled}
+            />
           )}
 
           {/* Headlines & Descriptions */}

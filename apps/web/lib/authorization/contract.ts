@@ -20,11 +20,20 @@ export const AUTHORIZATION_PERMISSION_MAP = {
     "manage_api_keys",
   ],
   team: ["read", "manage", "delete"],
-  workspace: ["read", "write", "manage", "share"],
-  survey: ["read", "write", "manage", "delete", "publish", "response_read", "response_export"],
+  workspace: ["read", "write", "manage", "share", "dashboard_read"],
+  survey: [
+    "read",
+    "write",
+    "manage",
+    "delete",
+    "publish",
+    "response_read",
+    "response_export",
+    "change_visibility",
+  ],
   dashboard: ["read", "write"],
   feedbackDirectory: ["read", "write", "manage"],
-  feedbackDirectoryAssignment: ["read", "write", "manage"],
+  feedbackDirectoryAssignment: ["read", "write", "manage", "dashboard_read"],
   response: ["read", "write", "manage", "export"],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 

@@ -1,0 +1,159 @@
+# Version updates for the actions pinned in .github/, the Cube image built from docker/cube-image, the
+# dev container's features, and patch and minor releases of the npm workspace.
+# Security updates for the npm workspace are configured separately in the repository settings and routed to
+# Linear by dependabot-to-linear.yml.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # "/" covers .github/workflows; composite actions are only scanned when listed explicitly.
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: monthly
+    # One PR per month moves every workflow together, so no action ends up on two versions.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    # cosign-installer v4 installs cosign v3, which signs images as OCI referrer bundles that cosign
+    # verifiers older than 2.6 cannot find. Moving to it changes how self-hosters verify our published
+    # images, so it needs its own PR with migration notes rather than a monthly group bump.
+    ignore:
+      - dependency-name: sigstore/cosign-installer
+        update-types:
+          - version-update:semver-major
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+      - github_actions
+
+  # The digest-pinned base images of ghcr.io/formbricks/cube, daily because new digests are where OS
+  # security fixes arrive. A new digest changes the image, so the PR also needs a
+  # docker/cube-image/REVISION bump: cube-image.yml fails until it has one.
+  - package-ecosystem: docker
+    directory: "/docker/cube-image"
+    schedule:
+      interval: daily
+    # The build stage stays on the runtime's Node major (the distroless base is nodejs24).
+    ignore:
+      - dependency-name: node
+        update-types:
+          - version-update:semver-major
+    commit-message:
+      prefix: "chore(docker)"
+    labels:
+      - dependencies
+
+  # The Cube version inside ghcr.io/formbricks/cube. The server and its driver must move together, and a
+  # new version also needs its native-module checksums (see "Bumping Cube" in docker/cube-image/README.md).
+  - package-ecosystem: npm
+    directory: "/docker/cube-image"
+    schedule:
+      interval: monthly
+    groups:
+      cube:
+        patterns:
+          - "@cubejs-backend/*"
+    commit-message:
+      prefix: "chore(docker)"
+    labels:
+      - dependencies
+      - javascript
+
+  # The dev container's features, pinned by digest in .devcontainer/devcontainer-lock.json. Features run as
+  # root at build time and docker-in-docker runs privileged, so they should track the maintained major.
+  - package-ecosystem: devcontainers
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(devcontainer)"
+    labels:
+      - dependencies
+
+  # Version PRs complement Trivy: they do not detect CVEs inside an image.
+  # Keep review required for datastore majors and chart/image compatibility changes.
+  - package-ecosystem: helm
+    directories:
+      - "/charts/formbricks"
+      - "/charts/spicedb-operator"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 15
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(helm)"
+
+  - package-ecosystem: docker-compose
+    directories:
+      - "/"
+      - "/docker"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 15
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(docker)"
+
+  - package-ecosystem: docker
+    directory: "/apps/web"
+    schedule:
+      interval: daily
+    # Keep the build-stage Node major aligned with .nvmrc and the compiled runtime.
+    ignore:
+      - dependency-name: node
+        update-types:
+          - version-update:semver-major
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(docker)"
+
+  # Patch and minor releases of the workspace's npm dependencies, one grouped PR a week, so fixes land
+  # before they become advisories. Majors need a deliberate migration and get a ticket instead. `allow`
+  # narrows version updates only, so security updates for a major still arrive.
+  # The cooldown matches pnpm's minimumReleaseAge (4320 minutes), so a PR never proposes a version that
+  # `pnpm install` would refuse.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 3
+    # Four package PRs can sit here at once (see the exclusion below) and stay open until someone bumps the
+    # package and re-checks its patch by hand, so the default limit of 5 would let them crowd out the weekly
+    # group PR they are deliberately kept out of.
+    open-pull-requests-limit: 10
+    allow:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
+    groups:
+      npm-minor-and-patch:
+        patterns:
+          - "*"
+        # Every package carrying a version-pinned patch in pnpm-workspace.yaml (`patchedDependencies`) is
+        # held out of the group, so Dependabot opens one PR per package instead of batching them. A bump the
+        # patch does not match makes `pnpm install` fail — this repo does not set `allowUnusedPatches` — and
+        # riding in the group with 50 unrelated updates would block all of them. Alone, the red PR is the
+        # signal to bump the package and re-check its patch by hand; each entry in `patchedDependencies`
+        # names the ticket behind it.
+        # Deliberately not an `ignore`: a bare one suppresses security updates too, for exactly the packages
+        # sitting under a hand-applied mitigation, and with no PR raised nothing would ask for the patch to
+        # be re-checked when Next moves.
+        exclude-patterns:
+          - "next"
+          - "better-auth"
+          - "@better-auth/oauth-provider"
+          - "pg-pool"
+    labels:
+      - dependencies
+      - javascript
+    commit-message:
+      prefix: "chore(deps)"

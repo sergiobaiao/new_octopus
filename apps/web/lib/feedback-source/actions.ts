@@ -12,6 +12,7 @@ import {
 import { assertCan } from "@/lib/authorization";
 import { getResponseCountBySurveyId } from "@/lib/response/service";
 import { getSurvey } from "@/lib/survey/service";
+import { assertNewlyAttachedSurveysWorkspaceVisible } from "@/lib/survey/visibility/outbound";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
 import { AuthenticatedActionClientCtx } from "@/lib/utils/action-client/types/context";
 import {
@@ -22,10 +23,7 @@ import {
 import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
 import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
 import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
-import { getFeedbackDirectoriesByWorkspaceId } from "@/modules/ee/feedback-directory/lib/feedback-directory";
 import { getContactIdsByUserIds } from "@/modules/ee/unify-feedback/lib/contacts";
-import { listFeedbackRecords } from "@/modules/hub/service";
-import type { FeedbackRecordListParams, FeedbackRecordListResponse } from "@/modules/hub/types";
 import { assertFeedbackSourceDirectoryAccess } from "./access";
 import { importHistoricalResponses } from "./import";
 import { resolveFormbricksMappingsInput } from "./mappings";
@@ -228,7 +226,11 @@ export const updateFeedbackSourceWithMappingsAction = authenticatedActionClient
       // fails here rather than as a Prisma error from the update.
       const feedbackSource = await prisma.feedbackSource.findUnique({
         where: { id: parsedInput.feedbackSourceId, workspaceId: parsedInput.workspaceId },
-        select: { feedbackDirectoryId: true, type: true },
+        select: {
+          feedbackDirectoryId: true,
+          formbricksMappings: { select: { surveyId: true } },
+          type: true,
+        },
       });
       if (!feedbackSource) {
         throw new ResourceNotFoundError("FeedbackSource", parsedInput.feedbackSourceId);
@@ -245,7 +247,8 @@ export const updateFeedbackSourceWithMappingsAction = authenticatedActionClient
       if (parsedInput.formbricksMappings?.length) {
         mappingsInput = await resolveFormbricksMappingsInput(
           parsedInput.formbricksMappings,
-          parsedInput.workspaceId
+          parsedInput.workspaceId,
+          feedbackSource.formbricksMappings.map(({ surveyId }) => surveyId)
         );
       } else if (parsedInput.fieldMappings && parsedInput.fieldMappings.length > 0) {
         mappingsInput = {
@@ -292,6 +295,11 @@ export const getResponseCountAction = authenticatedActionClient
       await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
         type: "workspace",
         id: surveyWorkspaceId,
+      });
+      // ENG-3282: a restricted survey's response count is its owner's and the administrators'.
+      await assertCan({ type: "user", id: ctx.user.id }, "survey.response_read", {
+        type: "survey",
+        id: parsedInput.surveyId,
       });
 
       return getResponseCountBySurveyId(parsedInput.surveyId);
@@ -347,73 +355,19 @@ export const importHistoricalResponsesAction = authenticatedActionClient
       if (survey.workspaceId !== parsedInput.workspaceId) {
         throw new ResourceNotFoundError("Survey", parsedInput.surveyId);
       }
+      // ENG-3282: the import copies this survey's responses, so the caller must be able to read them.
+      await assertCan({ type: "user", id: ctx.user.id }, "survey.response_read", {
+        type: "survey",
+        id: survey.id,
+      });
+      // Copying responses into a feedback directory is outbound (ENG-3283): a restricted survey's
+      // responses must not leave its access list this way either.
+      await assertNewlyAttachedSurveysWorkspaceVisible([survey.id]);
 
       const importResult = await importHistoricalResponses(feedbackSource, survey);
       ctx.auditLoggingCtx.newObject = importResult;
       return importResult;
     })
-  );
-
-const ZListFeedbackRecordsAction = z.object({
-  workspaceId: ZId,
-  frdId: ZId,
-  limit: z.number().min(1).max(1000).optional(),
-  cursor: z.string().optional(),
-  sourceType: z.string().optional(),
-  fieldType: z
-    .enum(["text", "categorical", "nps", "csat", "ces", "rating", "number", "boolean", "date"])
-    .optional(),
-  since: z.string().optional(),
-  until: z.string().optional(),
-});
-
-export const listFeedbackRecordsAction = authenticatedActionClient
-  .inputSchema(ZListFeedbackRecordsAction)
-  .action(
-    async ({
-      ctx,
-      parsedInput,
-    }: {
-      ctx: AuthenticatedActionClientCtx;
-      parsedInput: z.infer<typeof ZListFeedbackRecordsAction>;
-    }): Promise<FeedbackRecordListResponse> => {
-      await assertCan({ type: "user", id: ctx.user.id }, "workspace.read", {
-        type: "workspace",
-        id: parsedInput.workspaceId,
-      });
-
-      // Verify FRD belongs to workspace's accessible FRDs
-      const frds = await getFeedbackDirectoriesByWorkspaceId(parsedInput.workspaceId);
-      if (!frds.some((f) => f.id === parsedInput.frdId)) {
-        throw new Error("Feedback directory not accessible");
-      }
-      await assertFeedbackSourceDirectoryAccess(
-        ctx.user.id,
-        parsedInput.frdId,
-        parsedInput.workspaceId,
-        "read"
-      );
-
-      const params: FeedbackRecordListParams = {
-        tenant_id: parsedInput.frdId,
-        limit: parsedInput.limit ?? 50,
-      };
-      if (parsedInput.cursor) params.cursor = parsedInput.cursor;
-      // One-element OR lists: Hub 0.8.4 made these filters repeatable, this caller stays single-valued.
-      if (parsedInput.sourceType) params.source_type = [parsedInput.sourceType];
-      if (parsedInput.fieldType) params.field_type = [parsedInput.fieldType];
-      if (parsedInput.since) params.since = parsedInput.since;
-      if (parsedInput.until) params.until = parsedInput.until;
-
-      const result = await listFeedbackRecords(params);
-      if (result.error || !result.data) {
-        // listFeedbackRecords already logged this with the full error and a Hub-unreachable hint;
-        // re-logging here only produced a second, thinner line per request.
-        throw new Error(result.error?.message ?? "Failed to load feedback records");
-      }
-
-      return result.data;
-    }
   );
 
 const ZGetFeedbackRecordContactsAction = z.object({

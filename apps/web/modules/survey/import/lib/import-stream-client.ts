@@ -1,0 +1,60 @@
+import type { TSurveyImportStreamEvent } from "@/app/api/internal/surveys/import/lib/events";
+import type { TSurveyImportStreamForm } from "@/app/api/internal/surveys/import/lib/schemas";
+import { V3ApiError, parseV3ApiError } from "@/modules/api/lib/v3-client";
+import { readSurveyDraftStream } from "@/modules/survey/components/template-list/lib/ai-generate-stream-client";
+
+export const SURVEY_IMPORT_STREAM_ENDPOINT = "/api/internal/surveys/import/stream";
+
+/** A refusal answered before the stream opened, plus the `Retry-After` header the problem body lacks. */
+export class SurveyImportRequestError extends V3ApiError {
+  readonly retryAfterSeconds: number | null;
+
+  constructor(error: V3ApiError, retryAfterSeconds: number | null) {
+    super({
+      status: error.status,
+      detail: error.detail,
+      code: error.code,
+      requestId: error.requestId,
+      invalid_params: error.invalid_params,
+    });
+    this.name = "SurveyImportRequestError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+/** The server sends `Retry-After` in seconds; anything else is ignored rather than guessed at. */
+export const parseRetryAfterSeconds = (value: string | null): number | null => {
+  if (value === null || value.trim() === "") return null;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : null;
+};
+
+/**
+ * Upload a file to import, handing each NDJSON event to `onEvent`. The file goes as it is, in a
+ * `multipart/form-data` body with the workspace (ENG-6848): the server reads it and tells its type from
+ * its bytes. A refusal before the stream opened throws a `SurveyImportRequestError`; a failure after it
+ * arrives as an `error` event, like Create with AI's stream.
+ */
+export async function streamSurveyImportFile(
+  { workspaceId, file }: TSurveyImportStreamForm,
+  { signal, onEvent }: { signal: AbortSignal; onEvent: (event: TSurveyImportStreamEvent) => void }
+): Promise<void> {
+  const form = new FormData();
+  form.append("workspaceId", workspaceId);
+  form.append("file", file);
+
+  // No Content-Type of our own: the browser sets multipart/form-data with the boundary it chose.
+  const response = await fetch(SURVEY_IMPORT_STREAM_ENDPOINT, {
+    method: "POST",
+    cache: "no-store",
+    body: form,
+    signal,
+  });
+
+  if (!response.ok) {
+    const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get("Retry-After"));
+    throw new SurveyImportRequestError(await parseV3ApiError(response), retryAfterSeconds);
+  }
+
+  await readSurveyDraftStream<TSurveyImportStreamEvent>(response, onEvent);
+}

@@ -13,6 +13,7 @@ import {
   PencilIcon,
   SquarePenIcon,
   TrashIcon,
+  UsersIcon,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -23,15 +24,27 @@ import { logger } from "@formbricks/logger";
 import type { TSurveyStatus } from "@formbricks/types/surveys/types";
 import { useWorkspace } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
 import { cn } from "@/lib/cn";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { SurveyStatusChangeDialog } from "@/modules/ee/creatives/components/survey-side/survey-status-change-dialog";
+import {
+  useSurveyLinkedCreatives,
+  useSurveyStatusChangeWithCreatives,
+} from "@/modules/ee/creatives/hooks/use-survey-linked-creatives";
+import { getLinkedCreativesBlockers, joinCreativeNames } from "@/modules/ee/creatives/lib/survey-side";
 import { EditPublicSurveyAlertDialog } from "@/modules/survey/components/edit-public-survey-alert-dialog";
-import { copySurveyLink } from "@/modules/survey/lib/client-utils";
+import { useExportSurvey } from "@/modules/survey/export/hooks/use-export-survey";
+import type { TSurveyExportFormat } from "@/modules/survey/export/lib/formats";
 import { copySurveyToOtherWorkspaceAction } from "@/modules/survey/list/actions";
 import { CopySurveyModal } from "@/modules/survey/list/components/copy-survey-modal";
 import { RenameSurveyModal } from "@/modules/survey/list/components/rename-survey-modal";
+import { getCustomCssCopyNotice } from "@/modules/survey/list/lib/custom-css-notice";
 import { surveyKeys } from "@/modules/survey/list/lib/query";
 import { TSurveyListItem } from "@/modules/survey/list/types/survey-overview";
+import { CollaborateModal } from "@/modules/survey/visibility/components/collaborate-modal";
+import { type TSurveyVisibilityUiGate, showVisibilityControls } from "@/modules/survey/visibility/lib/state";
+import type { TSurveyVisibilityBlocker } from "@/modules/survey/visibility/types";
+import { Alert, AlertDescription, AlertTitle } from "@/modules/ui/components/alert";
 import { ConfirmationModal } from "@/modules/ui/components/confirmation-modal";
 import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
 import {
@@ -51,7 +64,6 @@ import { SurveyStatusIndicator } from "@/modules/ui/components/survey-status-ind
 interface SurveyDropDownMenuProps {
   survey: TSurveyListItem;
   publicDomain: string;
-  disabled?: boolean;
   isSurveyCreationDeletionDisabled?: boolean;
   isReadOnly: boolean;
   deleteSurvey: (surveyId: string) => Promise<void>;
@@ -59,6 +71,16 @@ interface SurveyDropDownMenuProps {
   archiveSurvey: (surveyId: string) => Promise<void>;
   restoreSurvey: (surveyId: string) => Promise<void>;
   renameSurvey: (surveyId: string, name: string) => Promise<void>;
+  /** ENG-3395: the restricted-surveys gate; Collaborate also needs the right to change visibility. */
+  surveyVisibilityGate: TSurveyVisibilityUiGate;
+  workspaceName: string;
+  listQueryKey: ReturnType<typeof surveyKeys.list>;
+  onVisibilityNotEnabled: () => void;
+  /**
+   * Shows why the delete was refused (409: creatives open the survey). The list owns that dialog: the
+   * optimistic removal unmounts this row before the answer arrives.
+   */
+  onDeleteBlocked: (blockers: TSurveyVisibilityBlocker[]) => void;
 }
 
 // Non-draft statuses that can be targeted by a status change from the list.
@@ -67,7 +89,6 @@ const CHANGEABLE_STATUSES: TSurveyStatus[] = ["inProgress", "paused", "completed
 export const SurveyDropDownMenu = ({
   survey,
   publicDomain,
-  disabled,
   isSurveyCreationDeletionDisabled,
   isReadOnly,
   deleteSurvey,
@@ -75,6 +96,11 @@ export const SurveyDropDownMenu = ({
   archiveSurvey,
   restoreSurvey,
   renameSurvey,
+  surveyVisibilityGate,
+  workspaceName,
+  listQueryKey,
+  onVisibilityNotEnabled,
+  onDeleteBlocked,
 }: Readonly<SurveyDropDownMenuProps>) => {
   const { workspace } = useWorkspace();
 
@@ -88,6 +114,7 @@ export const SurveyDropDownMenu = ({
   const [isCautionDialogOpen, setIsCautionDialogOpen] = useState(false);
   const [isCopyModalOpen, setIsCopyModalOpen] = useState(false);
   const [isRenameModalOpen, setIsRenameModalOpen] = useState(false);
+  const [isCollaborateModalOpen, setIsCollaborateModalOpen] = useState(false);
   const router = useRouter();
   const queryClient = useQueryClient();
 
@@ -101,9 +128,9 @@ export const SurveyDropDownMenu = ({
   // Show the status submenu for non-draft surveys when the user has write access.
   const canChangeStatus = !isArchived && !isReadOnly && survey.status !== "draft";
   const isInProgress = survey.status === "inProgress";
-  const hasVisibleActions = isArchived
-    ? canManageSurvey
-    : canManageSurvey || canPreviewOrCopyLink || canChangeStatus;
+  const canCollaborate = showVisibilityControls(surveyVisibilityGate, survey.access);
+  // Anyone who sees the survey may export it, read-only members and drafts included: no gate below.
+  const exportSurvey = useExportSurvey();
 
   const getStatusLabel = (t: TFunction, status: TSurveyStatus): string => {
     switch (status) {
@@ -112,7 +139,7 @@ export const SurveyDropDownMenu = ({
       case "paused":
         return t("common.paused");
       case "completed":
-        return t("common.completed");
+        return t("common.closed");
       case "draft":
         return t("common.draft");
       default:
@@ -121,7 +148,6 @@ export const SurveyDropDownMenu = ({
   };
 
   const handleStatusChange = async (status: TSurveyStatus) => {
-    setIsDropDownOpen(false);
     const toastId = toast.loading(t("workspace.surveys.status_updating"));
     try {
       await updateSurveyStatus(survey.id, status);
@@ -133,6 +159,21 @@ export const SurveyDropDownMenu = ({
     }
   };
 
+  // Pausing, closing or resuming names the creatives that open the survey first.
+  const statusChange = useSurveyStatusChangeWithCreatives({
+    workspaceId: survey.workspaceId,
+    surveyId: survey.id,
+    currentStatus: survey.status,
+    applyStatus: handleStatusChange,
+  });
+
+  // Archiving pauses the survey and, 30 days on, deletes it: the dialog names the creatives it affects.
+  const archiveLinkedCreatives = useSurveyLinkedCreatives({
+    workspaceId: survey.workspaceId,
+    surveyId: survey.id,
+    enabled: isArchiveDialogOpen,
+  });
+
   const handleDeleteSurvey = async (surveyId: string) => {
     setLoading(true);
 
@@ -140,6 +181,12 @@ export const SurveyDropDownMenu = ({
       await deleteSurvey(surveyId);
       toast.success(t("workspace.surveys.survey_deleted_successfully"));
     } catch (error) {
+      const linkedCreatives = getLinkedCreativesBlockers(error);
+      if (linkedCreatives) {
+        setDeleteDialogOpen(false);
+        onDeleteBlocked(linkedCreatives);
+        return;
+      }
       toast.error(getV3ApiErrorMessage(error, t("workspace.surveys.error_deleting_survey")));
     } finally {
       setLoading(false);
@@ -179,7 +226,7 @@ export const SurveyDropDownMenu = ({
     try {
       e.preventDefault();
       setIsDropDownOpen(false);
-      await navigator.clipboard.writeText(copySurveyLink(surveyLink));
+      await navigator.clipboard.writeText(surveyLink);
       toast.success(t("common.copied_to_clipboard"));
     } catch (error) {
       logger.error(error);
@@ -193,6 +240,17 @@ export const SurveyDropDownMenu = ({
     setIsCautionDialogOpen(true);
   };
 
+  const handleExport = async (format: TSurveyExportFormat) => {
+    setIsDropDownOpen(false);
+    try {
+      await exportSurvey.mutateAsync({ surveyId: survey.id, format });
+    } catch (error) {
+      // Aborted because the row went away or another download started: nothing to tell the user.
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      toast.error(getV3ApiErrorMessage(error, t("workspace.surveys.export.failed")));
+    }
+  };
+
   const handleDuplicateSurvey = async () => {
     if (!workspace?.id) return;
     setIsDuplicating(true);
@@ -204,6 +262,8 @@ export const SurveyDropDownMenu = ({
       });
       if (response?.data) {
         toast.success(t("workspace.surveys.survey_duplicated_successfully"));
+        const customCssNotice = getCustomCssCopyNotice(response.data, t);
+        if (customCssNotice) toast.error(customCssNotice, { duration: 8000 });
         await queryClient.invalidateQueries({ queryKey: surveyKeys.lists() });
         return;
       }
@@ -216,29 +276,45 @@ export const SurveyDropDownMenu = ({
     }
   };
 
-  if (!hasVisibleActions) {
-    return null;
-  }
+  // Export sits just above Delete: after Restore for an archived survey, after Copy link otherwise.
+  const exportMenu = (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger data-testid="survey-export-submenu" chevronSide="left">
+        {t("workspace.surveys.export.menu")}
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent sideOffset={8}>
+        <DropdownMenuItem
+          data-testid="export-formbricks-file"
+          disabled={exportSurvey.isPending}
+          onSelect={() => void handleExport("json")}>
+          {t("workspace.surveys.export.formbricks_file")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          data-testid="export-excel-file"
+          disabled={exportSurvey.isPending}
+          onSelect={() => void handleExport("xlsx")}>
+          {t("workspace.surveys.export.excel_file")}
+        </DropdownMenuItem>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
 
   return (
     <div
       id={`${survey.name.toLowerCase().split(" ").join("-")}-survey-actions`}
       data-testid="survey-dropdown-menu">
       <DropdownMenu open={isDropDownOpen} onOpenChange={setIsDropDownOpen}>
-        <DropdownMenuTrigger className="z-10" asChild disabled={disabled}>
+        <DropdownMenuTrigger className="z-10" asChild>
           <button
             type="button"
             data-testid="survey-dropdown-trigger"
             aria-label={t("workspace.surveys.open_options")}
-            className={cn(
-              "rounded-lg border bg-white p-2",
-              disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:bg-slate-50"
-            )}>
+            className="cursor-pointer rounded-lg border bg-white p-2 hover:bg-slate-50">
             <span className="sr-only">{t("workspace.surveys.open_options")}</span>
             <MoreVertical className="size-4" aria-hidden="true" />
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent className="inline-block w-auto min-w-max">
+        <DropdownMenuContent className="inline-block max-h-[var(--radix-dropdown-menu-content-available-height)] w-auto min-w-max">
           <DropdownMenuGroup>
             {isArchived && canManageSurvey && (
               <DropdownMenuItem
@@ -251,6 +327,7 @@ export const SurveyDropDownMenu = ({
                 {t("workspace.surveys.restore")}
               </DropdownMenuItem>
             )}
+            {isArchived && exportMenu}
             {isArchived && canManageSurvey && (
               <DropdownMenuItem
                 data-testid="delete-survey-forever"
@@ -287,6 +364,39 @@ export const SurveyDropDownMenu = ({
                 {t("common.rename")}
               </DropdownMenuItem>
             )}
+            {canPreviewOrCopyLink && (
+              <DropdownMenuItem>
+                <button
+                  type="button"
+                  className={cn(
+                    "flex w-full items-center",
+                    isSingleUseEnabled && "cursor-not-allowed opacity-50"
+                  )}
+                  disabled={isSingleUseEnabled}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setIsDropDownOpen(false);
+                    const previewUrl = new URL(surveyLink);
+                    previewUrl.searchParams.set("preview", "true");
+                    globalThis.window.open(previewUrl.toString(), "_blank", "noopener,noreferrer");
+                  }}>
+                  <EyeIcon className="mr-2 size-4" />
+                  {t("common.preview")}
+                </button>
+              </DropdownMenuItem>
+            )}
+            {canCollaborate && (
+              <DropdownMenuItem
+                data-testid="collaborate-survey"
+                icon={<UsersIcon className="size-4" />}
+                onSelect={(e) => {
+                  e.preventDefault();
+                  setIsDropDownOpen(false);
+                  setIsCollaborateModalOpen(true);
+                }}>
+                {t("common.collaborate")}
+              </DropdownMenuItem>
+            )}
             {!isArchived && canManageSurvey && (
               <DropdownMenuItem>
                 <button
@@ -312,7 +422,8 @@ export const SurveyDropDownMenu = ({
                   <DropdownMenuRadioGroup
                     value={survey.status}
                     onValueChange={(value) => {
-                      void handleStatusChange(value as TSurveyStatus);
+                      setIsDropDownOpen(false);
+                      void statusChange.requestStatusChange(value as TSurveyStatus);
                     }}>
                     {CHANGEABLE_STATUSES.map((status) => (
                       <DropdownMenuRadioItem
@@ -350,27 +461,6 @@ export const SurveyDropDownMenu = ({
               <DropdownMenuItem>
                 <button
                   type="button"
-                  className={cn(
-                    "flex w-full items-center",
-                    isSingleUseEnabled && "cursor-not-allowed opacity-50"
-                  )}
-                  disabled={isSingleUseEnabled}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    setIsDropDownOpen(false);
-                    const previewUrl = new URL(surveyLink);
-                    previewUrl.searchParams.set("preview", "true");
-                    globalThis.window.open(previewUrl.toString(), "_blank");
-                  }}>
-                  <EyeIcon className="mr-2 size-4" />
-                  {t("common.preview")}
-                </button>
-              </DropdownMenuItem>
-            )}
-            {canPreviewOrCopyLink && (
-              <DropdownMenuItem>
-                <button
-                  type="button"
                   data-testid="copy-link"
                   className={cn(
                     "flex w-full items-center",
@@ -383,6 +473,7 @@ export const SurveyDropDownMenu = ({
                 </button>
               </DropdownMenuItem>
             )}
+            {!isArchived && exportMenu}
             {!isArchived && canManageSurvey && (
               <DropdownMenuItem>
                 <button
@@ -436,7 +527,21 @@ export const SurveyDropDownMenu = ({
               ? t("workspace.surveys.archive_survey_description_in_progress")
               : t("workspace.surveys.archive_survey_description")
           }
-          body={t("workspace.surveys.archive_survey_warning")}
+          body={
+            <div className="space-y-3 whitespace-normal">
+              <p>{t("workspace.surveys.archive_survey_warning")}</p>
+              {archiveLinkedCreatives.length > 0 && (
+                <Alert variant="warning" role="status">
+                  <AlertTitle>{t("workspace.creatives.survey_side.archive_note_title")}</AlertTitle>
+                  <AlertDescription>
+                    {t("workspace.creatives.survey_side.archive_note", {
+                      creatives: joinCreativeNames(archiveLinkedCreatives),
+                    })}
+                  </AlertDescription>
+                </Alert>
+              )}
+            </div>
+          }
           buttonText={isInProgress ? t("workspace.surveys.stop_and_archive") : t("common.archive")}
           buttonVariant={isInProgress ? "destructive" : "default"}
           buttonLoading={isArchiving}
@@ -446,6 +551,8 @@ export const SurveyDropDownMenu = ({
         />
       )}
 
+      {canChangeStatus && <SurveyStatusChangeDialog {...statusChange.dialog} />}
+
       {!isArchived && canManageSurvey && (
         <RenameSurveyModal
           open={isRenameModalOpen}
@@ -453,6 +560,17 @@ export const SurveyDropDownMenu = ({
           surveyId={survey.id}
           surveyName={survey.name}
           renameSurvey={renameSurvey}
+        />
+      )}
+
+      {canCollaborate && (
+        <CollaborateModal
+          open={isCollaborateModalOpen}
+          setOpen={setIsCollaborateModalOpen}
+          surveyId={survey.id}
+          workspaceName={workspaceName}
+          listQueryKey={listQueryKey}
+          onVisibilityNotEnabled={onVisibilityNotEnabled}
         />
       )}
 

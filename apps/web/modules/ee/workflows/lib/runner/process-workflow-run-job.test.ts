@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { Prisma } from "@formbricks/database/prisma";
 import type { TWorkflowRunJobData } from "@formbricks/jobs";
+import { TooManyRequestsError } from "@formbricks/types/errors";
 import { processWorkflowRunJob } from "./process-workflow-run-job";
 
 const {
@@ -39,6 +40,8 @@ const {
   mockCapturePostHogEvent: vi.fn(),
 }));
 
+// Survey visibility (ENG-3282) is not enforced here: the readiness marker is off, not read from a database.
+vi.mock("@/lib/authzed/scope-readiness", () => ({ isSurveyVisibilityReady: vi.fn(async () => false) }));
 vi.mock("@formbricks/database", () => ({
   prisma: {
     workflowRun: {
@@ -106,6 +109,10 @@ vi.mock("@/lib/response/service", () => ({
 
 vi.mock("@/lib/survey/service", () => ({
   getSurvey: mockGetSurvey,
+}));
+
+vi.mock("@/modules/email/lib/email-actor", () => ({
+  resolveEmailActorUserId: vi.fn(async (ownerUserId: string | null) => ownerUserId ?? "org-owner"),
 }));
 
 vi.mock("@/lib/organization/service", () => ({
@@ -185,7 +192,7 @@ const baseRun = {
   triggerType: "response.completed",
   triggerPayload,
   workflowVersion: { definition: executableDefinition },
-  workflow: { definition: executableDefinition },
+  workflow: { definition: executableDefinition, createdBy: "creator-1" },
 };
 
 const mockResponse = {
@@ -197,6 +204,9 @@ const mockResponse = {
 };
 
 const mockSurvey = {
+  visibility: "workspace",
+  visibilityVersion: 0,
+  visibilityProjectedVersion: 0,
   id: "cm9zr4mps000008l8btfy1vtz",
   workspaceId: "cm9zr4wsp000508l8y6nh9r2v",
   blocks: [],
@@ -299,11 +309,21 @@ describe("processWorkflowRunJob", () => {
     // HTML-only send (no `text`), resolved recipient, sanitized subject, stable Message-ID.
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
     const sendArgs = mockSendEmail.mock.calls[0][0];
+    expect(sendArgs.emailType).toBe("workflow_email");
     expect(sendArgs).toMatchObject({
       to: "jane@example.com",
       replyTo: "support@example.com",
       subject: "Thanks for your response",
       html: "<html>branded</html>",
+      auditContext: {
+        trigger: "workflow",
+        organizationId: "org1",
+        surveyId: mockSurvey.id,
+        responseId: mockResponse.id,
+        workflowRunId: data.workflowRunId,
+        workflowId: data.workflowId,
+        configuredByUserId: "creator-1",
+      },
     });
     // No `from` — the deployment MAIL_FROM default applies (Follow-Ups parity).
     expect(sendArgs.from).toBeUndefined();
@@ -343,12 +363,19 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("teammate@example.com") },
-      workflow: { definition: makeDefinition("teammate@example.com") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("teammate@example.com") },
     });
 
     await processWorkflowRunJob(data, baseContext);
 
-    expect(mockSendEmail).toHaveBeenCalledWith(expect.objectContaining({ to: "teammate@example.com" }));
+    // Rate-limited by the organization and the workflow's creator. The author chose the address, so
+    // there is no per-recipient cap (ENG-3823).
+    expect(mockSendEmail).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "teammate@example.com",
+        rateLimit: { organizationId: "org1", actorUserId: "creator-1", externalRecipient: false },
+      })
+    );
   });
 
   test("does not send to a literal recipient outside the workspace allowlist (ENG-2029)", async () => {
@@ -358,7 +385,7 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("attacker@external-evil.example") },
-      workflow: { definition: makeDefinition("attacker@external-evil.example") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("attacker@external-evil.example") },
     });
 
     await processWorkflowRunJob(data, finalAttemptContext);
@@ -382,7 +409,7 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("revoked-member@example.com") },
-      workflow: { definition: makeDefinition("revoked-member@example.com") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("revoked-member@example.com") },
     });
 
     await processWorkflowRunJob(data, finalAttemptContext);
@@ -405,7 +432,7 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("Teammate@Example.com") },
-      workflow: { definition: makeDefinition("Teammate@Example.com") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("Teammate@Example.com") },
     });
 
     await processWorkflowRunJob(data, baseContext);
@@ -419,7 +446,7 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("teammate@example.com") },
-      workflow: { definition: makeDefinition("teammate@example.com") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("teammate@example.com") },
     });
 
     await processWorkflowRunJob(data, finalAttemptContext);
@@ -435,6 +462,48 @@ describe("processWorkflowRunJob", () => {
     );
   });
 
+  // A workflow created with an API key has no creator; its organization's owner is charged instead.
+  test("charges the organization's owner for a workflow without a creator", async () => {
+    mockWorkflowRunFindFirst.mockResolvedValue({
+      ...baseRun,
+      workflowVersion: { definition: makeDefinition("contact") },
+      workflow: { createdBy: null, definition: makeDefinition("contact") },
+    });
+    mockGetResponse.mockResolvedValue({
+      ...mockResponse,
+      data: { contact: ["Jane", "Doe", "jane@example.com", "+1"] },
+    });
+
+    await processWorkflowRunJob(data, baseContext);
+
+    expect(mockSendEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ rateLimit: expect.objectContaining({ actorUserId: "org-owner" }) })
+    );
+  });
+
+  // With no organization there is no owner to fall back to and no organization to count against, so the
+  // email reaches the limiter without one, which refuses it rather than skipping its caps.
+  test("passes no organization and the creator unchanged when the workspace has no organization", async () => {
+    mockGetOrganizationByWorkspaceId.mockResolvedValue(null);
+    mockWorkflowRunFindFirst.mockResolvedValue({
+      ...baseRun,
+      workflowVersion: { definition: makeDefinition("contact") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("contact") },
+    });
+    mockGetResponse.mockResolvedValue({
+      ...mockResponse,
+      data: { contact: ["Jane", "Doe", "jane@example.com", "+1"] },
+    });
+
+    await processWorkflowRunJob(data, baseContext);
+
+    expect(mockSendEmail).toHaveBeenCalledWith(
+      expect.objectContaining({
+        rateLimit: { organizationId: undefined, actorUserId: "creator-1", externalRecipient: true },
+      })
+    );
+  });
+
   test("still sends to a respondent-field recipient even when it is outside the member allowlist", async () => {
     // A field-resolved recipient is the respondent's own address, always allowed regardless of the
     // workspace allowlist — only literal addresses are gated.
@@ -446,12 +515,18 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("contact") },
-      workflow: { definition: makeDefinition("contact") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("contact") },
     });
 
     await processWorkflowRunJob(data, baseContext);
 
-    expect(mockSendEmail).toHaveBeenCalledWith(expect.objectContaining({ to: "jane@example.com" }));
+    // A respondent typed this address in, so it is also capped per recipient (ENG-3823).
+    expect(mockSendEmail).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "jane@example.com",
+        rateLimit: { organizationId: "org1", actorUserId: "creator-1", externalRecipient: true },
+      })
+    );
   });
 
   test("does not query the member allowlist when no step has a literal recipient", async () => {
@@ -464,7 +539,7 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("contact") },
-      workflow: { definition: makeDefinition("contact") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("contact") },
     });
 
     await processWorkflowRunJob(data, baseContext);
@@ -478,7 +553,7 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("teammate@example.com") },
-      workflow: { definition: makeDefinition("teammate@example.com") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("teammate@example.com") },
     });
 
     await processWorkflowRunJob(data, baseContext);
@@ -495,7 +570,7 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("contact") },
-      workflow: { definition: makeDefinition("contact") },
+      workflow: { createdBy: "creator-1", definition: makeDefinition("contact") },
     });
 
     await processWorkflowRunJob(data, baseContext);
@@ -665,11 +740,53 @@ describe("processWorkflowRunJob", () => {
     // Claimed the failed row via updateMany (failed→running), then re-sent, then updated to succeeded.
     expect(mockWorkflowRunLogUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { runId: baseRun.id, stepId: "send-email", status: { in: ["failed", "pending"] } },
+        where: { runId: baseRun.id, stepId: "send-email", status: { in: ["failed", "pending", "skipped"] } },
         data: expect.objectContaining({ status: "running" }),
       })
     );
     expect(mockWorkflowRunLogCreate).not.toHaveBeenCalled();
+    expect(mockSendEmail).toHaveBeenCalledTimes(1);
+    const completion = mockWorkflowRunUpdateMany.mock.calls.at(-1)?.[0];
+    expect(completion.data.status).toBe("completed");
+    expect(completion.data.data.steps[0]).toMatchObject({ status: "succeeded" });
+  });
+
+  test("a rate-limited send is recorded as skipped and completes the run, not as a failure", async () => {
+    mockSendEmail.mockRejectedValue(new TooManyRequestsError("Maximum number of requests reached"));
+    mockWorkflowRunUpdateMany.mockResolvedValue({ count: 1 });
+
+    await expect(processWorkflowRunJob(data, baseContext)).resolves.toBeUndefined();
+
+    // The step says why it did not send, and it is not a `failed` row: no error trace, no run failure.
+    expect(mockWorkflowRunLogUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "skipped",
+          error: null,
+          output: { reason: "email_rate_limited" },
+        }),
+      })
+    );
+    const completion = mockWorkflowRunUpdateMany.mock.calls.at(-1)?.[0];
+    expect(completion.data.status).toBe("completed");
+    expect(completion.data.data.steps[0]).toMatchObject({ status: "skipped" });
+    expect(mockCapturePostHogEvent).not.toHaveBeenCalled();
+  });
+
+  test("retry of a throttled step: claims the skipped row and re-sends (it never went out)", async () => {
+    mockWorkflowRunFindFirst.mockResolvedValue({ ...baseRun, status: "running" });
+    mockWorkflowRunUpdateMany.mockResolvedValue({ count: 0 });
+    mockWorkflowRunLogFindFirst.mockResolvedValue(existingStepLog("skipped"));
+    mockWorkflowRunLogUpdateMany.mockResolvedValue({ count: 1 });
+
+    await expect(processWorkflowRunJob(data, baseContext)).resolves.toBeUndefined();
+
+    expect(mockWorkflowRunLogUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { runId: baseRun.id, stepId: "send-email", status: { in: ["failed", "pending", "skipped"] } },
+        data: expect.objectContaining({ status: "running" }),
+      })
+    );
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
     const completion = mockWorkflowRunUpdateMany.mock.calls.at(-1)?.[0];
     expect(completion.data.status).toBe("completed");
@@ -844,7 +961,10 @@ describe("processWorkflowRunJob", () => {
     mockWorkflowRunFindFirst.mockResolvedValue({
       ...baseRun,
       workflowVersion: { definition: makeDefinition("email", { subject: "Hi\r\nBcc: evil@example.com" }) },
-      workflow: { definition: makeDefinition("email", { subject: "Hi\r\nBcc: evil@example.com" }) },
+      workflow: {
+        createdBy: "creator-1",
+        definition: makeDefinition("email", { subject: "Hi\r\nBcc: evil@example.com" }),
+      },
     });
 
     await processWorkflowRunJob(data, baseContext);

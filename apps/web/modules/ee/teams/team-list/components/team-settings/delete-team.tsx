@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { deleteTeamAction } from "@/modules/ee/teams/team-list/actions";
 import { TTeam } from "@/modules/ee/teams/team-list/types/team";
 import { Button } from "@/modules/ui/components/button";
@@ -12,9 +12,9 @@ import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
 import { TooltipRenderer } from "@/modules/ui/components/tooltip";
 
 interface DeleteTeamProps {
-  teamId: TTeam["id"];
-  onDelete: () => void;
-  isOwnerOrManager: boolean;
+  readonly teamId: TTeam["id"];
+  readonly onDelete: () => void;
+  readonly isOwnerOrManager: boolean;
 }
 
 export const DeleteTeam = ({ teamId, onDelete, isOwnerOrManager }: DeleteTeamProps) => {

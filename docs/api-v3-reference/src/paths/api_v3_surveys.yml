@@ -2,7 +2,19 @@ get:
   operationId: getSurveysV3
   summary: List surveys
   description: |
-    Returns surveys for the workspace. Session cookie, `x-api-key`, or a Bearer token.
+    Returns the surveys in the workspace **that the caller may read**. A restricted survey is listed only
+    to its owner and to the organisation's owners and managers; to everyone else, API keys included, it
+    does not exist here. `meta.totalCount` and `meta.workspaceSurveyCount` count that same readable set,
+    so neither number reveals a restricted survey to someone who cannot see it. The visibility predicate
+    is applied in the query and the cursor, never after the fact: `limit` keeps its meaning and
+    `meta.nextCursor` being `null` remains the only end-of-collection signal.
+
+    `view=full` returns each survey's whole document alongside its summary fields, so an export does not
+    need one `GET /api/v3/surveys/{surveyId}` per survey. Pages are not snapshots: a survey created or
+    deleted while you page may be missed or skipped, so a full extraction should page with
+    `sortBy=createdAt` and reconcile on a later run.
+
+    Session cookie, `x-api-key`, or a Bearer token.
   tags:
     - V3 Surveys
   parameters:
@@ -21,7 +33,7 @@ get:
         minimum: 1
         maximum: 250
         default: 20
-      description: Page size (max 250)
+      description: Page size (max 250, or max 50 with `view=full`; above that → **400**)
     - in: query
       name: cursor
       schema:
@@ -84,6 +96,47 @@ get:
         Survey type filter (`link` / `app`). Same repeat-or-comma rules as
         `filter[status][in]`.
     - in: query
+      name: filter[visibility][in]
+      schema:
+        type: array
+        items:
+          $ref: ../components/schemas/SurveyVisibility.yml
+      style: form
+      explode: true
+      description: >-
+        Keep only surveys with one of these visibilities, as each item reports it (a survey with a
+        change in flight counts as `restricted`). Same repeat-or-comma rules as `filter[status][in]`;
+        unknown values → **400**. Filters within the readable set: a workspace member asking for
+        `restricted` gets their own restricted surveys, an organisation manager gets everyone's.
+    - in: query
+      name: filter[owner][in]
+      schema:
+        type: array
+        items:
+          type: string
+          enum:
+            - me
+            - others
+      style: form
+      explode: true
+      description: >-
+        `me` keeps surveys whose `owner` is the caller; `others` keeps the rest, ownerless surveys
+        included. Relative to the signed-in user, so an API key sending this parameter gets **400**.
+    - in: query
+      name: filter[singleUse][eq]
+      schema:
+        type: boolean
+      description: >-
+        `true` keeps only single-use surveys (single-use links turned on), `false` only the others.
+        Omit it to list both. Applied in the query, so `limit` and the counts keep their meaning.
+    - in: query
+      name: filter[pinProtected][eq]
+      schema:
+        type: boolean
+      description: >-
+        `true` keeps only surveys that ask for a PIN before they open, `false` only the others. Omit
+        it to list both. Applied in the query, so `limit` and the counts keep their meaning.
+    - in: query
       name: sortBy
       schema:
         type: string
@@ -95,6 +148,21 @@ get:
       description: >-
         Sort order. Defaults to `updatedAt`. The `cursor` token is bound to the
         selected sort order.
+    - in: query
+      name: view
+      schema:
+        type: string
+        enum:
+          - summary
+          - full
+        default: summary
+      description: >-
+        `summary` (default) returns `SurveyListItem`s. `full` returns `SurveyFullListItem`s: the
+        summary fields plus the survey document `GET /api/v3/surveys/{surveyId}` returns, in every
+        configured language. With `full`, `limit` is at most 50, `meta.unsupportedSurveyIds` is
+        present, and each request also counts against a separate limit of 30 full pages per minute per
+        user or API key (**429** beyond it). Pagination, filters, sorting and permissions are the same in
+        both views.
   responses:
     "200":
       description: Surveys retrieved successfully
@@ -118,43 +186,13 @@ get:
               data:
                 type: array
                 items:
-                  $ref: ../components/schemas/SurveyListItem.yml
+                  anyOf:
+                    - $ref: ../components/schemas/SurveyFullListItem.yml
+                    - $ref: ../components/schemas/SurveyListItem.yml
+                description: >-
+                  `SurveyListItem`s, or `SurveyFullListItem`s with `view=full`.
               meta:
-                type: object
-                required:
-                  - limit
-                  - nextCursor
-                  - totalCount
-                  - workspaceSurveyCount
-                properties:
-                  limit:
-                    type: integer
-                  nextCursor:
-                    type:
-                      - string
-                      - "null"
-                    description: >-
-                      Opaque cursor for the next page. `null` when there are no
-                      more results.
-                  totalCount:
-                    type:
-                      - integer
-                      - "null"
-                    minimum: 0
-                    description: >-
-                      Total number of surveys matching the current filters
-                      across all pages. `null` when `includeTotalCount=false`.
-                  workspaceSurveyCount:
-                    type:
-                      - integer
-                      - "null"
-                    minimum: 0
-                    description: >-
-                      Total number of surveys in the workspace, archived
-                      (soft-deleted) ones included and independent of the
-                      current filters. `null` when `includeTotalCount=false`
-                      (the same gate as `totalCount`). Replaces the boolean
-                      `hasArchived` field of earlier releases.
+                $ref: ../components/schemas/SurveyListMeta.yml
     "400":
       $ref: ../components/responses/V3BadRequest.yml
     "401":
@@ -238,6 +276,8 @@ post:
               languages:
                 - code: de-DE
                   enabled: true
+              showLanguageSwitch: true
+              autoSelectLanguage: true
               welcomeCard:
                 enabled: true
                 headline:
@@ -424,6 +464,8 @@ post:
             properties:
               data:
                 $ref: ../components/schemas/SurveyResource.yml
+              warnings:
+                $ref: ../components/schemas/CustomCssWarnings.yml
     "400":
       description: >
         Bad Request — the document failed schema validation, i.e. any rule checkable from the
@@ -438,6 +480,10 @@ post:
         `code: missing_required_field` (e.g. `displayLimit` when `displayOption` is `displaySome`).
         Bare type, range, enum, and malformed-locale-map violations report the field `name` with a
         human-readable `reason` and no machine `code`.
+        Typed Embedded Data that cannot be taken as sent is refused here too, naming each path in
+        `invalid_params`: `embeddedFields` and the legacy `variables` / `hiddenFields` sent together
+        but describing different fields, an `embeddedFields` entry linking a `key` the workspace
+        library does not have, or a field the legacy format could not store.
       content:
         application/problem+json:
           schema:
@@ -448,7 +494,9 @@ post:
       description: >-
         Forbidden — no write access, missing external URL permission, missing
         Contacts entitlement for app-survey targeting, or workspace does not
-        exist (404 not used; avoids existence leak)
+        exist (404 not used; avoids existence leak). Survey custom CSS on an
+        organization without the Scale plan (Formbricks Cloud) is refused with
+        `code: custom_css_plan_required`.
       content:
         application/problem+json:
           schema:
@@ -466,10 +514,31 @@ post:
         service applies on write — for example a CTA `buttonUrl` whose scheme the service does not
         accept. The `invalid_params`
         array pinpoints each issue (e.g. `code: invalid_reference` with the offending `identifier`).
+
+        Also returned when `customCss` cannot be processed (a syntax error, the 20 000-byte survey budget,
+        a complexity limit): `invalid_params` names `customCss.light` / `customCss.dark` and
+        `details.errors` carries the processor's located errors. Nothing is created.
+
+        Also returned with `code: workspace_survey_limit_reached` when the workspace already holds
+        the maximum number of surveys. That problem carries no `invalid_params`; instead `details`
+        is `{ count, limit }` — the workspace's current survey count and the limit it has reached —
+        so a client can tell the user how many surveys to archive or delete before retrying.
       content:
         application/problem+json:
           schema:
             $ref: ../components/schemas/Problem.yml
+          examples:
+            workspaceSurveyLimitReached:
+              summary: The workspace has reached its survey limit
+              value:
+                title: Unprocessable Content
+                status: 422
+                detail: This workspace has reached its survey limit
+                code: workspace_survey_limit_reached
+                requestId: req_01j9zq7w3k2m4n5p6r7s8t9v0w
+                details:
+                  count: 10000
+                  limit: 10000
     "429":
       $ref: ../components/responses/V3TooManyRequests.yml
     "500":

@@ -15,9 +15,11 @@ const mocks = vi.hoisted(() => ({
   checkSurveyValidity: vi.fn(),
   createQuotaFullObject: vi.fn(),
   createResponseWithQuotaEvaluation: vi.fn(),
+  findRecentDuplicateResponse: vi.fn(),
   formatValidationErrorsForV1Api: vi.fn((errors) => errors),
   getClientIpFromHeaders: vi.fn(),
   getIsContactsEnabled: vi.fn(),
+  getOpenedByCreativeMeta: vi.fn(),
   getOrganizationIdFromWorkspaceId: vi.fn(),
   getSurvey: vi.fn(),
   reportApiError: vi.fn(),
@@ -65,6 +67,10 @@ vi.mock("@/modules/api/v2/lib/element", () => ({
   validateOtherOptionLengthForMultipleChoice: mocks.validateOtherOptionLengthForMultipleChoice,
 }));
 
+vi.mock("@/modules/ee/creatives/lib/attribution", () => ({
+  getOpenedByCreativeMeta: mocks.getOpenedByCreativeMeta,
+}));
+
 vi.mock("@/modules/ee/license-check/lib/utils", () => ({
   getIsContactsEnabled: mocks.getIsContactsEnabled,
 }));
@@ -75,6 +81,10 @@ vi.mock("@/modules/ee/quotas/lib/helpers", () => ({
 
 vi.mock("@/modules/storage/utils", () => ({
   validateClientFileUploads: mocks.validateClientFileUploads,
+}));
+
+vi.mock("@/app/api/client/[workspaceId]/responses/lib/duplicate-response", () => ({
+  findRecentDuplicateResponse: mocks.findRecentDuplicateResponse,
 }));
 
 vi.mock("./lib/response", () => ({
@@ -111,11 +121,14 @@ const getSurveyWithFields = (embeddedFields: unknown[]) => ({
 });
 
 /** Posts a raw body straight at the endpoint, as a caller that never ran the renderer would. */
-const postRawBody = async (data: Record<string, unknown>): Promise<Response> => {
+const postRawBody = async (
+  data: Record<string, unknown>,
+  extra: Record<string, unknown> = {}
+): Promise<Response> => {
   const request = new Request(`https://api.test/api/v2/client/${workspaceId}/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ surveyId, finished: false, data }),
+    body: JSON.stringify({ surveyId, finished: false, data, ...extra }),
   });
 
   return POST(request, { params: Promise.resolve({ workspaceId }) });
@@ -138,6 +151,7 @@ describe("POST /api/v2/client/[workspaceId]/responses — Embedded Data ingest c
     mocks.validateOtherOptionLengthForMultipleChoice.mockReturnValue(null);
     mocks.validateResponseData.mockReturnValue(null);
     mocks.createQuotaFullObject.mockReturnValue({});
+    mocks.findRecentDuplicateResponse.mockResolvedValue(null);
     mocks.createResponseWithQuotaEvaluation.mockResolvedValue({
       id: responseId,
       surveyId,
@@ -201,12 +215,112 @@ describe("POST /api/v2/client/[workspaceId]/responses — Embedded Data ingest c
       expect.anything(),
       { seats: 12 },
       expect.anything(),
-      expect.anything()
+      expect.anything(),
+      undefined
     );
     expect(mocks.checkSurveyValidity).toHaveBeenCalledWith(
       expect.anything(),
       workspaceId,
       expect.objectContaining({ data: { seats: 12 } })
     );
+  });
+});
+
+describe("POST /api/v2/client/[workspaceId]/responses — duplicate submissions (ENG-1147)", () => {
+  const contactId = "clh8ruz3w0000qa8h9x0bt9ry";
+  const existingResponseId = "cm8f4x9mm0001gx9h5b7d7h3q";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    mocks.resolveClientApiIds.mockResolvedValue({ workspaceId });
+    mocks.getOrganizationIdFromWorkspaceId.mockResolvedValue("org_1");
+    mocks.getIsContactsEnabled.mockResolvedValue(true);
+    mocks.getSurvey.mockResolvedValue({ ...getSurveyWithFields([]), type: "link" });
+    mocks.checkSurveyValidity.mockResolvedValue(null);
+    mocks.validateClientFileUploads.mockReturnValue(true);
+    mocks.validateOtherOptionLengthForMultipleChoice.mockReturnValue(null);
+    mocks.validateResponseData.mockReturnValue(null);
+    mocks.createQuotaFullObject.mockReturnValue({ quotaFull: false });
+    mocks.findRecentDuplicateResponse.mockResolvedValue({ id: existingResponseId });
+  });
+
+  test("hands back the earlier response's id instead of creating a second one", async () => {
+    const response = await postRawBody({ q1: 5 }, { contactId, finished: true });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ data: { id: existingResponseId, quotaFull: false } });
+    expect(mocks.findRecentDuplicateResponse).toHaveBeenCalledWith({
+      surveyId,
+      surveyType: "link",
+      contactId,
+      data: { q1: 5 },
+      finished: true,
+    });
+    expect(mocks.createResponseWithQuotaEvaluation).not.toHaveBeenCalled();
+    expect(mocks.sendToPipeline).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/v2/client/[workspaceId]/responses — opened by creative (ENG-4001)", () => {
+  const creativeId = "clh7m1qkx0000qwer1234abcd";
+
+  const persistedMeta = () => mocks.createResponseWithQuotaEvaluation.mock.calls[0][0].meta;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    mocks.resolveClientApiIds.mockResolvedValue({ workspaceId });
+    mocks.getSurvey.mockResolvedValue({ ...getSurveyWithFields([]), isAnonymizeResponsesEnabled: true });
+    mocks.checkSurveyValidity.mockResolvedValue(null);
+    mocks.validateClientFileUploads.mockReturnValue(true);
+    mocks.validateOtherOptionLengthForMultipleChoice.mockReturnValue(null);
+    mocks.validateResponseData.mockReturnValue(null);
+    mocks.createQuotaFullObject.mockReturnValue({});
+    mocks.findRecentDuplicateResponse.mockResolvedValue(null);
+    mocks.createResponseWithQuotaEvaluation.mockResolvedValue({
+      id: responseId,
+      surveyId,
+      finished: false,
+      quotaFull: undefined,
+    });
+  });
+
+  test("stamps the creative's own name, whatever name the client sent, and keeps it when anonymized", async () => {
+    mocks.getOpenedByCreativeMeta.mockResolvedValue({
+      openedByCreativeId: creativeId,
+      openedByCreativeName: "Feedback tab",
+    });
+
+    const response = await postRawBody(
+      { q1: "answer" },
+      { meta: { openedByCreativeId: creativeId, openedByCreativeName: "Forged name" } }
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.getOpenedByCreativeMeta).toHaveBeenCalledWith({ creativeId, workspaceId, surveyId });
+    expect(persistedMeta()).toEqual(
+      expect.objectContaining({ openedByCreativeId: creativeId, openedByCreativeName: "Feedback tab" })
+    );
+  });
+
+  test("stores no creative when it does not check out, and still creates the response", async () => {
+    mocks.getOpenedByCreativeMeta.mockResolvedValue({});
+
+    const response = await postRawBody(
+      { q1: "answer" },
+      { meta: { openedByCreativeId: creativeId, openedByCreativeName: "Forged name" } }
+    );
+
+    expect(response.status).toBe(200);
+    expect(persistedMeta()).not.toHaveProperty("openedByCreativeId");
+    expect(persistedMeta()).not.toHaveProperty("openedByCreativeName");
+  });
+
+  test("never takes a name from a client that names no creative", async () => {
+    await postRawBody({ q1: "answer" }, { meta: { openedByCreativeName: "Forged name" } });
+
+    expect(mocks.getOpenedByCreativeMeta).not.toHaveBeenCalled();
+    expect(persistedMeta()).not.toHaveProperty("openedByCreativeName");
   });
 });

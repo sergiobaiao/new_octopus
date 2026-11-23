@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export const ZMembershipRole = z.enum(["owner", "admin", "editor", "developer", "viewer"]);
-export const ZOrganizationRole = z.enum(["owner", "manager", "member", "billing"]);
+export const ZOrganizationRole = z.enum(["owner", "manager", "member", "billing", "dashboard_viewer"]);
 
 export type TMembershipRole = z.infer<typeof ZMembershipRole>;
 export type TOrganizationRole = z.infer<typeof ZOrganizationRole>;
@@ -22,6 +22,11 @@ export const ZMember = z.object({
   accepted: z.boolean(),
   role: ZOrganizationRole,
   isActive: z.boolean(),
+  /**
+   * Only sent to Owners and Managers. `null` means no sign-in since the column shipped — it was never
+   * backfilled — so it reads as "No sign-in recorded", not "never".
+   */
+  lastLoginAt: z.date().nullable().optional(),
 });
 
 export type TMember = z.infer<typeof ZMember>;

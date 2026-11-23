@@ -1,5 +1,6 @@
 "use client";
 
+import type { TOrganizationRole } from "@formbricks/types/memberships";
 import { OrganizationBreadcrumb } from "@/app/(app)/workspaces/[workspaceId]/components/organization-breadcrumb";
 import { WorkspaceBreadcrumb } from "@/app/(app)/workspaces/[workspaceId]/components/workspace-breadcrumb";
 import { Breadcrumb, BreadcrumbList } from "@/modules/ui/components/breadcrumb";
@@ -13,6 +14,7 @@ interface WorkspaceAndOrgSwitchProps {
   organizationWorkspacesLimit: number;
   isFormbricksCloud: boolean;
   isLicenseActive: boolean;
+  isNoLicense: boolean;
   isOwnerOrManager: boolean;
   isAccessControlAllowed: boolean;
   isMembershipPending: boolean;
@@ -20,6 +22,8 @@ interface WorkspaceAndOrgSwitchProps {
   // there is no current workspace on those pages, so the breadcrumb must not claim one. The
   // organization breadcrumb still receives the resolved workspace id for its own menu.
   showWorkspaceBreadcrumb?: boolean;
+  /** The person's role in the current organization: it decides where picking an organization leads. */
+  membershipRole?: TOrganizationRole;
 }
 
 export const WorkspaceAndOrgSwitch = ({
@@ -31,10 +35,12 @@ export const WorkspaceAndOrgSwitch = ({
   organizationWorkspacesLimit,
   isFormbricksCloud,
   isLicenseActive,
+  isNoLicense,
   isOwnerOrManager,
   isAccessControlAllowed,
   isMembershipPending,
   showWorkspaceBreadcrumb = true,
+  membershipRole,
 }: Readonly<WorkspaceAndOrgSwitchProps>) => {
   // Keep this as the id itself rather than a boolean: rendering the workspace crumb narrows it to a
   // defined string, which a separate boolean flag would not do.
@@ -49,6 +55,7 @@ export const WorkspaceAndOrgSwitch = ({
           currentWorkspaceId={currentWorkspaceId}
           isMultiOrgEnabled={isMultiOrgEnabled}
           isLastCrumb={!workspaceCrumbId}
+          membershipRole={membershipRole}
         />
         {workspaceCrumbId && (
           <WorkspaceBreadcrumb
@@ -59,9 +66,11 @@ export const WorkspaceAndOrgSwitch = ({
             organizationWorkspacesLimit={organizationWorkspacesLimit}
             isFormbricksCloud={isFormbricksCloud}
             isLicenseActive={isLicenseActive}
+            isNoLicense={isNoLicense}
             isAccessControlAllowed={isAccessControlAllowed}
             isEnvironmentBreadcrumbVisible={false}
             isMembershipPending={isMembershipPending}
+            membershipRole={membershipRole}
           />
         )}
       </BreadcrumbList>

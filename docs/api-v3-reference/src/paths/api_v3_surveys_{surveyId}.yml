@@ -94,6 +94,12 @@ get:
                   createdAt: "2026-05-18T09:24:54.014Z"
                   updatedAt: "2026-05-18T09:24:54.014Z"
                   archivedAt: null
+                  visibility: workspace
+                  owner:
+                    name: Alice Example
+                  access:
+                    via: workspace
+                    canManageVisibility: false
                   name: CSAT Survey
                   type: link
                   status: inProgress
@@ -107,6 +113,8 @@ get:
                       alias: german
                       default: false
                       enabled: false
+                  showLanguageSwitch: false
+                  autoSelectLanguage: null
                   welcomeCard:
                     enabled: false
                   blocks:
@@ -123,8 +131,20 @@ get:
                           required: true
                   endings: []
                   hiddenFields:
-                    enabled: false
+                    enabled: true
+                    fieldIds:
+                      - plan_tier
                   variables: []
+                  embeddedFields:
+                    - storageKey: plan_tier
+                      key: plan_tier
+                      name: Plan tier
+                      source: ingested
+                      dataType: string
+                      defaultValue: free
+                      locked: true
+                  startLogic: []
+                  customCss: null
             filtered:
               summary: Language-filtered projection with ?lang=de-DE
               value:
@@ -134,6 +154,12 @@ get:
                   createdAt: "2026-05-18T09:24:54.014Z"
                   updatedAt: "2026-05-18T09:24:54.014Z"
                   archivedAt: null
+                  visibility: workspace
+                  owner:
+                    name: Alice Example
+                  access:
+                    via: workspace
+                    canManageVisibility: false
                   name: CSAT Survey
                   type: link
                   status: inProgress
@@ -147,6 +173,8 @@ get:
                       alias: german
                       default: false
                       enabled: false
+                  showLanguageSwitch: false
+                  autoSelectLanguage: null
                   welcomeCard:
                     enabled: false
                   blocks:
@@ -164,6 +192,9 @@ get:
                   hiddenFields:
                     enabled: false
                   variables: []
+                  embeddedFields: []
+                  startLogic: []
+                  customCss: null
     "400":
       description: >-
         Invalid survey id, unsupported query parameter, unknown language, or
@@ -222,10 +253,16 @@ patch:
     drafts.
 
 
-    Optimistic concurrency (`ETag`, `If-Match`, or revision tokens) is future
-    work; until then,
+    Server-owned fields that `GET` returns (`id`, `workspaceId`, `type`, `createdAt`,
+    `archivedAt`, `defaultLanguage`, `languages[].alias`) are accepted and verified, so the
+    output of a `GET` can be sent straight back. Echoing the value you were given is a no-op;
+    changing one is a **422** `read_only_field`.
 
-    overlapping writes are last-write-wins.
+
+    A round-tripped `updatedAt` acts as an optimistic-concurrency precondition: the write is
+    applied only if the survey has not changed since your read, and is otherwise rejected with
+    **409**. Omit it and overlapping writes remain last-write-wins. Header-based preconditions
+    (`ETag` / `If-Match`) are still future work.
   tags:
     - V3 Surveys
   parameters:
@@ -243,6 +280,14 @@ patch:
         schema:
           $ref: ../components/schemas/PatchSurveyRequest.yml
         examples:
+          linkLibraryField:
+            summary: Set the survey's Embedded Data, linking a library field by key
+            value:
+              embeddedFields:
+                - key: plan_tier
+                - name: region
+                  source: ingested
+                  defaultValue: emea
           renameSurvey:
             summary: Rename a survey
             value:
@@ -255,6 +300,16 @@ patch:
                   en-US: Product Feedback
                   de-DE: Produktfeedback
                 cx_operation: product_feedback
+          setCustomCss:
+            summary: Replace the survey's custom CSS
+            value:
+              customCss:
+                light: '[data-fb-part="button-primary"] { border-radius: 999px; }'
+                dark: '#fbjs[data-appearance="dark"] { --acme-ink: #e6eef5; }'
+          clearCustomCss:
+            summary: Clear the survey's custom CSS
+            value:
+              customCss: null
           replaceBlocks:
             summary: Replace survey blocks
             value:
@@ -291,21 +346,27 @@ patch:
             properties:
               data:
                 $ref: ../components/schemas/SurveyResource.yml
+              warnings:
+                $ref: ../components/schemas/CustomCssWarnings.yml
     "400":
       description: >
         Bad Request — the patch failed schema validation, i.e. any rule checkable from the request
         body alone, without consulting stored state. Covers: malformed JSON; an unsupported query
-        parameter; unknown, unsupported, or immutable fields (`type` cannot be changed after creation,
-        and `distribution`/`targeting` are `app`-only — sending them when patching a `link` survey is
-        rejected); wrong types or out-of-range values; bad enum values; malformed multilingual maps;
+        parameter; unknown or unsupported fields (`distribution`/`targeting` are `app`-only — sending
+        them when patching a `link` survey is rejected); wrong types or out-of-range values; bad enum values; malformed multilingual maps;
         and intra-document field-combination rules — notably `displayLimit` is required (must be >= 1)
         when `displayOption` is `displaySome`. Cross-reference failures that need
         stored state to detect return **422** instead. Every offending field is itemized in
         `invalid_params`. Unknown, forbidden, immutable, or wrongly-combined fields carry
-        `code: unsupported_field` (e.g. `type`, or `distribution`/`targeting` on a link survey);
+        `code: unsupported_field` (e.g. `distribution`/`targeting` on a link survey; a changed
+        server-owned field such as `type` is **422** `read_only_field`, not this);
         omissions carry `code: missing_required_field`. Bare type, range, enum, and
         malformed-locale-map violations report the field `name` with a human-readable `reason` and no
         machine `code`.
+        Typed Embedded Data that cannot be taken as sent is refused here too, naming each path in
+        `invalid_params`: `embeddedFields` and the legacy `variables` / `hiddenFields` sent together
+        but describing different fields, an `embeddedFields` entry linking a `key` the workspace
+        library does not have, or a field the legacy format could not store.
       content:
         application/problem+json:
           schema:
@@ -316,14 +377,36 @@ patch:
       description: >-
         Forbidden — no write access, missing external URL permission, missing
         Contacts entitlement for app-survey targeting, or survey does not exist
-        (404 not used; avoids existence leak)
+        (404 not used; avoids existence leak). Adding or editing `customCss` on an
+        organization without the Scale plan (Formbricks Cloud) is refused with
+        `code: custom_css_plan_required`; clearing it, or a patch that leaves it unchanged, is not.
       content:
         application/problem+json:
           schema:
             $ref: ../components/schemas/Problem.yml
+    "409":
+      description: >-
+        Conflict — a round-tripped `updatedAt` did not match the stored survey, so it changed since
+        your read. Nothing was written. `details` carries `expectedUpdatedAt` and the live
+        `currentUpdatedAt`, so a client can re-read and retry without guessing.
+      content:
+        application/problem+json:
+          schema:
+            $ref: ../components/schemas/Problem.yml
+          example:
+            title: Conflict
+            status: 409
+            detail: >-
+              Survey was modified since it was last read; updatedAt is now
+              2026-04-21T11:30:00.000Z. Re-read the survey and retry.
+            code: conflict
+            requestId: 6f1f7f3e-3b0e-4a1a-9f0a-7c9a1d2b3c4d
+            details:
+              expectedUpdatedAt: 2026-04-21T10:00:00.000Z
+              currentUpdatedAt: 2026-04-21T11:30:00.000Z
     "422":
       description: >-
-        Unprocessable Content — the request cannot be processed against stored state. Two cases:
+        Unprocessable Content — the request cannot be processed against stored state. Five cases:
 
         1. The target survey is archived (soft-deleted) and therefore read-only; restore it before
         editing. The `invalid_params` entry reports `name: archivedAt` with the reason
@@ -332,12 +415,44 @@ patch:
         2. The patched document passed schema validation but failed a
         cross-reference check that requires stored state to detect: an undeclared locale key used in
         content, a duplicate stable id, an immutable element-id change on a published survey, a
+        change to a question code, answer code, question type or option text of a published survey, or
+        the deletion of an option that existed at launch (`immutable_question_code`,
+        `immutable_answer_code`, `immutable_question_type`, `immutable_option_text`,
+        `immutable_option_deletion`; reverting the survey to `draft` lifts the lock), a
         dangling logic/jump reference, an invalid media URL, a
         `distribution.triggers[].actionClassId` referencing an action class that does not exist in
         the workspace (discover valid ids via `GET /api/v3/action-classes`), or a `targeting.filters`
         entry that cannot resolve in the workspace — an unknown contact-attribute key or segment, an
-        unsupported person identifier, or an unknown device value. The `invalid_params`
+        unsupported person identifier, or an unknown device value. An app survey set to any status
+        but `draft` needs a trigger of its own or a non-archived creative that opens it; with neither
+        it is refused at `name: triggers`. The `invalid_params`
         array pinpoints each issue (e.g. `code: invalid_reference` with the offending `identifier`).
+        A patch that newly *introduces* a forward reference — a recall of an answer not yet given, a
+        logic condition reading a later block, or a `requireAnswer` target that is not in a later block
+        — is refused with `code: misordered_reference`; a survey that already contains one stays
+        patchable, only newly created violations are rejected. A patch that newly *introduces* a
+        loop in the conditional logic — jumps, fallbacks and next blocks leading back on themselves,
+        so a respondent could never reach an ending — is refused the same way, reported at the
+        `logic` of each block a new looping step leaves ("Cyclic logic detected in block N"). A
+        survey that already loops stays patchable, and blocks that only lead into a loop are fine.
+
+
+        3. A server-owned field was echoed back with a different value — `code: read_only_field`,
+        with the submitted value in `identifier`. Sending the value `GET` returned is always a no-op.
+
+
+        4. The *stored* survey cannot be read as a v3 document at all — `code:
+        stored_survey_invalid`. The reported paths are into the survey, not into the request; repair
+        it in the editor. A stored survey that reads fine but already fails validation (a missing
+        translation, a dangling recall) stays patchable: only issues a patch newly introduces are
+        refused. The exception is publishing: moving a `draft` out of `draft` still requires a survey
+        that passes, and is refused as `stored_survey_invalid` while it does not.
+
+
+        5. `customCss` could not be processed (a syntax error, the 20 000-byte survey budget, a
+        complexity limit). `invalid_params` names `customCss.light` / `customCss.dark`;
+        `details.errors` carries the processor's located errors. Nothing is written, so the saved CSS
+        stays in effect.
       content:
         application/problem+json:
           schema:
@@ -380,7 +495,13 @@ patch:
 delete:
   operationId: deleteSurveyV3
   summary: Delete a survey
-  description: Deletes a survey by id. Session cookie, `x-api-key`, or a Bearer token.
+  description: >
+    Deletes a survey by id. Session cookie, `x-api-key`, or a Bearer token.
+
+
+    Refused with **409** (`survey_has_linked_creatives`) while non-archived creatives open the survey;
+    `details.creatives` names them. Archived creatives don't block the delete: they are unlinked with it, and
+    each unlink is audited as an update of that creative.
   tags:
     - V3 Surveys
   parameters:
@@ -409,6 +530,8 @@ delete:
       $ref: ../components/responses/V3Unauthorized.yml
     "403":
       $ref: ../components/responses/V3Forbidden.yml
+    "409":
+      $ref: ../components/responses/V3SurveyHasLinkedCreatives.yml
     "429":
       $ref: ../components/responses/V3TooManyRequests.yml
     "500":

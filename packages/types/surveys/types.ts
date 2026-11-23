@@ -1,16 +1,38 @@
 import { z } from "zod";
 import { ZActionClass, ZActionClassNoCodeConfig } from "../action-classes";
-import { ZColor, ZEndingCardUrl, ZId, ZOverlay, ZPlacement, ZStorageUrl, getZSafeUrl } from "../common";
+import {
+  ZColor,
+  ZEndingCardButtonLink,
+  ZEndingCardUrl,
+  ZId,
+  ZOverlay,
+  ZPlacement,
+  ZStorageUrl,
+  getZSafeUrl,
+} from "../common";
 import { ZContactAttributes } from "../contact-attribute";
-import { ZLinkedEmbeddedField } from "../embedded-data";
+import { ZCustomCssStored } from "../custom-css";
+import { type TEmbeddedDataType, ZLinkedEmbeddedField } from "../embedded-data";
+import { linkedToDesiredEmbeddedFields, toLegacyEmbeddedFields } from "../embedded-data-mapping";
+import { RESERVED_FIELD_CATALOG } from "../embedded-data-resolver";
 import { type TI18nString, ZI18nString } from "../i18n";
+import { ZOverlayColor, ZOverlayOpacity } from "../overlay";
 import { isLegacyIdCharset, isLegacyVariableName } from "../safe-identifier";
 import { ZSegment } from "../segment";
+import { ZShowConditions } from "../show-conditions";
 import { ZAllowedFileExtension } from "../storage";
 import { ZBaseStyling } from "../styling";
 import { ZLanguage } from "../workspace";
-import { type TSurveyBlock, type TSurveyBlockLogicAction, ZSurveyBlocks } from "./blocks";
+import {
+  type TSurveyBlock,
+  type TSurveyBlockLogicAction,
+  ZActionMarkLowQuality,
+  ZSurveyBlockLogic,
+  ZSurveyBlocks,
+} from "./blocks";
 import { findBlocksWithCyclicLogic } from "./blocks-validation";
+import { validateSurveyCodes } from "./codes";
+import { getCopiedOptionsIssues } from "./copied-options";
 import {
   type TSurveyElement,
   TSurveyElementTypeEnum,
@@ -30,8 +52,10 @@ import {
   ZSurveyPictureSelectionElement,
   ZSurveyRankingElement,
   ZSurveyRatingElement,
+  ZSurveySignatureElement,
 } from "./elements";
 import { validateElementLabels } from "./elements-validation";
+import { type TExpressionTypeContext, getSetValueExpressionIssues } from "./expression-types";
 import { ZSurveyFollowUp } from "./follow-up";
 import {
   type TConditionGroup,
@@ -45,6 +69,10 @@ import {
   ZConditionGroupDeprecated,
   ZDynamicLogicFieldValueDeprecated,
 } from "./logic";
+import { type TFindMatrix, findUnknownMatrixIds, isMatrixRowCondition } from "./matrix-conditions";
+import { OPTION_LIST_NAMES } from "./not-shown";
+import { getOptionLists } from "./show-if";
+import { validateStartLogic } from "./start-logic-validation";
 import {
   FORBIDDEN_IDS,
   findLanguageCodesForDuplicateLabels,
@@ -63,8 +91,9 @@ export const ZSurveyEndScreenCard = ZSurveyEndingBase.extend({
   headline: ZI18nString.optional(),
   subheader: ZI18nString.optional(),
   buttonLabel: ZI18nString.optional(),
-  buttonLink: ZEndingCardUrl.optional(),
+  buttonLink: ZEndingCardButtonLink.optional(),
   imageUrl: ZStorageUrl.optional(),
+  imageAltText: ZI18nString.optional(),
   videoUrl: ZStorageUrl.optional(),
   // Absent means "show it": the checkmark predates this field, so every survey written before it has to
   // keep rendering the icon.
@@ -113,6 +142,7 @@ export enum TSurveyQuestionTypeEnum {
   ContactInfo = "contactInfo",
   CSAT = "csat",
   CES = "ces",
+  Signature = "signature",
 }
 
 /**
@@ -228,6 +258,26 @@ export const ZSurveyVariable = z
   });
 export const ZSurveyVariables = z.array(ZSurveyVariable);
 
+/**
+ * The variables array as a **stored** survey must satisfy it: ids unique, names unique.
+ *
+ * Separate from `ZSurveyVariables`, which is deliberately unrefined because partial payloads and
+ * derived fragments parse against it. Exported so the write path can check the same rule `ZSurvey`
+ * will apply on the next read — a guard that parsed the bare array would accept a survey it could
+ * never load again, which is the one failure it exists to prevent.
+ */
+export const ZStoredSurveyVariables = ZSurveyVariables.superRefine((variables, ctx) => {
+  const variableIds = variables.map((v) => v.id);
+  if (new Set(variableIds).size !== variableIds.length) {
+    ctx.addIssue({ code: "custom", message: "Variable IDs must be unique", path: ["variables"] });
+  }
+
+  const variableNames = variables.map((v) => v.name);
+  if (new Set(variableNames).size !== variableNames.length) {
+    ctx.addIssue({ code: "custom", message: "Variable names must be unique", path: ["variables"] });
+  }
+});
+
 export type TSurveyVariable = z.infer<typeof ZSurveyVariable>;
 export type TSurveyVariables = z.infer<typeof ZSurveyVariables>;
 
@@ -243,6 +293,9 @@ export const ZSurveyWorkspaceOverwrites = z.object({
   placement: ZPlacement.nullish(),
   clickOutsideClose: z.boolean().nullish(),
   overlay: ZOverlay.nullish(),
+  // Only read when `overlay` is set here too (see resolveOverlayAppearance).
+  overlayColor: ZOverlayColor.nullish(),
+  overlayOpacity: ZOverlayOpacity.nullish(),
 });
 
 export type TSurveyWorkspaceOverwrites = z.infer<typeof ZSurveyWorkspaceOverwrites>;
@@ -301,10 +354,12 @@ export type TSurveyMetadata = z.infer<typeof ZSurveyMetadata>;
 export const ZSurveyQuestionChoice = z.object({
   id: z.string(),
   label: ZI18nString,
+  code: z.string().optional(),
 });
 
 export const ZSurveyPictureChoice = z.object({
   id: z.string(),
+  code: z.string().optional(),
   imageUrl: ZStorageUrl,
 });
 
@@ -393,7 +448,13 @@ const ZActionJumpToQuestion = ZActionBase.extend({
  */
 export type TActionJumpToQuestion = z.infer<typeof ZActionJumpToQuestion>;
 
-export const ZSurveyLogicAction = z.union([ZActionCalculate, ZActionRequireAnswer, ZActionJumpToQuestion]);
+// `markLowQuality` (ENG-6933) is carried as it is, so the v1 questions view round-trips a block rule using it.
+export const ZSurveyLogicAction = z.union([
+  ZActionCalculate,
+  ZActionRequireAnswer,
+  ZActionJumpToQuestion,
+  ZActionMarkLowQuality,
+]);
 
 export type TSurveyLogicAction = z.infer<typeof ZSurveyLogicAction>;
 
@@ -437,17 +498,23 @@ export const ZSurveyQuestionBase = z.object({
   isDraft: z.boolean().optional(),
 });
 
+// Legacy twin of `ZSurveyQuestionElementBase`: every question but CTA can carry a code, so the v1
+// API round-trips it (ENG-6778).
+export const ZSurveyCodedQuestionBase = ZSurveyQuestionBase.extend({
+  code: z.string().optional(),
+});
+
 export const ZSurveyOpenTextQuestionInputType = z.enum(["text", "email", "url", "number", "phone"]);
 export type TSurveyOpenTextQuestionInputType = z.infer<typeof ZSurveyOpenTextQuestionInputType>;
 
 /**
  * @deprecated Use ZSurveyOpenTextElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyOpenTextQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyOpenTextQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.OpenText),
   placeholder: ZI18nString.optional(),
   longAnswer: z.boolean().optional(),
-  inputType: ZSurveyOpenTextQuestionInputType.optional().prefault("text"),
+  inputType: ZSurveyOpenTextQuestionInputType.prefault("text"),
   insightsEnabled: z.boolean().prefault(false).optional(),
   charLimit: z
     .object({
@@ -494,7 +561,7 @@ export type TSurveyOpenTextQuestion = z.infer<typeof ZSurveyOpenTextQuestion>;
 /**
  * @deprecated Use ZSurveyConsentElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyConsentQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyConsentQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.Consent),
   label: ZI18nString,
 });
@@ -517,7 +584,7 @@ export type TShuffleOption = z.infer<typeof ZShuffleOption>;
 /**
  * @deprecated Use ZSurveyMultipleChoiceElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyMultipleChoiceQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyMultipleChoiceQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.union([
     z.literal(TSurveyQuestionTypeEnum.MultipleChoiceSingle),
     z.literal(TSurveyQuestionTypeEnum.MultipleChoiceMulti),
@@ -537,11 +604,11 @@ export type TSurveyMultipleChoiceQuestion = z.infer<typeof ZSurveyMultipleChoice
 /**
  * @deprecated Use ZSurveyNPSElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyNPSQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyNPSQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.NPS),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 /**
@@ -567,19 +634,19 @@ export type TSurveyCTAQuestion = z.infer<typeof ZSurveyCTAQuestion>;
 /**
  * @deprecated Use ZSurveyRatingElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyRatingQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyRatingQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.Rating),
   scale: z.enum(["number", "smiley", "star"]),
   range: z.union([z.literal(5), z.literal(3), z.literal(4), z.literal(6), z.literal(7), z.literal(10)]),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 /**
  * @deprecated Use ZSurveyDateElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyDateQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyDateQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.Date),
   html: ZI18nString.optional(),
   format: z.enum(["M-d-y", "d-M-y", "y-M-d"]),
@@ -598,9 +665,9 @@ export type TSurveyRatingQuestion = z.infer<typeof ZSurveyRatingQuestion>;
 /**
  * @deprecated Use ZSurveyPictureSelectionElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyPictureSelectionQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyPictureSelectionQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.PictureSelection),
-  allowMulti: z.boolean().optional().prefault(false),
+  allowMulti: z.boolean().prefault(false),
   choices: z.array(ZSurveyPictureChoice).min(2, {
     error: "Picture Selection question must have atleast 2 choices",
   }),
@@ -614,7 +681,7 @@ export type TSurveyPictureSelectionQuestion = z.infer<typeof ZSurveyPictureSelec
 /**
  * @deprecated Use ZSurveyFileUploadElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyFileUploadQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyFileUploadQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.FileUpload),
   allowMultipleFiles: z.boolean(),
   maxSizeInMB: z.number().optional(),
@@ -626,10 +693,19 @@ export const ZSurveyFileUploadQuestion = ZSurveyQuestionBase.extend({
  */
 export type TSurveyFileUploadQuestion = z.infer<typeof ZSurveyFileUploadQuestion>;
 
+/** The v1 API shape of a Signature element; use ZSurveySignatureElement in new code. */
+export const ZSurveySignatureQuestion = ZSurveyQuestionBase.extend({
+  type: z.literal(TSurveyQuestionTypeEnum.Signature), // NOSONAR the v1 compatibility shape has to name the legacy enum member
+  allowTypedSignature: z.boolean().prefault(true),
+});
+
+/** The v1 API shape of a Signature element; use TSurveySignatureElement in new code. */
+export type TSurveySignatureQuestion = z.infer<typeof ZSurveySignatureQuestion>;
+
 /**
  * @deprecated Use ZSurveyCalElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyCalQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyCalQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.Cal),
   calUserName: z.string().min(1, {
     error: "Cal user name is required",
@@ -645,6 +721,7 @@ export type TSurveyCalQuestion = z.infer<typeof ZSurveyCalQuestion>;
 export const ZSurveyMatrixQuestionChoice = z.object({
   id: z.string(),
   label: ZI18nString,
+  code: z.string().optional(),
 });
 
 export type TSurveyMatrixQuestionChoice = z.infer<typeof ZSurveyMatrixQuestionChoice>;
@@ -652,11 +729,11 @@ export type TSurveyMatrixQuestionChoice = z.infer<typeof ZSurveyMatrixQuestionCh
 /**
  * @deprecated Use ZSurveyMatrixElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyMatrixQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyMatrixQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.Matrix),
   rows: z.array(ZSurveyMatrixQuestionChoice),
   columns: z.array(ZSurveyMatrixQuestionChoice),
-  shuffleOption: ZShuffleOption.optional().prefault("none"),
+  shuffleOption: ZShuffleOption.prefault("none"),
 });
 
 /**
@@ -675,7 +752,7 @@ export type TInputFieldConfig = z.infer<typeof ZToggleInputConfig>;
 /**
  * @deprecated Use ZSurveyAddressElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyAddressQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyAddressQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.Address),
   addressLine1: ZToggleInputConfig,
   addressLine2: ZToggleInputConfig,
@@ -688,7 +765,7 @@ export const ZSurveyAddressQuestion = ZSurveyQuestionBase.extend({
 /**
  * @deprecated Use ZSurveyContactInfoElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyContactInfoQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyContactInfoQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.ContactInfo),
   firstName: ZToggleInputConfig,
   lastName: ZToggleInputConfig,
@@ -710,7 +787,7 @@ export type TSurveyContactInfoQuestion = z.infer<typeof ZSurveyContactInfoQuesti
 /**
  * @deprecated Use ZSurveyRankingElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyRankingQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyRankingQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.Ranking),
   choices: z
     .array(ZSurveyQuestionChoice)
@@ -732,13 +809,13 @@ export type TSurveyRankingQuestion = z.infer<typeof ZSurveyRankingQuestion>;
 /**
  * @deprecated Use ZSurveyCsatElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyCsatQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyCsatQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.CSAT),
   scale: z.enum(["number", "smiley", "star"]),
   range: z.literal(5),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 /**
@@ -749,13 +826,13 @@ export type TSurveyCsatQuestion = z.infer<typeof ZSurveyCsatQuestion>;
 /**
  * @deprecated Use ZSurveyCesElement instead. Kept for v1 API backward compatibility only.
  */
-export const ZSurveyCesQuestion = ZSurveyQuestionBase.extend({
+export const ZSurveyCesQuestion = ZSurveyCodedQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.CES),
   scale: z.enum(["number", "smiley", "star"]),
   range: z.union([z.literal(5), z.literal(7)]),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 /**
@@ -783,6 +860,7 @@ export const ZSurveyQuestion = z.union([
   ZSurveyContactInfoQuestion,
   ZSurveyCsatQuestion,
   ZSurveyCesQuestion,
+  ZSurveySignatureQuestion,
 ]);
 
 /**
@@ -821,6 +899,7 @@ export const ZSurveyQuestionType = z.enum([
   TSurveyQuestionTypeEnum.ContactInfo,
   TSurveyQuestionTypeEnum.CSAT,
   TSurveyQuestionTypeEnum.CES,
+  TSurveyQuestionTypeEnum.Signature, // NOSONAR the v1 compatibility list has to name the legacy enum member
 ]);
 
 /**
@@ -866,12 +945,24 @@ export const ZSurveyStatus = z.enum(["draft", "inProgress", "paused", "completed
 
 export type TSurveyStatus = z.infer<typeof ZSurveyStatus>;
 
+// ENG-3282: who may read a survey. `workspace` is everyone with workspace access; `restricted` is the
+// owner and the organization's owners and managers only.
+export const ZSurveyVisibility = z.enum(["restricted", "workspace"]);
+
+export type TSurveyVisibility = z.infer<typeof ZSurveyVisibility>;
+
 export const ZSurveyInlineTriggers = z.object({
   codeConfig: z.object({ identifier: z.string() }).optional(),
   noCodeConfig: ZActionClassNoCodeConfig.optional(),
 });
 
 export type TSurveyInlineTriggers = z.infer<typeof ZSurveyInlineTriggers>;
+
+/**
+ * Rules before the first question a survey may hold (ENG-6932). A screener has a handful; a ceiling,
+ * not a target. New in 6.2, so no stored survey exceeds it. The v3 API advertises the same number.
+ */
+export const MAX_START_LOGIC_RULES = 100;
 
 export const ZSurveyBase = z.object({
   id: z.cuid2(),
@@ -881,9 +972,22 @@ export const ZSurveyBase = z.object({
   type: ZSurveyType,
   workspaceId: z.cuid2(),
   createdBy: z.string().nullable(),
+  // ENG-3282 authorization facts. Server-owned: omitted from every create/update input below, set only
+  // by the creation-facts resolver and the visibility endpoint. `visibility` is the stored flag, not
+  // the effective one — see `getEffectiveVisibility`.
+  visibility: ZSurveyVisibility,
+  ownerId: z.string().nullable(),
+  visibilityVersion: z.number().int(),
+  visibilityProjectedVersion: z.number().int(),
+  visibilityChangedAt: z.date().nullable(),
+  visibilityChangedById: z.string().nullable(),
   status: ZSurveyStatus,
   displayOption: ZSurveyDisplayOption,
   autoClose: z.number().nullable(),
+  // App surveys close 3 seconds after the ending card unless this is on, in which case the ending card
+  // stays until the respondent closes it (WCAG 2.2.1). Not the inactivity `autoClose` above. Optional so
+  // surveys built in memory (templates, previews) read as off, matching the column default.
+  keepEndingCardOpen: z.boolean().optional(),
   triggers: z.array(z.object({ actionClass: ZActionClass })),
   // This variable should be called `cooldownPeriod`, not `recontactDays`. It is related to the
   // Survey Cooldown Period feature (across surveys) and not the Recontact Options (per survey).
@@ -928,38 +1032,23 @@ export const ZSurveyBase = z.object({
   /**
    * The survey's Embedded Data definitions, joined from `EmbeddedData` / `SurveyEmbeddedData` and
    * inlined when the survey is loaded (ENG-1837). This is the **read** source of truth for every
-   * reader — reach it through `getSurveyEmbeddedFields`, never directly, so surveys read through a
-   * select that omits the join still fall back to the legacy columns below.
+   * reader — reach it through `getSurveyEmbeddedFields`, never directly. `variables` / `hiddenFields`
+   * above and below are a read-only projection derived from it at load (ENG-2404), kept for the
+   * payloads deployed SDK bundles and API consumers still read.
    *
-   * Read-only and optional. Optional because every survey literal, fixture and create payload in the
-   * codebase predates it; read-only because `variables` / `hiddenFields` remain the written columns
-   * until the legacy JSON is dropped — the write paths that spread a survey object into Prisma strip
-   * this key explicitly, and both create-input schemas omit it.
+   * Since ENG-3228 it is also **accepted input** on `updateSurvey` and `createSurvey`: one shape for
+   * read and write, so the editor sends back the pairs it was loaded with, carrying the `dataType`,
+   * `defaultValue`, `locked` and shared-library link the legacy shape has no word for. Present in
+   * a payload, it is the complete desired set for both sources and `variables` / `hiddenFields` are
+   * ignored; absent, those two legacy keys run the write exactly as before.
+   *
+   * Still optional — every survey literal, fixture and create payload in the codebase predates it —
+   * and still never spread into Prisma: `Survey` owns relations named `embeddedData` /
+   * `embeddedDataLinks`, so each write seam destructures this key out and lets
+   * `reconcileEmbeddedData` do the writing.
    */
   embeddedFields: z.array(ZLinkedEmbeddedField).optional(),
-  variables: ZSurveyVariables.superRefine((variables, ctx) => {
-    // variable ids must be unique
-    const variableIds = variables.map((v) => v.id);
-    const uniqueVariableIds = new Set(variableIds);
-    if (uniqueVariableIds.size !== variableIds.length) {
-      ctx.addIssue({
-        code: "custom",
-        message: "Variable IDs must be unique",
-        path: ["variables"],
-      });
-    }
-
-    // variable names must be unique
-    const variableNames = variables.map((v) => v.name);
-    const uniqueVariableNames = new Set(variableNames);
-    if (uniqueVariableNames.size !== variableNames.length) {
-      ctx.addIssue({
-        code: "custom",
-        message: "Variable names must be unique",
-        path: ["variables"],
-      });
-    }
-  }),
+  variables: ZStoredSurveyVariables,
   followUps: z.array(
     ZSurveyFollowUp.extend({
       deleted: z.boolean().optional(),
@@ -987,13 +1076,16 @@ export const ZSurveyBase = z.object({
   workspaceOverwrites: ZSurveyWorkspaceOverwrites.nullable(),
   styling: ZSurveyStyling.nullable(),
   showLanguageSwitch: z.boolean().nullable(),
+  // Optional so survey literals and API payloads that predate the setting keep validating; null and
+  // undefined both read as "off".
+  autoSelectLanguage: z.boolean().nullish(),
   surveyClosedMessage: ZSurveyClosedMessage.nullable(),
   segment: ZSegment.nullable(),
   singleUse: ZSurveySingleUse.nullable(),
   isVerifyEmailEnabled: z.boolean(),
   recaptcha: ZSurveyRecaptcha.nullable(),
   isBackButtonHidden: z.boolean(),
-  isAutoProgressingEnabled: z.boolean().optional().prefault(false),
+  isAutoProgressingEnabled: z.boolean().prefault(false),
   isCaptureIpEnabled: z.boolean(),
   /**
    * "Anonymize responses". Suppresses the privacy-sensitive reserved fields **at ingest**, so the
@@ -1015,10 +1107,72 @@ export const ZSurveyBase = z.object({
   slug: ZSurveySlug.nullable(),
   customHeadScripts: z.string().nullish(),
   customHeadScriptsMode: z.enum(["add", "replace"]).nullish(),
+  /**
+   * Survey custom CSS as stored (ENG-2949): source plus trusted compiled output. Nullish so survey
+   * objects built without it still type-check. Only the shared custom CSS save service writes it, and
+   * it reads nothing but `source` from a payload — `compiled` and `processorVersion` sent by a caller
+   * are ignored and recomputed.
+   */
+  customCss: ZCustomCssStored.nullish(),
+  /**
+   * App surveys: conditions checked in the browser when a trigger fires (ENG-3873). `null` means no
+   * conditions; an empty group is stored as `null` too. Nullish so survey objects built without it
+   * still type-check.
+   */
+  showConditions: ZShowConditions.nullish(),
+  /**
+   * Rules before the first question (ENG-6932, json-shapes.md section 4): the block-rule format, run
+   * by the survey as soon as it loads, before the welcome card and on start-at links. They may jump
+   * to a block, screen out by jumping to an ending, and set a value; `surveyRefinement` refuses the
+   * rest. Nullish: `null` (the column default) and a missing key both mean none.
+   */
+  startLogic: z.array(ZSurveyBlockLogic).max(MAX_START_LOGIC_RULES).nullish(),
 });
 
-export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.RefinementCtx): void => {
+/**
+ * The survey this refinement resolves logic operands and follow-up recipients against.
+ *
+ * Identical to the input except for `variables` / `hiddenFields`, which are re-derived when the
+ * payload declares its Embedded Data as rows — the same derivation the read seam runs over the
+ * stored rows (`toLegacyEmbeddedFields`), so what this validates against is what the survey will
+ * read back as once the write lands rather than what the legacy keys happen to say on the way in.
+ *
+ * That distinction only exists because of the editor (ENG-2628): its working copy is rows-native,
+ * so the two legacy keys it forwards are whatever it was loaded with at mount, and a variable or
+ * hidden field added since then lives only in `embeddedFields`. Without this, using a freshly added
+ * field in logic — or as a follow-up recipient — would fail `ZSurvey` on publish, both in the
+ * editor's own pre-flight and again as the server action's input schema.
+ *
+ * A payload with no `embeddedFields` is untouched. The legacy writes (the v1 management PUT, and
+ * `updateSurvey` given only `variables` / `hiddenFields`) validate with the rows the write will leave
+ * the survey with (`getLegacyWriteEmbeddedFields` in apps/web), which are the legacy keys plus the
+ * stored fields those keys can't say, such as a computed date (ENG-6935).
+ */
+const withDerivedLegacyColumns = <T extends z.infer<typeof ZSurveyBase>>(survey: T): T => {
+  if (survey.embeddedFields === undefined) return survey;
+
+  const derived = toLegacyEmbeddedFields(linkedToDesiredEmbeddedFields(survey.embeddedFields));
+  return { ...survey, variables: derived.variables, hiddenFields: derived.hiddenFields };
+};
+
+export const surveyRefinement = (rawSurvey: z.infer<typeof ZSurveyBase>, ctx: z.RefinementCtx): void => {
+  const survey = withDerivedLegacyColumns(rawSurvey);
   const { questions, blocks, languages, welcomeCard, endings, isBackButtonHidden } = survey;
+
+  // `ZSurveyBase` already ran this over the *incoming* `variables`, which the derivation above has
+  // just replaced — so on a rows-native payload nothing has checked what the survey will actually
+  // read back as. Two computed fields can derive one legacy name (a local `score` alongside a library
+  // field keyed `score`), and that survey would parse here and then fail its next save. `updateSurvey`
+  // refuses it before it writes; running the same schema here is what stops the editor's pre-flight
+  // and the server action's input schema disagreeing with the write path about the same payload.
+  if (survey.embeddedFields !== undefined) {
+    const derived = ZStoredSurveyVariables.safeParse(survey.variables);
+    if (!derived.success) {
+      for (const issue of derived.error.issues) {
+        ctx.addIssue({ code: "custom", message: issue.message, path: ["embeddedFields"] });
+      }
+    }
+  }
 
   // Validate: must have questions OR blocks with elements, not both
   const hasQuestions = questions.length > 0;
@@ -1038,6 +1192,20 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
       message: "Survey cannot have both questions and blocks. Use one model.",
       path: ["blocks"],
     });
+  }
+
+  // Question codes and answer codes (ENG-6778). Embedded Data names are read from the derived legacy
+  // columns, which hold both the hidden fields and the variables whichever carrier the payload used.
+  if (hasBlocks) {
+    // Typed as optional on purpose: the create-input schema reaches this refinement with both absent.
+    const declared: { hiddenFields?: { fieldIds?: string[] }; variables?: { name: string }[] } = survey;
+    const embeddedDataNames = [
+      ...(declared.hiddenFields?.fieldIds ?? []),
+      ...(declared.variables ?? []).map((variable) => variable.name),
+    ];
+    for (const issue of validateSurveyCodes({ blocks, embeddedDataNames })) {
+      ctx.addIssue({ code: "custom", message: issue.message, path: issue.path });
+    }
   }
 
   let multiLangIssue: z.core.$ZodRawIssue | null;
@@ -1398,7 +1566,7 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
         const logicIssues = validateLogic(survey, questionIndex, question.logic);
 
         logicIssues.forEach((issue) => {
-          ctx.addIssue(issue as z.IssueData);
+          ctx.addIssue(issue as z.core.$ZodRawIssue);
         });
       }
     });
@@ -1473,6 +1641,48 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
           if (elementMultiLangIssue) {
             ctx.addIssue(elementMultiLangIssue);
           }
+        }
+
+        // Validate image alt text if present. An empty default is a decorative image and needs no translations.
+        if (element.imageAltText?.[defaultLanguageCode].trim()) {
+          elementMultiLangIssue = validateElementLabels(
+            "imageAltText",
+            element.imageAltText,
+            languages,
+            blockIndex,
+            elementIndex
+          );
+          if (elementMultiLangIssue) {
+            ctx.addIssue(elementMultiLangIssue);
+          }
+        }
+
+        if (element.type === TSurveyElementTypeEnum.PictureSelection) {
+          element.choices.forEach((choice, choiceIndex) => {
+            if (!choice.imageAltText?.[defaultLanguageCode]?.trim()) return;
+            const choiceAltIssue = validateElementLabels(
+              `Image alt text of choice ${String(choiceIndex + 1)}`,
+              choice.imageAltText,
+              languages,
+              blockIndex,
+              elementIndex,
+              true
+            );
+            if (choiceAltIssue) {
+              ctx.addIssue({
+                ...choiceAltIssue,
+                path: [
+                  "blocks",
+                  blockIndex,
+                  "elements",
+                  elementIndex,
+                  "choices",
+                  choiceIndex,
+                  "imageAltText",
+                ],
+              });
+            }
+          });
         }
 
         // Type-specific validation
@@ -1789,8 +1999,23 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
       // Validate block logic (conditions, actions, fallback)
       const logicIssues = validateBlockLogic(survey, blockIndex, block, allElements);
       logicIssues.forEach((issue) => {
-        ctx.addIssue(issue as z.IssueData);
+        ctx.addIssue(issue as z.core.$ZodRawIssue);
       });
+
+      // Show-if on the block and its elements (ENG-6931)
+      validateShowIf(survey, blockIndex, block, allElements).forEach((issue) => {
+        ctx.addIssue(issue as z.core.$ZodRawIssue);
+      });
+    });
+
+    // Copied options (ENG-6938): the source exists, comes earlier and has options of the same kind.
+    getCopiedOptionsIssues(blocks).forEach(({ path, message }) => {
+      ctx.addIssue({ code: "custom", message, path });
+    });
+
+    // Rules before the first question: jumps and Set value only, reading fields, never answers.
+    validateStartLogic(survey).forEach((issue) => {
+      ctx.addIssue(issue as z.core.$ZodRawIssue);
     });
 
     // 5. Check for cyclic logic in blocks
@@ -1838,6 +2063,20 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
         }
       }
 
+      if (ending.imageAltText?.default.trim()) {
+        const multiLangIssueInImageAltText = validateCardFieldsForAllLanguages(
+          "imageAltText",
+          ending.imageAltText,
+          languages,
+          "end",
+          index
+        );
+
+        if (multiLangIssueInImageAltText) {
+          ctx.addIssue(multiLangIssueInImageAltText);
+        }
+      }
+
       if (ending.buttonLabel !== undefined || ending.buttonLink !== undefined) {
         if (!ending.buttonLabel) {
           ctx.addIssue({
@@ -1865,7 +2104,7 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
             path: ["endings", index, "buttonLink"],
           });
         } else {
-          const parsedButtonLink = ZEndingCardUrl.safeParse(ending.buttonLink);
+          const parsedButtonLink = ZEndingCardButtonLink.safeParse(ending.buttonLink);
           if (!parsedButtonLink.success) {
             const errorMessage = parsedButtonLink.error.issues[0].message;
             ctx.addIssue({
@@ -2082,6 +2321,7 @@ const isInvalidOperatorsForQuestionType = (
       }
       break;
     case TSurveyQuestionTypeEnum.FileUpload:
+    case TSurveyQuestionTypeEnum.Signature: // NOSONAR the legacy question switch has to name the legacy enum member
     case TSurveyQuestionTypeEnum.Address:
     case TSurveyQuestionTypeEnum.Ranking:
       if (!["isSubmitted", "isSkipped"].includes(operator)) {
@@ -2332,7 +2572,7 @@ const validateConditions = (
             });
           }
         } else if (rightOperand?.type === "static") {
-          if (!rightOperand.value) {
+          if (rightOperand.value === "") {
             issues.push({
               code: "custom",
               message: `Conditional Logic: Static value is required in logic no: ${String(logicIndex + 1)} of question ${String(questionIndex + 1)}`,
@@ -2920,7 +3160,7 @@ const validateActions = (
           };
         }
       }
-    } else {
+    } else if (action.objective === "jumpToQuestion" || action.objective === "requireAnswer") {
       const endingIds = survey.endings.map((ending) => ending.id);
 
       const possibleQuestionIds =
@@ -3107,6 +3347,23 @@ const isInvalidOperatorsForElementType = (
       }
       break;
     case TSurveyElementTypeEnum.Ranking:
+      // T21 (ENG-6937): both engines map a ranking's stored labels back to option ids, so "was ranked"
+      // conditions match. Equality is left out: a ranking is an order, not a set.
+      if (
+        ![
+          "includesAllOf",
+          "includesOneOf",
+          "doesNotIncludeAllOf",
+          "doesNotIncludeOneOf",
+          "isSubmitted",
+          "isSkipped",
+        ].includes(operator)
+      ) {
+        isInvalidOperator = true;
+      }
+      break;
+    case TSurveyElementTypeEnum.FileUpload:
+    case TSurveyElementTypeEnum.Signature:
       if (!["isSubmitted", "isSkipped"].includes(operator)) {
         isInvalidOperator = true;
       }
@@ -3145,11 +3402,6 @@ const isInvalidOperatorsForElementType = (
         isInvalidOperator = true;
       }
       break;
-    case TSurveyElementTypeEnum.FileUpload:
-      if (!["isSubmitted", "isSkipped"].includes(operator)) {
-        isInvalidOperator = true;
-      }
-      break;
     case TSurveyElementTypeEnum.Date:
       if (!["equals", "doesNotEqual", "isBefore", "isAfter", "isSubmitted", "isSkipped"].includes(operator)) {
         isInvalidOperator = true;
@@ -3182,12 +3434,27 @@ const isInvalidOperatorsForElementType = (
   return isInvalidOperator;
 };
 
-const validateBlockConditions = (
+/**
+ * Where a condition group lives, for its error messages: the issue `path`, the `where` phrase that
+ * ends a message ("logic no: 2 of block 3"), and whether an element in a later block is reported
+ * here. Show-if reports its stricter reference rule itself, with exact paths (`validateShowIf`).
+ */
+interface TConditionScope {
+  path: (string | number)[];
+  where: string;
+  checkLaterBlock: boolean;
+}
+
+/**
+ * The operand and operator checks of one condition group — the element exists, the operator suits
+ * its type, the right operand fits — shared by block logic and show-if.
+ */
+const validateConditionGroupOperands = (
   survey: TSurvey,
   blockIndex: number,
-  logicIndex: number,
   conditions: TConditionGroup,
-  allElements: Map<string, { block: number; element: number; data: TSurveyElement }>
+  allElements: Map<string, { block: number; element: number; data: TSurveyElement }>,
+  scope: TConditionScope
 ): z.core.$ZodIssue[] => {
   const issues: z.core.$ZodIssue[] = [];
 
@@ -3202,15 +3469,15 @@ const validateBlockConditions = (
       if (!elementInfo) {
         issues.push({
           code: "custom",
-          message: `Conditional Logic: Element Id ${elementId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+          message: `Conditional Logic: Element Id ${elementId} does not exist in ${scope.where}`,
+          path: scope.path,
         });
         return;
-      } else if (blockIndex < elementInfo.block) {
+      } else if (scope.checkLaterBlock && blockIndex < elementInfo.block) {
         issues.push({
           code: "custom",
           message: `Conditional Logic: Block ${String(blockIndex + 1)} cannot refer to an element in block ${String(elementInfo.block + 1)} that appears later in the survey`,
-          path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+          path: scope.path,
         });
         return;
       }
@@ -3222,8 +3489,8 @@ const validateBlockConditions = (
       if (isInvalidOperator) {
         issues.push({
           code: "custom",
-          message: `Conditional Logic: Invalid operator "${operator}" for element type "${element.type}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+          message: `Conditional Logic: Invalid operator "${operator}" for element type "${element.type}" in ${scope.where}`,
+          path: scope.path,
         });
       }
 
@@ -3231,8 +3498,8 @@ const validateBlockConditions = (
       if (element.type === TSurveyElementTypeEnum.CTA && !element.buttonExternal) {
         issues.push({
           code: "custom",
-          message: `Conditional Logic: CTA element "${elementId}" does not have an external button and cannot be used in logic conditions in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+          message: `Conditional Logic: CTA element "${elementId}" does not have an external button and cannot be used in logic conditions in ${scope.where}`,
+          path: scope.path,
         });
         return;
       }
@@ -3255,8 +3522,8 @@ const validateBlockConditions = (
         if (rightOperand !== undefined) {
           issues.push({
             code: "custom",
-            message: `Conditional Logic: Right operand should not be defined for operator "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-            path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+            message: `Conditional Logic: Right operand should not be defined for operator "${operator}" in ${scope.where}`,
+            path: scope.path,
           });
         }
         return;
@@ -3271,8 +3538,8 @@ const validateBlockConditions = (
           if (!elem) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Element ID ${elemId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Element ID ${elemId} does not exist in ${scope.where}`,
+              path: scope.path,
             });
           } else {
             const validElementTypes: TSurveyElementTypeEnum[] = [TSurveyElementTypeEnum.OpenText];
@@ -3296,20 +3563,20 @@ const validateBlockConditions = (
             if (!validElementTypes.includes(elem.data.type)) {
               issues.push({
                 code: "custom",
-                message: `Conditional Logic: Invalid element type "${elem.data.type}" for right operand in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-                path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                message: `Conditional Logic: Invalid element type "${elem.data.type}" for right operand in ${scope.where}`,
+                path: scope.path,
               });
             }
           }
         } else if (rightOperand?.type === "variable") {
           const variableId = rightOperand.value;
-          const variable = survey.variables.find((v) => v.id === variableId);
+          const variable = findLogicComputedField(survey, variableId);
 
           if (!variable) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Variable ID ${variableId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Variable ID ${variableId} does not exist in ${scope.where}`,
+              path: scope.path,
             });
           }
         } else if (rightOperand?.type === "hiddenField") {
@@ -3319,16 +3586,16 @@ const validateBlockConditions = (
           if (!field) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Hidden field ID ${fieldId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Hidden field ID ${fieldId} does not exist in ${scope.where}`,
+              path: scope.path,
             });
           }
         } else if (rightOperand?.type === "static") {
-          if (!rightOperand.value) {
+          if (rightOperand.value === "") {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Static value is required in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Static value is required in ${scope.where}`,
+              path: scope.path,
             });
           }
         }
@@ -3336,15 +3603,15 @@ const validateBlockConditions = (
         if (rightOperand?.type !== "static") {
           issues.push({
             code: "custom",
-            message: `Conditional Logic: Right operand should be a static value for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-            path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+            message: `Conditional Logic: Right operand should be a static value for "${operator}" in ${scope.where}`,
+            path: scope.path,
           });
         } else if (condition.operator === "equals" || condition.operator === "doesNotEqual") {
           if (typeof rightOperand.value !== "string") {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Right operand should be a string for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Right operand should be a string for "${operator}" in ${scope.where}`,
+              path: scope.path,
             });
           } else {
             // Validate that the choice ID exists in the element's choices
@@ -3353,7 +3620,7 @@ const validateBlockConditions = (
               issues.push({
                 code: "custom",
                 message: `Conditional Logic: Choice "${rightOperand.value}" does not exist in element ${String(elementInfo.element + 1)} of block ${String(elementInfo.block + 1)}`,
-                path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                path: scope.path,
               });
             }
           }
@@ -3366,15 +3633,15 @@ const validateBlockConditions = (
         if (rightOperand?.type !== "static") {
           issues.push({
             code: "custom",
-            message: `Conditional Logic: Right operand should be a static value for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-            path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+            message: `Conditional Logic: Right operand should be a static value for "${operator}" in ${scope.where}`,
+            path: scope.path,
           });
         } else if (condition.operator === "equals" || condition.operator === "doesNotEqual") {
           if (typeof rightOperand.value !== "string") {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Right operand should be a string for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Right operand should be a string for "${operator}" in ${scope.where}`,
+              path: scope.path,
             });
           } else {
             // Validate that the choice ID exists in the element's choices
@@ -3383,7 +3650,7 @@ const validateBlockConditions = (
               issues.push({
                 code: "custom",
                 message: `Conditional Logic: Choice "${rightOperand.value}" does not exist in element ${String(elementInfo.element + 1)} of block ${String(elementInfo.block + 1)}`,
-                path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                path: scope.path,
               });
             }
           }
@@ -3395,16 +3662,16 @@ const validateBlockConditions = (
           if (!Array.isArray(rightOperand.value)) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Right operand should be an array for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Right operand should be an array for "${operator}" in ${scope.where}`,
+              path: scope.path,
             });
           } else {
             rightOperand.value.forEach((value) => {
               if (typeof value !== "string") {
                 issues.push({
                   code: "custom",
-                  message: `Conditional Logic: Each value in the right operand should be a string for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-                  path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                  message: `Conditional Logic: Each value in the right operand should be a string for "${operator}" in ${scope.where}`,
+                  path: scope.path,
                 });
               }
             });
@@ -3414,8 +3681,8 @@ const validateBlockConditions = (
             if (rightOperand.value.some((value) => !choiceIds.includes(value))) {
               issues.push({
                 code: "custom",
-                message: `Conditional Logic: One or more choices selected in right operand do not exist in the element in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-                path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                message: `Conditional Logic: One or more choices selected in right operand do not exist in the element in ${scope.where}`,
+                path: scope.path,
               });
             }
           }
@@ -3426,48 +3693,48 @@ const validateBlockConditions = (
       ) {
         if (rightOperand?.type === "variable") {
           const variableId = rightOperand.value;
-          const variable = survey.variables.find((v) => v.id === variableId);
+          const variable = findLogicComputedField(survey, variableId);
 
           if (!variable) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Variable ID ${variableId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Variable ID ${variableId} does not exist in ${scope.where}`,
+              path: scope.path,
             });
           } else if (variable.type !== "number") {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Variable type should be number in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Variable type should be number in ${scope.where}`,
+              path: scope.path,
             });
           }
         } else if (rightOperand?.type === "static") {
           if (typeof rightOperand.value !== "number") {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Right operand should be a number for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Right operand should be a number for "${operator}" in ${scope.where}`,
+              path: scope.path,
             });
           } else if (element.type === TSurveyElementTypeEnum.NPS) {
             if (rightOperand.value < 0 || rightOperand.value > 10) {
               issues.push({
                 code: "custom",
-                message: `Conditional Logic: NPS score should be between 0 and 10 for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-                path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                message: `Conditional Logic: NPS score should be between 0 and 10 for "${operator}" in ${scope.where}`,
+                path: scope.path,
               });
             }
           } else if (rightOperand.value < 1 || rightOperand.value > element.range) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Rating value should be between 1 and ${String(element.range)} for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Rating value should be between 1 and ${String(element.range)} for "${operator}" in ${scope.where}`,
+              path: scope.path,
             });
           }
         } else {
           issues.push({
             code: "custom",
-            message: `Conditional Logic: Right operand should be a variable or a static value for "${operator}" in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-            path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+            message: `Conditional Logic: Right operand should be a variable or a static value for "${operator}" in ${scope.where}`,
+            path: scope.path,
           });
         }
       } else if (element.type === TSurveyElementTypeEnum.Date) {
@@ -3478,8 +3745,8 @@ const validateBlockConditions = (
           if (!elem) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Element ID ${elemId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Element ID ${elemId} does not exist in ${scope.where}`,
+              path: scope.path,
             });
           } else {
             const validElementTypes: TSurveyElementTypeEnum[] = [
@@ -3489,26 +3756,26 @@ const validateBlockConditions = (
             if (!validElementTypes.includes(elem.data.type)) {
               issues.push({
                 code: "custom",
-                message: `Conditional Logic: Invalid element type "${elem.data.type}" for right operand in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-                path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                message: `Conditional Logic: Invalid element type "${elem.data.type}" for right operand in ${scope.where}`,
+                path: scope.path,
               });
             }
           }
         } else if (rightOperand?.type === "variable") {
           const variableId = rightOperand.value;
-          const variable = survey.variables.find((v) => v.id === variableId);
+          const variable = findLogicComputedField(survey, variableId);
 
           if (!variable) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Variable ID ${variableId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Variable ID ${variableId} does not exist in ${scope.where}`,
+              path: scope.path,
             });
           } else if (variable.type !== "text") {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Variable type should be text in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Variable type should be text in ${scope.where}`,
+              path: scope.path,
             });
           }
         } else if (rightOperand?.type === "hiddenField") {
@@ -3518,8 +3785,8 @@ const validateBlockConditions = (
           if (!doesFieldExists) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Hidden field ID ${fieldId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Hidden field ID ${fieldId} does not exist in ${scope.where}`,
+              path: scope.path,
             });
           }
         } else if (rightOperand?.type === "static") {
@@ -3528,56 +3795,59 @@ const validateBlockConditions = (
           if (!date) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Please select a date value in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Please select a date value in ${scope.where}`,
+              path: scope.path,
             });
           } else if (isNaN(new Date(date).getTime())) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Invalid date format for right operand in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Invalid date format for right operand in ${scope.where}`,
+              path: scope.path,
             });
           }
         }
       } else if (element.type === TSurveyElementTypeEnum.Matrix) {
         const row = leftOperand.meta?.row;
-        if (row === undefined) {
+        // ENG-6934: the id form alone is a row condition too; the write path fills the position.
+        if (!isMatrixRowCondition(leftOperand.meta)) {
           if (rightOperand?.value !== undefined) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Right operand is not allowed in matrix element in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Right operand is not allowed in matrix element in ${scope.where}`,
+              path: scope.path,
             });
           }
           if (!["isPartiallySubmitted", "isCompletelySubmitted"].includes(operator)) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Operator "${operator}" is not allowed in matrix element in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Operator "${operator}" is not allowed in matrix element in ${scope.where}`,
+              path: scope.path,
             });
           }
         } else {
           if (rightOperand === undefined) {
             issues.push({
               code: "custom",
-              message: `Conditional Logic: Right operand is required in matrix element in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+              message: `Conditional Logic: Right operand is required in matrix element in ${scope.where}`,
+              path: scope.path,
             });
           }
           if (rightOperand) {
             if (rightOperand.type !== "static") {
               issues.push({
                 code: "custom",
-                message: `Conditional Logic: Right operand should be a static value in matrix element in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-                path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                message: `Conditional Logic: Right operand should be a static value in matrix element in ${scope.where}`,
+                path: scope.path,
               });
             }
+            // With a row id, the id decides the row (and is checked on its own); the position is
+            // only the previous release's reading, rewritten from the id on every write.
             const rowIndex = Number(row);
-            if (rowIndex < 0 || rowIndex >= element.rows.length) {
+            if (leftOperand.meta?.rowId === undefined && (rowIndex < 0 || rowIndex >= element.rows.length)) {
               issues.push({
                 code: "custom",
-                message: `Conditional Logic: Invalid row index in matrix element in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-                path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+                message: `Conditional Logic: Invalid row index in matrix element in ${scope.where}`,
+                path: scope.path,
               });
             }
           }
@@ -3585,26 +3855,26 @@ const validateBlockConditions = (
       }
     } else if (leftOperand.type === "variable") {
       const variableId = leftOperand.value;
-      const variable = survey.variables.find((v) => v.id === variableId);
+      const variable = findLogicComputedField(survey, variableId);
 
       if (!variable) {
         issues.push({
           code: "custom",
-          message: `Conditional Logic: Variable ID ${variableId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+          message: `Conditional Logic: Variable ID ${variableId} does not exist in ${scope.where}`,
+          path: scope.path,
         });
         return;
       }
 
       if (rightOperand?.type === "variable") {
         const rightVariableId = rightOperand.value;
-        const rightVariable = survey.variables.find((v) => v.id === rightVariableId);
+        const rightVariable = findLogicComputedField(survey, rightVariableId);
 
         if (!rightVariable) {
           issues.push({
             code: "custom",
-            message: `Conditional Logic: Variable ID ${rightVariableId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-            path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+            message: `Conditional Logic: Variable ID ${rightVariableId} does not exist in ${scope.where}`,
+            path: scope.path,
           });
         }
       }
@@ -3639,8 +3909,8 @@ const validateBlockConditions = (
       if (!field) {
         issues.push({
           code: "custom",
-          message: `Conditional Logic: Hidden field ID ${fieldId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+          message: `Conditional Logic: Hidden field ID ${fieldId} does not exist in ${scope.where}`,
+          path: scope.path,
         });
       }
     } else {
@@ -3666,7 +3936,339 @@ const validateBlockConditions = (
   };
 
   processConditionGroup(conditions);
+  // ENG-6934: a row or column id the matrix doesn't have, at the exact path of the id.
+  const findMatrix: TFindMatrix = (elementId) => {
+    const element = allElements.get(elementId)?.data;
+    return element?.type === TSurveyElementTypeEnum.Matrix ? element : undefined;
+  };
+  for (const issue of findUnknownMatrixIds(conditions, findMatrix, scope.path)) {
+    issues.push({ code: "custom", message: `${issue.message} in ${scope.where}`, path: issue.path });
+  }
   return issues;
+};
+
+const validateBlockConditions = (
+  survey: TSurvey,
+  blockIndex: number,
+  logicIndex: number,
+  conditions: TConditionGroup,
+  allElements: Map<string, { block: number; element: number; data: TSurveyElement }>
+): z.core.$ZodIssue[] =>
+  validateConditionGroupOperands(survey, blockIndex, conditions, allElements, {
+    path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
+    where: `logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+    checkLaterBlock: true,
+  });
+
+type TElementPositions = Map<string, { block: number; element: number; data: TSurveyElement }>;
+
+/**
+ * Show-if (ENG-6931). The operand checks of block logic, plus the reference rule (json-shapes §1),
+ * reported at the exact path of the offending condition:
+ *
+ * - a block's show-if may use earlier blocks only;
+ * - an element's show-if may use earlier blocks plus elements above it in the same block;
+ * - nothing may use itself or anything below it, which also makes loops impossible.
+ *
+ * Both sides of a condition are checked: an element can be the right operand too.
+ */
+const validateShowIf = (
+  survey: TSurvey,
+  blockIndex: number,
+  block: TSurveyBlock,
+  allElements: TElementPositions
+): z.core.$ZodIssue[] => {
+  const issues: z.core.$ZodIssue[] = [];
+  const blockLabel = `block ${String(blockIndex + 1)}`;
+
+  const checkReferences = (
+    group: TConditionGroup,
+    groupPath: (string | number)[],
+    canUse: (target: { block: number; element: number }) => boolean,
+    owner: string,
+    ownerElementId?: string
+  ): void => {
+    group.conditions.forEach((condition, conditionIndex) => {
+      const conditionPath = [...groupPath, "conditions", conditionIndex];
+      if (isConditionGroup(condition)) {
+        checkReferences(condition, conditionPath, canUse, owner, ownerElementId);
+        return;
+      }
+      const operands = [condition.leftOperand, condition.rightOperand];
+      for (const operand of operands) {
+        if (operand?.type !== "element") continue;
+        const target = allElements.get(operand.value);
+        // An element that doesn't exist is reported by the operand checks.
+        if (!target || canUse(target)) continue;
+        issues.push({
+          code: "custom",
+          message:
+            operand.value === ownerElementId
+              ? `Show-if: The show-if of ${owner} cannot use the question itself`
+              : `Show-if: The show-if of ${owner} cannot use question "${operand.value}", which is not above it. A block's show-if can use earlier blocks only; a question's show-if can use earlier blocks and questions above it on the same page`,
+          path: conditionPath,
+        });
+        // One issue per condition is enough to point at it.
+        break;
+      }
+    });
+  };
+
+  if (block.showIf) {
+    const path = ["blocks", blockIndex, "showIf"];
+    issues.push(
+      ...validateConditionGroupOperands(survey, blockIndex, block.showIf, allElements, {
+        path,
+        where: `the show-if of ${blockLabel}`,
+        checkLaterBlock: false,
+      })
+    );
+    checkReferences(block.showIf, path, (target) => target.block < blockIndex, blockLabel);
+  }
+
+  block.elements.forEach((element, elementIndex) => {
+    if (!element.showIf) return;
+    const path = ["blocks", blockIndex, "elements", elementIndex, "showIf"];
+    const owner = `question ${String(elementIndex + 1)} of ${blockLabel}`;
+    issues.push(
+      ...validateConditionGroupOperands(survey, blockIndex, element.showIf, allElements, {
+        path,
+        where: `the show-if of ${owner}`,
+        checkLaterBlock: false,
+      })
+    );
+    checkReferences(
+      element.showIf,
+      path,
+      (target) => target.block < blockIndex || (target.block === blockIndex && target.element < elementIndex),
+      owner,
+      element.id
+    );
+  });
+
+  // Option show-if (ENG-6937): an option, a matrix row or a matrix column follows its element's rule.
+  block.elements.forEach((element, elementIndex) => {
+    for (const { listKey, items } of getOptionLists(element)) {
+      items.forEach((item, itemIndex) => {
+        if (!item.showIf) return;
+        const path = ["blocks", blockIndex, "elements", elementIndex, listKey, itemIndex, "showIf"];
+        const owner = `${OPTION_LIST_NAMES[listKey].noun} ${String(itemIndex + 1)} of question ${String(elementIndex + 1)} of ${blockLabel}`;
+        issues.push(
+          ...validateConditionGroupOperands(survey, blockIndex, item.showIf, allElements, {
+            path,
+            where: `the show-if of ${owner}`,
+            checkLaterBlock: false,
+          })
+        );
+        checkReferences(
+          item.showIf,
+          path,
+          (target) =>
+            target.block < blockIndex || (target.block === blockIndex && target.element < elementIndex),
+          owner,
+          element.id
+        );
+      });
+    }
+  });
+
+  return issues;
+};
+
+/** How a logic error names a block: its editable title, or its position when the title is blank. */
+const getBlockLabel = (block: TSurveyBlock, blockIndex: number): string =>
+  block.name.trim() || `Block ${String(blockIndex + 1)}`;
+
+/** Where a block rule's action sits, for its checks and their messages. */
+interface TBlockActionContext {
+  survey: TSurvey;
+  blockIndex: number;
+  logicIndex: number;
+  currentBlock: TSurveyBlock;
+  allElements: Map<string, { block: number; element: number; data: TSurveyElement }>;
+}
+
+/** The answers a one-step calculation may take, by the type of the field it sets. */
+const TEXT_CALCULATION_ELEMENT_TYPES = new Set<TSurveyElementTypeEnum>([
+  TSurveyElementTypeEnum.OpenText,
+  TSurveyElementTypeEnum.MultipleChoiceSingle,
+  TSurveyElementTypeEnum.Rating,
+  TSurveyElementTypeEnum.NPS,
+  TSurveyElementTypeEnum.Date,
+]);
+const NUMBER_CALCULATION_ELEMENT_TYPES = new Set<TSurveyElementTypeEnum>([
+  TSurveyElementTypeEnum.Rating,
+  TSurveyElementTypeEnum.NPS,
+]);
+
+/** The answer a one-step calculation reads, checked against the type of the field it sets. */
+const validateCalculationElementSource = (
+  ctx: TBlockActionContext,
+  variableType: "number" | "text",
+  elementId: string
+): z.core.$ZodIssue | undefined => {
+  const { blockIndex, logicIndex, allElements } = ctx;
+  const selectedElement = allElements.get(elementId);
+
+  if (variableType === "text") {
+    if (selectedElement && TEXT_CALCULATION_ELEMENT_TYPES.has(selectedElement.data.type)) return undefined;
+    return {
+      code: "custom",
+      message: `Conditional Logic: Invalid element type for text variable in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+    };
+  }
+
+  if (
+    !selectedElement ||
+    (!NUMBER_CALCULATION_ELEMENT_TYPES.has(selectedElement.data.type) &&
+      selectedElement.data.type === TSurveyElementTypeEnum.OpenText &&
+      selectedElement.data.inputType !== "number")
+  ) {
+    return {
+      code: "custom",
+      message: `Conditional Logic: Invalid element type for number variable in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+    };
+  }
+  return undefined;
+};
+
+/**
+ * A Set value or one-step calculation. Its expression's issues, each at its exact path into the tree,
+ * go to `expressionIssues`; anything else is returned.
+ */
+const validateBlockCalculateAction = (
+  ctx: TBlockActionContext,
+  action: Extract<TSurveyBlockLogicAction, { objective: "calculate" }>,
+  actionIndex: number,
+  expressionIssues: z.core.$ZodIssue[]
+): z.core.$ZodIssue | undefined => {
+  const { survey, blockIndex, logicIndex, allElements } = ctx;
+  const variable = findLogicComputedField(survey, action.variableId);
+
+  if (!variable) {
+    return {
+      code: "custom",
+      message: `Conditional Logic: Variable ID ${action.variableId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+    };
+  }
+
+  // Set value (ENG-6935): the expression's types and its result against the field, each issue at
+  // its exact path into the tree.
+  if (action.value.type === "expression") {
+    const valuePath = ["blocks", blockIndex, "logic", logicIndex, "actions", actionIndex, "value", "value"];
+    for (const issue of getSetValueExpressionIssues(
+      action.value.value,
+      variable.dataType,
+      getExpressionTypeContext(survey, allElements)
+    )) {
+      expressionIssues.push({ code: "custom", message: issue.message, path: [...valuePath, ...issue.path] });
+    }
+    return undefined;
+  }
+
+  // The one-step operators predate dates; a computed date is set with a formula.
+  if (variable.type === "date") {
+    return {
+      code: "custom",
+      message: `Conditional Logic: A date field is set with an expression in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+      path: ["blocks", blockIndex, "logic", logicIndex, "actions", actionIndex, "value"],
+    };
+  }
+
+  if (action.value.type === "variable") {
+    const selectedVariable = findLogicComputedField(survey, action.value.value);
+
+    if (selectedVariable?.type !== variable.type) {
+      return {
+        code: "custom",
+        message: `Conditional Logic: Invalid variable type for variable in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+        path: ["blocks", blockIndex, "logic", logicIndex],
+      };
+    }
+  }
+
+  if (action.value.type === "element") {
+    return validateCalculationElementSource(ctx, variable.type, action.value.value);
+  }
+  return undefined;
+};
+
+/** Require answer must target an optional question in a later block. */
+const validateBlockRequireAnswerAction = (
+  ctx: TBlockActionContext,
+  targetElementId: string
+): z.core.$ZodIssue | undefined => {
+  const { blockIndex, logicIndex, allElements } = ctx;
+  const targetElementInfo = allElements.get(targetElementId);
+
+  if (!targetElementInfo) {
+    return {
+      code: "custom",
+      message: `Conditional Logic: Element ID ${targetElementId} does not exist for requireAnswer action in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+    };
+  }
+
+  // Check if element is in the current block (not allowed)
+  if (targetElementInfo.block === blockIndex) {
+    return {
+      code: "custom",
+      message: `Conditional Logic: Element ${targetElementId} cannot be in the current block for requireAnswer action in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}. RequireAnswer must target elements in other blocks.`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+    };
+  }
+
+  // Check if element is in a previous block (should target future blocks)
+  if (targetElementInfo.block < blockIndex) {
+    return {
+      code: "custom",
+      message: `Conditional Logic: Element ${targetElementId} is in a previous block (block ${String(targetElementInfo.block + 1)}). RequireAnswer should target elements in future blocks after block ${String(blockIndex + 1)}.`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+    };
+  }
+
+  // Check if element is optional (not required)
+  if (targetElementInfo.data.required) {
+    return {
+      code: "custom",
+      message: `Conditional Logic: Element ${targetElementId} in block ${String(targetElementInfo.block + 1)} is already required in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+    };
+  }
+  return undefined;
+};
+
+/** A jump must go to a block or an ending that exists, and not to its own block. */
+const validateBlockJumpAction = (
+  ctx: TBlockActionContext,
+  targetBlockId: string
+): z.core.$ZodIssue | undefined => {
+  const { survey, blockIndex, logicIndex, currentBlock } = ctx;
+  const possibleTargets = [...survey.blocks.map((b) => b.id), ...survey.endings.map((ending) => ending.id)];
+
+  if (!possibleTargets.includes(targetBlockId)) {
+    // Named by the owning block's title, never the missing target's id: the id is internal and
+    // the block it pointed at no longer exists to be named.
+    return {
+      code: "custom",
+      message: `Conditional Logic: Jump destination in rule ${String(logicIndex + 1)} of "${getBlockLabel(currentBlock, blockIndex)}" no longer exists. Choose a valid destination.`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+      params: { missingLogicDestination: "jump" },
+    };
+  }
+
+  // Cannot jump to the current block
+  if (targetBlockId === currentBlock.id) {
+    return {
+      code: "custom",
+      message: `Conditional Logic: Cannot jump to the current block in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+      path: ["blocks", blockIndex, "logic", logicIndex],
+    };
+  }
+  return undefined;
 };
 
 const validateBlockActions = (
@@ -3677,140 +4279,21 @@ const validateBlockActions = (
   currentBlock: TSurveyBlock,
   allElements: Map<string, { block: number; element: number; data: TSurveyElement }>
 ): z.core.$ZodIssue[] => {
-  const actionIssues: (z.core.$ZodIssue | undefined)[] = actions.map((action) => {
-    if (action.objective === "calculate") {
-      const variable = survey.variables.find((v) => v.id === action.variableId);
+  const ctx: TBlockActionContext = { survey, blockIndex, logicIndex, currentBlock, allElements };
+  const expressionIssues: z.core.$ZodIssue[] = [];
 
-      if (!variable) {
-        return {
-          code: "custom",
-          message: `Conditional Logic: Variable ID ${action.variableId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex],
-        };
-      }
-
-      if (action.value.type === "variable") {
-        const selectedVariable = survey.variables.find((v) => v.id === action.value.value);
-
-        if (selectedVariable?.type !== variable.type) {
-          return {
-            code: "custom",
-            message: `Conditional Logic: Invalid variable type for variable in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-            path: ["blocks", blockIndex, "logic", logicIndex],
-          };
-        }
-      }
-
-      if (variable.type === "text") {
-        if (action.value.type === "element") {
-          const allowedElements: TSurveyElementTypeEnum[] = [
-            TSurveyElementTypeEnum.OpenText,
-            TSurveyElementTypeEnum.MultipleChoiceSingle,
-            TSurveyElementTypeEnum.Rating,
-            TSurveyElementTypeEnum.NPS,
-            TSurveyElementTypeEnum.Date,
-          ];
-
-          const selectedElement = allElements.get(action.value.value);
-
-          if (!selectedElement || !allowedElements.includes(selectedElement.data.type)) {
-            return {
-              code: "custom",
-              message: `Conditional Logic: Invalid element type for text variable in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-              path: ["blocks", blockIndex, "logic", logicIndex],
-            };
-          }
-        }
-
+  const actionIssues: (z.core.$ZodIssue | undefined)[] = actions.map((action, actionIndex) => {
+    switch (action.objective) {
+      case "calculate":
+        return validateBlockCalculateAction(ctx, action, actionIndex, expressionIssues);
+      case "requireAnswer":
+        return validateBlockRequireAnswerAction(ctx, action.target);
+      case "jumpToBlock":
+        return validateBlockJumpAction(ctx, action.target);
+      default:
+        // `markLowQuality` (ENG-6933) has nothing to check: it takes no target.
         return undefined;
-      }
-
-      if (action.value.type === "element") {
-        const allowedElements: TSurveyElementTypeEnum[] = [
-          TSurveyElementTypeEnum.Rating,
-          TSurveyElementTypeEnum.NPS,
-        ];
-
-        const selectedElement = allElements.get(action.value.value);
-
-        if (
-          !selectedElement ||
-          (!allowedElements.includes(selectedElement.data.type) &&
-            selectedElement.data.type === TSurveyElementTypeEnum.OpenText &&
-            selectedElement.data.inputType !== "number")
-        ) {
-          return {
-            code: "custom",
-            message: `Conditional Logic: Invalid element type for number variable in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-            path: ["blocks", blockIndex, "logic", logicIndex],
-          };
-        }
-      }
-    } else if (action.objective === "requireAnswer") {
-      // requireAnswer must target an element OUTSIDE the current block (in a future block)
-      const targetElementId = action.target;
-      const targetElementInfo = allElements.get(targetElementId);
-
-      if (!targetElementInfo) {
-        return {
-          code: "custom",
-          message: `Conditional Logic: Element ID ${targetElementId} does not exist for requireAnswer action in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex],
-        };
-      }
-
-      // Check if element is in the current block (not allowed)
-      if (targetElementInfo.block === blockIndex) {
-        return {
-          code: "custom",
-          message: `Conditional Logic: Element ${targetElementId} cannot be in the current block for requireAnswer action in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}. RequireAnswer must target elements in other blocks.`,
-          path: ["blocks", blockIndex, "logic", logicIndex],
-        };
-      }
-
-      // Check if element is in a previous block (should target future blocks)
-      if (targetElementInfo.block < blockIndex) {
-        return {
-          code: "custom",
-          message: `Conditional Logic: Element ${targetElementId} is in a previous block (block ${String(targetElementInfo.block + 1)}). RequireAnswer should target elements in future blocks after block ${String(blockIndex + 1)}.`,
-          path: ["blocks", blockIndex, "logic", logicIndex],
-        };
-      }
-
-      // Check if element is optional (not required)
-      if (targetElementInfo.data.required) {
-        return {
-          code: "custom",
-          message: `Conditional Logic: Element ${targetElementId} in block ${String(targetElementInfo.block + 1)} is already required in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex],
-        };
-      }
-    } else {
-      // action.objective === "jumpToBlock"
-      const targetBlockId = action.target;
-      const blockIds = survey.blocks.map((b) => b.id);
-      const endingIds = survey.endings.map((ending) => ending.id);
-      const possibleTargets = [...blockIds, ...endingIds];
-
-      if (!possibleTargets.includes(targetBlockId)) {
-        return {
-          code: "custom",
-          message: `Conditional Logic: Block ID ${targetBlockId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex],
-        };
-      }
-
-      // Cannot jump to the current block
-      if (targetBlockId === currentBlock.id) {
-        return {
-          code: "custom",
-          message: `Conditional Logic: Cannot jump to the current block in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
-          path: ["blocks", blockIndex, "logic", logicIndex],
-        };
-      }
     }
-
-    return undefined;
   });
 
   const jumpToBlockActions = actions.filter((action) => action.objective === "jumpToBlock");
@@ -3823,8 +4306,50 @@ const validateBlockActions = (
   }
 
   const filteredActionIssues = actionIssues.filter((issue): issue is z.core.$ZodIssue => issue !== undefined);
-  return filteredActionIssues;
+  return [...filteredActionIssues, ...expressionIssues];
 };
+
+/**
+ * The computed field a logic reference names, with its type. Read from the rows when the payload has
+ * them, because a computed date (ENG-6935) lives only there; the legacy `variables` otherwise.
+ */
+const findLogicComputedField = (
+  survey: TSurvey,
+  storageKey: string
+): { type: "number" | "text" | "date"; dataType: TEmbeddedDataType } | undefined => {
+  const row = survey.embeddedFields?.find(
+    ({ field, link }) => field.source === "computed" && link.storageKey === storageKey
+  );
+  if (row) {
+    const { dataType } = row.field;
+    return { type: dataType === "number" || dataType === "date" ? dataType : "text", dataType };
+  }
+  const variable = survey.variables.find((v) => v.id === storageKey);
+  if (!variable) return undefined;
+  return { type: variable.type, dataType: variable.type === "number" ? "number" : "string" };
+};
+
+/** What the expression type check resolves references against: this survey's elements and fields. */
+const getExpressionTypeContext = (
+  survey: TSurvey,
+  allElements: Map<string, { block: number; element: number; data: TSurveyElement }>
+): TExpressionTypeContext => ({
+  getElement: (elementId) => {
+    const element = allElements.get(elementId)?.data;
+    if (!element) return undefined;
+    return { type: element.type, inputType: "inputType" in element ? element.inputType : undefined };
+  },
+  getComputedFieldType: (storageKey) => findLogicComputedField(survey, storageKey)?.dataType,
+  getIngestedFieldType: (storageKey) => {
+    if (survey.embeddedFields !== undefined) {
+      return survey.embeddedFields.find(
+        ({ field, link }) => field.source === "ingested" && link.storageKey === storageKey
+      )?.field.dataType;
+    }
+    return survey.hiddenFields.fieldIds?.includes(storageKey) ? "string" : undefined;
+  },
+  getReservedFieldType: (name) => RESERVED_FIELD_CATALOG.find((entry) => entry.name === name)?.dataType,
+});
 
 const validateBlockLogicFallback = (
   survey: TSurvey,
@@ -3867,8 +4392,9 @@ const validateBlockLogicFallback = (
     return [
       {
         code: "custom",
-        message: `Conditional Logic: Fallback block ID ${block.logicFallback} does not exist in block ${String(blockIndex + 1)}`,
+        message: `Conditional Logic: Fallback destination of "${getBlockLabel(block, blockIndex)}" no longer exists. Choose a valid destination.`,
         path: ["blocks", blockIndex],
+        params: { missingLogicDestination: "fallback" },
       },
     ];
   }
@@ -3901,13 +4427,13 @@ export const ZSurveyUpdateInput = ZSurveyBase.omit({
   createdAt: true,
   updatedAt: true,
   followUps: true,
-  // Read-only projection of the EmbeddedData tables (ENG-1837), omitted for the same reason as on
-  // both create inputs: nothing may reach a Prisma write through this schema. Omitting STRIPS rather
-  // than rejects, so the v1 PUT round-trip — which re-parses the loaded survey merged with the patch
-  // — is unaffected; `updateSurveyInternal` still destructures the key out, because callers that hand
-  // it a raw `TSurvey` (the editor's save actions, the summary's single-use toggle) never go through
-  // this schema at all.
-  embeddedFields: true,
+  // ENG-2949: stripped. This is the legacy v1 PUT boundary, which ignores a
+  // `customCss` key like any other unknown one; omitting it here means the merged round-trip never hands
+  // the stored value to `updateSurvey`, which then leaves the survey's CSS untouched.
+  customCss: true,
+  // The ENG-3282 authorization facts (`visibility`, `ownerId`, the versions) are deliberately NOT
+  // omitted: the v1 PUT round-trip re-parses the loaded survey, which carries them.
+  // `updateSurveyInternal` strips them before the write instead, so none is writable through here.
 })
   .extend({
     followUps: z
@@ -3927,7 +4453,15 @@ export const ZSurveyUpdateInput = ZSurveyBase.omit({
       updatedAt: z.coerce.date(),
     })
   )
-  .superRefine(surveyRefinement);
+  .superRefine(surveyRefinement)
+  // `embeddedFields` is read by the refinement and never output. This schema is the v1
+  // `PUT /api/v1/management/surveys/{id}` boundary, which re-parses the loaded survey merged with the
+  // caller's patch. Output, the key would hand `updateSurvey` a desired set on every legacy PUT, turning
+  // what the legacy columns say into a no-op, so the PUT stays a legacy write. Read, it is what logic
+  // resolves against that the legacy columns can't say (a computed date, ENG-6935): the route sets it
+  // to the rows the write will leave the survey with (`getLegacyWriteEmbeddedFields`), over whatever
+  // the caller sent.
+  .transform(({ embeddedFields: _validatedOnly, ...survey }) => survey);
 
 // Helper function to make all properties of a Zod object schema optional
 const makeSchemaOptional = <T extends z.ZodRawShape>(
@@ -3949,11 +4483,16 @@ export const ZSurveyCreateInput = makeSchemaOptional(ZSurveyBase)
     // archivedAt is owned exclusively by the archive/restore flows; a create must never set it,
     // otherwise a caller could POST an already-archived, purge-eligible survey.
     archivedAt: true,
-    // Read-only projection of the EmbeddedData tables (ENG-1837). `createSurvey` spreads the parsed
-    // body straight into `Prisma.SurveyCreateInput`, and `Survey` owns relations named
-    // `embeddedData` / `embeddedDataLinks`, so admitting this key would turn a read projection into
-    // a nested relation write. The rows are written by `reconcileEmbeddedData` instead.
-    embeddedFields: true,
+    // Server-owned authorization facts (ENG-3282): never writable through a survey payload.
+    visibility: true,
+    ownerId: true,
+    visibilityVersion: true,
+    visibilityProjectedVersion: true,
+    visibilityChangedAt: true,
+    visibilityChangedById: true,
+    // ENG-2949: custom CSS is stripped from generic create payloads. Only callers that ran the shared
+    // custom CSS save service may set it, through `createSurvey`'s options.
+    customCss: true,
   })
   .extend({
     name: z.string(), // Keep name required
@@ -4005,11 +4544,16 @@ export const ZSurveyCreateInputWithWorkspaceId = makeSchemaOptional(ZSurveyBase)
     // archivedAt is owned exclusively by the archive/restore flows; a create must never set it,
     // otherwise a caller could POST an already-archived, purge-eligible survey.
     archivedAt: true,
-    // Read-only projection of the EmbeddedData tables (ENG-1837). `createSurvey` spreads the parsed
-    // body straight into `Prisma.SurveyCreateInput`, and `Survey` owns relations named
-    // `embeddedData` / `embeddedDataLinks`, so admitting this key would turn a read projection into
-    // a nested relation write. The rows are written by `reconcileEmbeddedData` instead.
-    embeddedFields: true,
+    // Server-owned authorization facts (ENG-3282): never writable through a survey payload.
+    visibility: true,
+    ownerId: true,
+    visibilityVersion: true,
+    visibilityProjectedVersion: true,
+    visibilityChangedAt: true,
+    visibilityChangedById: true,
+    // ENG-2949: custom CSS is stripped from generic create payloads. Only callers that ran the shared
+    // custom CSS save service may set it, through `createSurvey`'s options.
+    customCss: true,
   })
   .extend({
     name: z.string(), // Keep name required
@@ -4057,7 +4601,7 @@ export interface TSurveyDates {
 
 export type TSurveyCreateInput = z.input<typeof ZSurveyCreateInput>;
 
-export type TSurveyEditorTabs = "elements" | "styling" | "language" | "settings" | "followUps";
+export type TSurveyEditorTabs = "elements" | "flow" | "styling" | "language" | "settings" | "followUps";
 
 export const ZSurveyElementSummaryOpenText = z.object({
   type: z.literal(TSurveyElementTypeEnum.OpenText),
@@ -4081,6 +4625,16 @@ export const ZSurveyElementSummaryOpenText = z.object({
 
 export type TSurveyElementSummaryOpenText = z.infer<typeof ZSurveyElementSummaryOpenText>;
 
+/**
+ * Option bases (ENG-6937). `shownCount`: how many of the respondents in the element's base were shown
+ * the option (or matrix row), set only when that is fewer than all of them; percentages are over it.
+ * `hidden`: the option is Hidden (retired on a live survey) and stays in results labelled so.
+ */
+const ZSummaryOptionBase = {
+  shownCount: z.number().optional(),
+  hidden: z.literal(true).optional(),
+};
+
 export const ZSurveyElementSummaryMultipleChoice = z.object({
   type: z.union([
     z.literal(TSurveyElementTypeEnum.MultipleChoiceMulti),
@@ -4094,6 +4648,7 @@ export const ZSurveyElementSummaryMultipleChoice = z.object({
       value: z.string(),
       count: z.number(),
       percentage: z.number(),
+      ...ZSummaryOptionBase,
       others: z
         .array(
           z.object({
@@ -4125,6 +4680,7 @@ export const ZSurveyElementSummaryPictureSelection = z.object({
       imageUrl: ZStorageUrl,
       count: z.number(),
       percentage: z.number(),
+      ...ZSummaryOptionBase,
     })
   ),
 });
@@ -4300,6 +4856,30 @@ export const ZSurveyElementSummaryFileUpload = z.object({
 
 export type TSurveyElementSummaryFileUpload = z.infer<typeof ZSurveyElementSummaryFileUpload>;
 
+export const ZSurveyElementSummarySignature = z.object({
+  type: z.literal(TSurveyElementTypeEnum.Signature),
+  element: ZSurveySignatureElement,
+  responseCount: z.number(),
+  signedCount: z.number(),
+  skippedCount: z.number(),
+  signatures: z.array(
+    z.object({
+      id: z.string(),
+      updatedAt: z.date(),
+      value: z.string(),
+      contact: z
+        .object({
+          id: ZId,
+          userId: z.string().optional(),
+        })
+        .nullable(),
+      contactAttributes: ZContactAttributes.nullable(),
+    })
+  ),
+});
+
+export type TSurveyElementSummarySignature = z.infer<typeof ZSurveyElementSummarySignature>;
+
 export const ZSurveyElementSummaryCal = z.object({
   type: z.literal(TSurveyElementTypeEnum.Cal),
   element: ZSurveyCalElement,
@@ -4330,6 +4910,7 @@ export const ZSurveyElementSummaryMatrix = z.object({
         })
       ),
       totalResponsesForRow: z.number(),
+      ...ZSummaryOptionBase,
     })
   ),
 });
@@ -4338,7 +4919,10 @@ export type TSurveyElementSummaryMatrix = z.infer<typeof ZSurveyElementSummaryMa
 
 export const ZSurveyElementSummaryHiddenFields = z.object({
   type: z.literal("hiddenField"),
+  /** The storage key the samples were read from. Unique per survey; not shown. */
   id: z.string(),
+  /** What the card is titled: the field's name, disambiguated on collision (ENG-3233). */
+  label: z.string(),
   responseCount: z.number(),
   samples: z.array(
     z.object({
@@ -4410,6 +4994,7 @@ export const ZSurveyElementSummaryRanking = z.object({
       value: z.string(),
       count: z.number(),
       avgRanking: z.number(),
+      ...ZSummaryOptionBase,
       others: z
         .array(
           z.object({
@@ -4439,6 +5024,7 @@ export const ZSurveyElementSummary = z.union([
   ZSurveyElementSummaryConsent,
   ZSurveyElementSummaryDate,
   ZSurveyElementSummaryFileUpload,
+  ZSurveyElementSummarySignature,
   ZSurveyElementSummaryCal,
   ZSurveyElementSummaryMatrix,
   ZSurveyElementSummaryAddress,
@@ -4472,6 +5058,8 @@ export const ZSurveySummary = z.object({
       impressions: z.number(),
       dropOffCount: z.number(),
       dropOffPercentage: z.number(),
+      /** Respondents the element was not shown to, from their not-shown records (ENG-6936). */
+      notShownCount: z.number(),
     })
   ),
   quotas: z.array(
@@ -4502,6 +5090,10 @@ export const ZSurveyFilterCriteria = z.object({
   // When true, include archived surveys (archivedAt not null) in results.
   // When false/undefined, archived surveys are excluded (hidden by default).
   includeArchived: z.boolean().optional(),
+  // true keeps only single-use surveys (`singleUse.enabled`), false only the others; undefined keeps both.
+  singleUse: z.boolean().optional(),
+  // true keeps only surveys with a PIN, false only the others; undefined keeps both.
+  pinProtected: z.boolean().optional(),
 });
 
 export type TSurveyFilterCriteria = z.infer<typeof ZSurveyFilterCriteria>;

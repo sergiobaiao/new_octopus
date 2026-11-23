@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
 import { TResponse, TResponseInput } from "@formbricks/types/responses";
 import { updateResponse } from "@/lib/response/service";
-import { evaluateResponseQuotas } from "@/modules/ee/quotas/lib/evaluation-service";
+import {
+  evaluateResponseQuotas,
+  loadQuotaEvaluationContext,
+} from "@/modules/ee/quotas/lib/evaluation-service";
 import { updateResponseWithQuotaEvaluation } from "./response";
 
 vi.mock("@/lib/response/service");
@@ -10,6 +13,10 @@ vi.mock("@/modules/ee/quotas/lib/evaluation-service");
 
 const mockUpdateResponse = vi.mocked(updateResponse);
 const mockEvaluateResponseQuotas = vi.mocked(evaluateResponseQuotas);
+const mockLoadQuotaEvaluationContext = vi.mocked(loadQuotaEvaluationContext);
+const mockQuotaContext = { quotas: [], survey: { id: "survey123" } } as unknown as Awaited<
+  ReturnType<typeof loadQuotaEvaluationContext>
+>;
 
 type MockTx = {
   response: {
@@ -73,6 +80,8 @@ describe("updateResponseWithQuotaEvaluation", () => {
     updatedAt: new Date("2024-01-02"),
     contactId: "contact123",
     ingestFlags: null,
+    notShown: null,
+    outcome: null,
     contact: mockResponse.contact,
     tags: mockResponse.tags,
   };
@@ -85,6 +94,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       },
     };
     prisma.$transaction = vi.fn(async (cb: any) => cb(mockTx));
+    mockLoadQuotaEvaluationContext.mockResolvedValue(mockQuotaContext);
   });
 
   test("should return original response when quota doesn't end survey", async () => {
@@ -93,7 +103,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       shouldEndSurvey: false,
     });
 
-    const result = await updateResponseWithQuotaEvaluation(mockResponseId, mockResponseInput);
+    const result = await updateResponseWithQuotaEvaluation(mockResponseId, "survey123", mockResponseInput);
 
     expect(mockUpdateResponse).toHaveBeenCalledWith(mockResponseId, mockResponseInput, mockTx);
     expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith({
@@ -106,6 +116,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       // The row just written, so `reserved` quota operands resolve (ENG-1840).
       response: expect.objectContaining({ id: expect.any(String) }),
       tx: mockTx,
+      quotaContext: mockQuotaContext,
     });
 
     expect(result).toEqual(mockResponse);
@@ -118,7 +129,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       refreshedResponse: mockRefreshedResponse,
     });
 
-    const result = await updateResponseWithQuotaEvaluation(mockResponseId, mockResponseInput);
+    const result = await updateResponseWithQuotaEvaluation(mockResponseId, "survey123", mockResponseInput);
 
     expect(mockUpdateResponse).toHaveBeenCalledWith(mockResponseId, mockResponseInput, mockTx);
     expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith({
@@ -131,6 +142,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       // The row just written, so `reserved` quota operands resolve (ENG-1840).
       response: expect.objectContaining({ id: expect.any(String) }),
       tx: mockTx,
+      quotaContext: mockQuotaContext,
     });
 
     expect(result).toEqual({
@@ -147,7 +159,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       refreshedResponse: null,
     });
 
-    const result = await updateResponseWithQuotaEvaluation(mockResponseId, mockResponseInput);
+    const result = await updateResponseWithQuotaEvaluation(mockResponseId, "survey123", mockResponseInput);
 
     expect(mockUpdateResponse).toHaveBeenCalledWith(mockResponseId, mockResponseInput, mockTx);
     expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith({
@@ -160,6 +172,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       // The row just written, so `reserved` quota operands resolve (ENG-1840).
       response: expect.objectContaining({ id: expect.any(String) }),
       tx: mockTx,
+      quotaContext: mockQuotaContext,
     });
 
     expect(result).toEqual(mockResponse);
@@ -172,7 +185,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       refreshedResponse: undefined,
     });
 
-    const result = await updateResponseWithQuotaEvaluation(mockResponseId, mockResponseInput);
+    const result = await updateResponseWithQuotaEvaluation(mockResponseId, "survey123", mockResponseInput);
 
     expect(mockUpdateResponse).toHaveBeenCalledWith(mockResponseId, mockResponseInput, mockTx);
     expect(result).toEqual(mockResponse);
@@ -185,7 +198,7 @@ describe("updateResponseWithQuotaEvaluation", () => {
       shouldEndSurvey: false,
     });
 
-    const result = await updateResponseWithQuotaEvaluation(mockResponseId, mockResponseInput);
+    const result = await updateResponseWithQuotaEvaluation(mockResponseId, "survey123", mockResponseInput);
 
     expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith({
       surveyId: responseWithNullLanguage.surveyId,
@@ -197,8 +210,24 @@ describe("updateResponseWithQuotaEvaluation", () => {
       // The row just written, so `reserved` quota operands resolve (ENG-1840).
       response: expect.objectContaining({ id: expect.any(String) }),
       tx: mockTx,
+      quotaContext: mockQuotaContext,
     });
 
     expect(result).toEqual(responseWithNullLanguage);
+  });
+
+  test("reads the quota definitions before opening the transaction, not inside it (ENG-3285)", async () => {
+    mockUpdateResponse.mockResolvedValue(mockResponse);
+    mockEvaluateResponseQuotas.mockResolvedValue({ shouldEndSurvey: false });
+
+    await updateResponseWithQuotaEvaluation(mockResponseId, "survey123", mockResponseInput);
+
+    expect(mockLoadQuotaEvaluationContext).toHaveBeenCalledWith("survey123");
+    expect(mockLoadQuotaEvaluationContext.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(prisma.$transaction).mock.invocationCallOrder[0]
+    );
+    expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith(
+      expect.objectContaining({ quotaContext: mockQuotaContext })
+    );
   });
 });

@@ -1,9 +1,15 @@
 import "server-only";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
-import { Prisma } from "@formbricks/database/prisma";
+import { Prisma, type Survey as TPrismaSurveyRow } from "@formbricks/database/prisma";
+import { PrismaErrorType } from "@formbricks/database/types/error";
 import { logger } from "@formbricks/logger";
 import { ZId, ZOptionalNumber } from "@formbricks/types/common";
+import type { TCustomCssStored } from "@formbricks/types/custom-css";
+import {
+  linkedToDesiredEmbeddedFields,
+  toLegacyEmbeddedFields,
+} from "@formbricks/types/embedded-data-mapping";
 import {
   DatabaseError,
   InvalidInputError,
@@ -23,39 +29,85 @@ import {
   describeDeclaredFieldNameErrors,
   validateNewDeclaredFields,
 } from "@formbricks/types/surveys/declared-field-guard";
-import { TSurvey, TSurveyCreateInput, ZSurvey, ZSurveyCreateInput } from "@formbricks/types/surveys/types";
-import { reconcileEmbeddedData } from "@/lib/embedded-data/reconcile";
+import { carryOverCodes } from "@formbricks/types/surveys/fill-missing-codes";
+import {
+  describePublishedLockViolations,
+  getPublishedLockViolations,
+} from "@formbricks/types/surveys/published-lock";
+import {
+  TSurvey,
+  TSurveyCreateInput,
+  TSurveyVariables,
+  ZStoredSurveyVariables,
+  ZSurvey,
+  ZSurveyCreateInput,
+  ZSurveyHiddenFields,
+} from "@formbricks/types/surveys/types";
+import { lockSurveyVisibility } from "@/lib/authzed/survey";
+import {
+  assertLinkableEmbeddedFields,
+  assertWritableEmbeddedFields,
+  getLegacyWriteEmbeddedFields,
+  reconcileEmbeddedData,
+} from "@/lib/embedded-data/reconcile";
 import { selectSurveyEmbeddedDataLinks, withInlinedEmbeddedFields } from "@/lib/embedded-data/survey-fields";
 import { scheduleFeedbackSourceReconciliation } from "@/lib/feedback-source/mapping-reconciliation";
 import {
   getOrganizationByWorkspaceId,
   subscribeOrganizationMembersToSurveyResponses,
 } from "@/lib/organization/service";
+import { fillSurveyBlockCodes } from "@/lib/survey/fill-codes";
+import type { TSurveyCreationFacts } from "@/lib/survey/visibility/creation";
+import { andVisibleSurveys, buildHiddenSurveyWhere } from "@/lib/survey/visibility/predicate";
+import {
+  SURVEY_WRITE_TRANSACTION_OPTIONS,
+  SurveyWriteAfterCommitError,
+  type TSurveyWriteTransaction,
+} from "@/lib/survey/write-transaction";
+import {
+  invalidateCustomCssCaches,
+  parseStoredCustomCss,
+  readCustomCssPayloadSource,
+  resolveCustomCssWriteOrThrow,
+} from "@/modules/custom-css/lib/service";
+import {
+  assertAddedSegmentSurveyFiltersVisible,
+  assertSegmentSurveyFiltersVisible,
+  getAddedSegmentSurveyIds,
+} from "@/modules/ee/contacts/segments/lib/helper";
 import { getSurveyWorkspaceIdMap } from "@/modules/ee/contacts/segments/lib/segments";
+import {
+  assertNoLinkedCreatives,
+  getDestinationSettingTurnedOn,
+} from "@/modules/ee/creatives/lib/linked-creatives";
+import { isAppSurveyBlockedFromPublishing } from "@/modules/ee/creatives/lib/survey-publish";
+import { getIsQuotasEnabled } from "@/modules/ee/license-check/lib/utils";
+import { hasMatrixElement, syncQuotaMatrixConditions } from "@/modules/ee/quotas/lib/quotas";
 import { handleTriggerUpdates } from "@/modules/survey/lib/trigger-updates";
 import {
   isSurveySchedulingDue,
   normalizeSurveyScheduling,
   reconcileDueSurveySchedules,
 } from "@/modules/survey/scheduling/lib/survey-scheduling";
-import { getActionClasses } from "../actionClass/service";
+import { getActionClasses, getActionClassesInTransaction } from "../actionClass/service";
 import { ITEMS_PER_PAGE } from "../constants";
+import { loggableError } from "../utils/loggable-error";
 import { validateInputs } from "../utils/validate";
+import { APP_SURVEY_TRIGGER_REQUIRED_MESSAGE, isAppSurveyMissingTriggersToPublish } from "./publish-rule";
 import {
-  APP_SURVEY_TRIGGER_REQUIRED_MESSAGE,
   checkForInvalidImagesInQuestions,
   checkForInvalidMediaInBlocks,
-  isAppSurveyMissingTriggersToPublish,
   stripIsDraftFromBlocks,
   transformPrismaSurvey,
   validateMediaAndPrepareBlocks,
 } from "./utils";
+import type { TSurveyActorContext } from "./visibility/actor-context";
 
 /**
- * ENG-1839 / ENG-2933: refuse a reserved name, or a name shared by a variable and a hidden field,
- * for newly declared fields — as an `InvalidInputError`, which `handleApiError` maps to a 400
- * carrying this message, and the editor surfaces as a toast. Thrown before any transaction is
- * opened, so a refusal never fails inside an interactive transaction.
+ * ENG-1839 / ENG-2933 / ENG-3142: refuse a reserved name, or a name a hidden field shares with a
+ * variable or an element, for newly declared fields — as an `InvalidInputError`, which
+ * `handleApiError` maps to a 400 carrying this message, and the editor surfaces as a toast. Thrown
+ * before any transaction is opened, so a refusal never fails inside an interactive transaction.
  *
  * Deliberately NOT inside `reconcileEmbeddedData`: that runs in the transaction, and the survey copy
  * flow feeds a whole survey's fields to it as "new" against zero existing rows — guarding there
@@ -71,6 +123,37 @@ const assertValidNewDeclaredFields = (params: {
   }
 };
 
+/**
+ * ENG-3228: the legacy `variables` / `hiddenFields` a payload's `embeddedFields` derive into, refused
+ * as a 400 if they could not be read back.
+ *
+ * Nothing stores them since ENG-2404, but the read seam derives them from the rows on every load and
+ * `ZSurvey` parses what it derived on every save — the editor sends the survey straight back — so a
+ * storage key the client minted badly (a computed field whose key is not a cuid, an ingested one
+ * carrying a space) would persist a survey whose next save fails. Checked here rather than in the
+ * reconcile because this is the *client* boundary: the survey copy feeds the reconcile storage keys
+ * of rows that already exist, including ones the ENG-1835 backfill moved across from columns no
+ * schema ever vetted, and re-judging those would refuse to duplicate a survey that works today.
+ */
+const assertDerivedLegacyColumnsAreStorable = (columns: {
+  variables: unknown;
+  hiddenFields: unknown;
+}): void => {
+  const variables = ZStoredSurveyVariables.safeParse(columns.variables);
+  if (!variables.success) {
+    throw new InvalidInputError(
+      `Embedded data fields cannot be stored as survey variables: ${variables.error.issues[0]?.message}`
+    );
+  }
+
+  const hiddenFields = ZSurveyHiddenFields.safeParse(columns.hiddenFields);
+  if (!hiddenFields.success) {
+    throw new InvalidInputError(
+      `Embedded data fields cannot be stored as hidden fields: ${hiddenFields.error.issues[0]?.message}`
+    );
+  }
+};
+
 export const selectSurvey = {
   id: true,
   createdAt: true,
@@ -79,19 +162,26 @@ export const selectSurvey = {
   type: true,
   workspaceId: true,
   createdBy: true,
+  visibility: true,
+  ownerId: true,
+  visibilityVersion: true,
+  visibilityProjectedVersion: true,
+  visibilityChangedAt: true,
+  visibilityChangedById: true,
   status: true,
   welcomeCard: true,
   questions: true,
   blocks: true,
   endings: true,
-  hiddenFields: true,
-  variables: true,
   displayOption: true,
   recontactDays: true,
   displayLimit: true,
   autoClose: true,
+  keepEndingCardOpen: true,
   delay: true,
   displayPercentage: true,
+  showConditions: true,
+  startLogic: true,
   autoComplete: true,
   publishOn: true,
   closeOn: true,
@@ -108,6 +198,7 @@ export const selectSurvey = {
   singleUse: true,
   pin: true,
   showLanguageSwitch: true,
+  autoSelectLanguage: true,
   recaptcha: true,
   metadata: true,
   customHeadScripts: true,
@@ -161,6 +252,18 @@ export const selectSurvey = {
   embeddedDataLinks: selectSurveyEmbeddedDataLinks,
 } satisfies Prisma.SurveySelect;
 
+/**
+ * `selectSurvey` plus the stored custom CSS (source and compiled output, up to ~40 KB). Kept out of the
+ * generic selector so the respondent hot paths built on `getSurvey` — response and display writes, file
+ * uploads — never load it. The readers that use it select it on purpose: the save paths (this file and
+ * API v3), whose results go back to the editor and to v3 serializers. A survey loaded without the column
+ * has no `customCss` key at all, which every write path reads as "leave the CSS unchanged".
+ */
+export const selectSurveyWithCustomCss = {
+  ...selectSurvey,
+  customCss: true,
+} satisfies Prisma.SurveySelect;
+
 const reconcilePersistedSurveySchedulingIfDue = async ({
   logSource,
   survey,
@@ -192,7 +295,7 @@ const reconcilePersistedSurveySchedulingIfDue = async ({
 
   const reconciledSurvey = await prisma.survey.findUnique({
     where: { id: survey.id },
-    select: selectSurvey,
+    select: selectSurveyWithCustomCss,
   });
 
   if (!reconciledSurvey) {
@@ -202,7 +305,10 @@ const reconcilePersistedSurveySchedulingIfDue = async ({
   return transformPrismaSurvey<TSurvey>(reconciledSurvey);
 };
 
-export const getSurvey = reactCache(async (surveyId: string): Promise<TSurvey | null> => {
+const findSurveyById = async (
+  surveyId: string,
+  select: typeof selectSurvey | typeof selectSurveyWithCustomCss
+): Promise<TSurvey | null> => {
   validateInputs([surveyId, ZId]);
 
   let surveyPrisma;
@@ -211,7 +317,7 @@ export const getSurvey = reactCache(async (surveyId: string): Promise<TSurvey | 
       where: {
         id: surveyId,
       },
-      select: selectSurvey,
+      select,
     });
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
@@ -226,16 +332,72 @@ export const getSurvey = reactCache(async (surveyId: string): Promise<TSurvey | 
   }
 
   return transformPrismaSurvey<TSurvey>(surveyPrisma);
-});
+};
+
+/** A survey without its stored custom CSS — see {@link selectSurveyWithCustomCss}. */
+export const getSurvey = reactCache(
+  async (surveyId: string): Promise<TSurvey | null> => await findSurveyById(surveyId, selectSurvey)
+);
+
+/**
+ * {@link getSurvey} with the stored custom CSS, for the readers that serialize or edit it (API v3). Not for
+ * respondent paths: they receive compiled CSS through the delivery code, never the stored value.
+ */
+export const getSurveyWithCustomCss = reactCache(
+  async (surveyId: string): Promise<TSurvey | null> =>
+    await findSurveyById(surveyId, selectSurveyWithCustomCss)
+);
+
+/**
+ * {@link getSurveyWithCustomCss} for a page of one workspace's surveys, in one query (API v3 list,
+ * `view=full`), each with its owner's display name read in the same snapshot. The caller bounds
+ * `surveyIds` by its page size and passes its visibility clause, so a survey restricted since it was
+ * listed is not read. Ids outside the workspace or that clause, or deleted since, are simply absent; the
+ * result is in no particular order.
+ */
+export const getSurveysWithCustomCssAndOwnerName = async (
+  workspaceId: string,
+  surveyIds: string[],
+  visibleSurveyWhere: Prisma.SurveyWhereInput
+): Promise<Array<{ survey: TSurvey; ownerName: string | null }>> => {
+  validateInputs([workspaceId, ZId], [surveyIds, ZId.array()]);
+  if (surveyIds.length === 0) return [];
+
+  try {
+    const surveysPrisma = await prisma.survey.findMany({
+      where: { id: { in: surveyIds }, workspaceId, ...andVisibleSurveys(visibleSurveyWhere) },
+      select: { ...selectSurveyWithCustomCss, owner: { select: { name: true } } },
+    });
+    return surveysPrisma.map(({ owner, ...surveyPrisma }) => ({
+      survey: transformPrismaSurvey<TSurvey>(surveyPrisma),
+      ownerName: owner?.name ?? null,
+    }));
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      logger.error(loggableError(error), "Error getting surveys by id");
+      throw new DatabaseError(error.message);
+    }
+    throw error;
+  }
+};
 
 export const getSurveysByActionClassId = reactCache(
-  async (actionClassId: string, page?: number): Promise<TSurvey[]> => {
-    validateInputs([actionClassId, ZId], [page, ZOptionalNumber]);
+  async (
+    actionClassId: string,
+    workspaceId: string,
+    /** ENG-3282: the caller's survey-visibility clause. */
+    visibleSurveyWhere: Prisma.SurveyWhereInput,
+    page?: number
+  ): Promise<TSurvey[]> => {
+    validateInputs([actionClassId, ZId], [workspaceId, ZId], [page, ZOptionalNumber]);
 
     let surveysPrisma;
     try {
       surveysPrisma = await prisma.survey.findMany({
         where: {
+          // An action class belongs to one workspace; scope to it rather than trusting the join alone.
+          workspaceId,
+          ...andVisibleSurveys(visibleSurveyWhere),
           triggers: {
             some: {
               actionClass: {
@@ -269,7 +431,13 @@ export const getSurveysByActionClassId = reactCache(
 );
 
 export const getSurveys = reactCache(
-  async (workspaceId: string, limit?: number, offset?: number): Promise<TSurvey[]> => {
+  async (
+    workspaceId: string,
+    /** ENG-3282: the caller's survey-visibility clause; see `lib/survey/visibility/predicate.ts`. */
+    visibleSurveyWhere: Prisma.SurveyWhereInput,
+    limit?: number,
+    offset?: number
+  ): Promise<TSurvey[]> => {
     validateInputs([workspaceId, ZId], [limit, ZOptionalNumber], [offset, ZOptionalNumber]);
 
     try {
@@ -278,6 +446,7 @@ export const getSurveys = reactCache(
           workspaceId,
           // Archived surveys are hidden by default across the app.
           archivedAt: null,
+          ...andVisibleSurveys(visibleSurveyWhere),
         },
         select: selectSurvey,
         orderBy: {
@@ -323,11 +492,154 @@ export const getSurveyCount = reactCache(async (workspaceId: string): Promise<nu
   }
 });
 
+/** The survey's stored custom CSS, read from the row (tenant-scoped by workspace). */
+const getStoredSurveyCustomCss = async (surveyId: string, workspaceId: string) => {
+  const row = await prisma.survey.findUnique({
+    where: { id: surveyId, workspaceId },
+    select: { customCss: true },
+  });
+  if (!row) {
+    throw new ResourceNotFoundError("Survey", surveyId);
+  }
+  return parseStoredCustomCss(row.customCss);
+};
+
+export type TUpdateSurveyOptions = {
+  /**
+   * The acting user's id, charged when the save adds or edits custom CSS — the budget CSS validation
+   * spends, so the editor's save and autosave cannot run the processor outside it.
+   */
+  customCssPrincipal?: string;
+  /**
+   * ENG-6870: who is saving, in survey-visibility terms. An app survey's targeting filters may only add
+   * surveys this actor can see, so a save that adds any fails without it.
+   */
+  targetingActor?: TSurveyActorContext;
+};
+
+/** ENG-7127: what a survey save does with a key of its payload; see `SURVEY_SAVE_KEYS`. */
+type TSurveySaveKeyRole = "column" | "handler" | "derived" | "serverOwned";
+
+/**
+ * ENG-7127: what a survey save does with each key of its payload. The update `data` is built from the
+ * `column` keys and the handlers in `updateSurveyInternal` only, never by spreading the payload: the
+ * draft save's schema used to keep unknown keys, and a spread passed Prisma relation writes
+ * (`workspace`, `creator`, `owner`, `responses`, …) and raw foreign keys (`segmentId`) straight to
+ * `tx.survey.update`, writing rows outside the survey.
+ *
+ * - `column`: copied from the payload as given.
+ * - `handler`: written by its own code, which checks the ids: segment, languages, triggers and
+ *   follow-ups below, Embedded Data through `reconcileEmbeddedData`, custom CSS through the custom CSS
+ *   service (ENG-2949), and `questions`, stripped of `isDraft`.
+ * - `derived`: set by the save itself.
+ * - `serverOwned`: never written by a save. `archivedAt` belongs to archive and restore; the visibility
+ *   facts to the visibility endpoint, under the per-survey lock (ENG-3282).
+ *
+ * Every key of `TSurvey` must be listed, so a new survey field fails to compile until it is given one.
+ */
+const SURVEY_SAVE_KEYS = {
+  name: "column",
+  status: "column",
+  displayOption: "column",
+  autoClose: "column",
+  keepEndingCardOpen: "column",
+  recontactDays: "column",
+  displayLimit: "column",
+  welcomeCard: "column",
+  blocks: "column",
+  endings: "column",
+  delay: "column",
+  autoComplete: "column",
+  workspaceOverwrites: "column",
+  styling: "column",
+  showLanguageSwitch: "column",
+  autoSelectLanguage: "column",
+  surveyClosedMessage: "column",
+  singleUse: "column",
+  isVerifyEmailEnabled: "column",
+  recaptcha: "column",
+  isBackButtonHidden: "column",
+  isAutoProgressingEnabled: "column",
+  isCaptureIpEnabled: "column",
+  isAnonymizeResponsesEnabled: "column",
+  pin: "column",
+  displayPercentage: "column",
+  metadata: "column",
+  slug: "column",
+  customHeadScripts: "column",
+  customHeadScriptsMode: "column",
+  showConditions: "column",
+  startLogic: "column",
+  type: "column",
+  questions: "handler",
+  triggers: "handler",
+  segment: "handler",
+  languages: "handler",
+  followUps: "handler",
+  embeddedFields: "handler",
+  variables: "handler",
+  hiddenFields: "handler",
+  customCss: "handler",
+  updatedAt: "derived",
+  publishOn: "derived",
+  closeOn: "derived",
+  id: "serverOwned",
+  workspaceId: "serverOwned",
+  createdAt: "serverOwned",
+  createdBy: "serverOwned",
+  archivedAt: "serverOwned",
+  visibility: "serverOwned",
+  ownerId: "serverOwned",
+  visibilityVersion: "serverOwned",
+  visibilityProjectedVersion: "serverOwned",
+  visibilityChangedAt: "serverOwned",
+  visibilityChangedById: "serverOwned",
+} as const satisfies Record<keyof TSurvey, TSurveySaveKeyRole>;
+
+type TSurveySaveColumn = {
+  [K in keyof typeof SURVEY_SAVE_KEYS]: (typeof SURVEY_SAVE_KEYS)[K] extends "column" ? K : never;
+}[keyof typeof SURVEY_SAVE_KEYS];
+
+/**
+ * A `column` must be a plain column: a field of the `Survey` row, which has no relations, that
+ * `Prisma.SurveyUpdateInput` also takes, which has no foreign keys. A relation or foreign key marked
+ * `column` fails to compile here.
+ */
+const asSurveyUpdateColumns = <K extends keyof TPrismaSurveyRow & keyof Prisma.SurveyUpdateInput>(
+  columns: K[]
+): readonly K[] => columns;
+
+const SURVEY_SAVE_COLUMNS = asSurveyUpdateColumns<TSurveySaveColumn>(
+  (Object.keys(SURVEY_SAVE_KEYS) as (keyof typeof SURVEY_SAVE_KEYS)[]).filter(
+    (key): key is TSurveySaveColumn => SURVEY_SAVE_KEYS[key] === "column"
+  )
+);
+
+/** ENG-7127: the payload's values for the `column` keys of `SURVEY_SAVE_KEYS`, and nothing else from it. */
+const pickSurveySaveColumns = (survey: TSurvey): Partial<Pick<TSurvey, TSurveySaveColumn>> => {
+  const columns: Partial<Record<TSurveySaveColumn, unknown>> = {};
+  for (const column of SURVEY_SAVE_COLUMNS) {
+    if (Object.hasOwn(survey, column)) columns[column] = survey[column];
+  }
+  return columns as Partial<Pick<TSurvey, TSurveySaveColumn>>;
+};
+
+/** Whether the workspace's organization is licensed for quotas; a workspace with none is not. */
+const getIsQuotasEnabledForWorkspace = async (workspaceId: string): Promise<boolean> => {
+  const organization = await getOrganizationByWorkspaceId(workspaceId);
+  return organization ? getIsQuotasEnabled(organization.id) : false;
+};
+
 export const updateSurveyInternal = async (
   updatedSurvey: TSurvey,
-  skipValidation = false
+  skipValidation = false,
+  options: TUpdateSurveyOptions = {}
 ): Promise<TSurvey> => {
-  if (!skipValidation) {
+  // A legacy write (only `variables` / `hiddenFields`, the v1 PUT) is validated once the stored rows
+  // are read, against the rows it will leave the survey with: logic may set or read a computed date
+  // the legacy keys can't say (ENG-6935).
+  const isLegacyWrite = updatedSurvey.embeddedFields === undefined;
+  if (!skipValidation && !isLegacyWrite) {
     validateInputs([updatedSurvey, ZSurvey]);
   }
 
@@ -341,6 +653,16 @@ export const updateSurveyInternal = async (
       throw new ResourceNotFoundError("Survey", surveyId);
     }
 
+    if (!skipValidation && isLegacyWrite) {
+      validateInputs([
+        {
+          ...updatedSurvey,
+          embeddedFields: getLegacyWriteEmbeddedFields(currentSurvey.embeddedFields ?? [], updatedSurvey),
+        },
+        ZSurvey,
+      ]);
+    }
+
     // Archived surveys are read-only. This covers every write path that flows through here
     // (editor save, the summary status dropdown's server action, etc.) — not just the v3 API.
     // Archive/restore themselves bypass this guard: they write archivedAt directly, not via update.
@@ -348,11 +670,26 @@ export const updateSurveyInternal = async (
       throw new InvalidInputError("This survey is archived. Restore it before editing.");
     }
 
+    // ENG-6783: once published, codes, question types and option text are locked (ADR 0020). The
+    // comparison is against the stored survey, so a client cannot unlock an element by flagging it
+    // `isDraft`. Covers the editor save and v1 PUT; v3 PATCH runs the same function in its own path.
+    if (currentSurvey.status !== "draft") {
+      const lockViolations = getPublishedLockViolations(currentSurvey, updatedSurvey);
+      if (lockViolations.length > 0) {
+        throw new InvalidInputError(describePublishedLockViolations(lockViolations));
+      }
+    }
+
     // ENG-1749: workspaceId and id are the survey's tenant anchors. Always resolve the workspace from
     // the existing survey (never the client payload), and strip workspaceId/id from the update below,
     // so an authorized editor cannot re-point their own survey into another workspace/organization.
     const actionClasses = await getActionClasses(currentSurvey.workspaceId);
 
+    // ENG-7127: only these keys are read from the payload, each by its own handler below; the scalar
+    // columns come from `pickSurveySaveColumns`. Nothing else in the payload reaches the write.
+    // ENG-3228/ENG-2404: Embedded Data reaches the rows through `reconcileEmbeddedData` alone, and
+    // ENG-2949: custom CSS through the shared custom CSS service, so a caller's compiled CSS or
+    // processor version is never stored.
     const {
       triggers,
       segment,
@@ -360,18 +697,32 @@ export const updateSurveyInternal = async (
       languages,
       type,
       followUps,
-      workspaceId: _workspaceId,
-      id: _id,
-      // archivedAt is owned exclusively by the archive/restore flows; never let a survey update touch it.
-      archivedAt: _archivedAt,
-      // ENG-1837: `embeddedFields` is a read-only projection of the EmbeddedData tables, inlined by
-      // the join below. `surveyData` is spread straight into `tx.survey.update`'s `data`, and
-      // `Survey` owns relations named `embeddedData` / `embeddedDataLinks` — so leaving it in would
-      // turn a read projection into a nested relation write. The rows are written by
-      // `reconcileEmbeddedData` from `updatedSurvey`'s legacy keys instead (ENG-2412).
-      embeddedFields: _embeddedFields,
-      ...surveyData
+      embeddedFields,
+      variables,
+      hiddenFields,
+      customCss,
     } = updatedSurvey;
+
+    // **Every Embedded Data refusal, before anything is written.** The segment block below writes
+    // through `prisma`, not through the transaction further down, so a refusal raised later would
+    // roll the survey update back and leave that segment change committed — a save carrying a
+    // segment edit beside an unstorable field would half-apply.
+    //
+    // All four refusals are therefore spent here: the two pure ones, the workspace lookup behind the
+    // shared links, and the derived legacy projection. The reconcile re-runs the first two inside the
+    // transaction, which is what protects its other callers; re-running them is cheap and keeps that
+    // function safe on its own.
+    if (embeddedFields !== undefined) {
+      const declared = linkedToDesiredEmbeddedFields(embeddedFields);
+      assertWritableEmbeddedFields(declared);
+      // Shared entries come back carrying the library's own definition rather than the payload's
+      // claim about it, so the projection checked below is the one the read seam will derive.
+      const desired = await assertLinkableEmbeddedFields(prisma, {
+        workspaceId: currentSurvey.workspaceId,
+        desired: declared,
+      });
+      assertDerivedLegacyColumnsAreStorable(toLegacyEmbeddedFields(desired));
+    }
 
     // ENG-1749 sibling: the segment block below updates/deletes by segment.id directly. Ensure the
     // segment belongs to this survey's workspace so a caller cannot mutate or delete another
@@ -390,9 +741,19 @@ export const updateSurveyInternal = async (
     // validation: `ZSurveyHiddenFields` stays lenient by design (the same schema parses surveys
     // loaded from the database), so without this `PUT /api/v1/management/surveys/<id>` can still
     // create a hidden field named `country` or `lang` that can never receive a value, or a variable
-    // named after an existing hidden field. Grandfathering is what makes it safe: `existing` is
+    // named after an existing hidden field. ENG-3142: nor a hidden field under an element's id, which
+    // the answer always owns in `response.data`. Grandfathering is what makes it safe: `existing` is
     // everything this survey already declares, and any name — or clash — in it passes untouched.
     assertValidNewDeclaredFields({ existing: currentSurvey, incoming: updatedSurvey });
+
+    // A creative's Destination can't be single-use or PIN-protected, so turning either on is refused
+    // (409) while linked creatives open the survey. Checked here, before the segment writes below, and
+    // again in the transaction under the lock a creative write takes to link a survey.
+    const creativeBlockedChange = getDestinationSettingTurnedOn(currentSurvey, updatedSurvey);
+    const linkedCreativesSurvey = { surveyId, workspaceId: currentSurvey.workspaceId };
+    if (creativeBlockedChange) {
+      await assertNoLinkedCreatives(prisma, linkedCreativesSurvey, creativeBlockedChange);
+    }
 
     // ENG-1939/ENG-2115: validation may only be skipped for a draft-to-draft write, so BOTH sides of
     // the transition are gated. The lenient draft schema (ZSurveyDraft) does not validate elements at
@@ -401,9 +762,12 @@ export const updateSurveyInternal = async (
     //   - persisted status (ENG-1939): stops a caller pushing invalid blocks onto a live survey and
     //     silently reverting it to draft, stopping it from collecting responses.
     //   - payload status (ENG-2115): stops a caller publishing a draft that never passed ZSurvey.
-    //     `status` is not destructured out of surveyData below, so it flows straight to the write.
+    //     `status` is one of `SURVEY_SAVE_COLUMNS`, so it flows straight to the write.
     // Deliberately placed after the ENG-1749 tenant guards so a cross-workspace attempt still reports
-    // the authorization failure first, and before prisma.survey.update so nothing is persisted.
+    // the authorization failure first, and before prisma.survey.update so nothing is persisted. The
+    // write repeats the stored-status half of this condition (see `tx.survey.update`): this read is
+    // outside the transaction, so a publish that commits in between is not seen here, and the in-flight
+    // draft save would otherwise revert the published survey to draft.
     if (skipValidation && (currentSurvey.status !== "draft" || updatedSurvey.status !== "draft")) {
       throw new OperationNotAllowedError("Only draft surveys can be updated without validation");
     }
@@ -411,9 +775,17 @@ export const updateSurveyInternal = async (
     if (!skipValidation) {
       checkForInvalidImagesInQuestions(questions);
 
-      // An app survey can never be shown without a trigger, so block publishing (non-draft status)
-      // one with zero triggers. The editor enforces this client-side only; mirror it server-side.
-      if (isAppSurveyMissingTriggersToPublish(type, updatedSurvey.status, triggers)) {
+      // An app survey can never be shown without a trigger or a creative that opens it, so block
+      // publishing (non-draft status) one with neither. The editor runs the same rule before saving.
+      if (
+        await isAppSurveyBlockedFromPublishing({
+          surveyId,
+          workspaceId: currentSurvey.workspaceId,
+          type,
+          status: updatedSurvey.status,
+          triggers,
+        })
+      ) {
         throw new InvalidInputError(APP_SURVEY_TRIGGER_REQUIRED_MESSAGE);
       }
     }
@@ -427,6 +799,32 @@ export const updateSurveyInternal = async (
       }
     }
 
+    // ENG-2949: custom CSS is decided before anything is written — the segment block below writes
+    // outside the transaction, so a refusal raised later would half-apply the save. Full-object payloads
+    // (the editor's save and autosave) are revalidated from source against the stored row: unchanged
+    // source costs no plan check and no processing, removal needs no plan, and an addition or edit needs
+    // the plan, a unit of the custom CSS budget and a clean processor run. Failures keep the stored
+    // revision.
+    const customCssSource = readCustomCssPayloadSource(customCss);
+    const customCssWrite =
+      customCssSource === undefined
+        ? null
+        : await resolveCustomCssWriteOrThrow({
+            scope: "survey",
+            organizationId: async () => {
+              const organization = await getOrganizationByWorkspaceId(currentSurvey.workspaceId);
+              if (!organization) {
+                throw new ResourceNotFoundError("Organization", null);
+              }
+              return organization.id;
+            },
+            // From the row, never from `currentSurvey`: `getSurvey` does not select the column, and a
+            // missing value read as "no CSS" would turn a clear into a no-op.
+            existing: await getStoredSurveyCustomCss(surveyId, currentSurvey.workspaceId),
+            input: customCssSource,
+            principal: options.customCssPrincipal,
+          });
+
     if (languages) {
       // Process languages update logic here
       // Extract currentLanguageIds and updatedLanguageIds
@@ -435,9 +833,9 @@ export const updateSurveyInternal = async (
         : [];
       const updatedLanguageIds =
         languages.length > 0 ? updatedSurvey.languages.map((l) => l.language.id) : [];
-      const enabledLanguageIds = languages.map((language) => {
-        if (language.enabled) return language.language.id;
-      });
+      const enabledLanguageIds = languages
+        .filter((language) => language.enabled)
+        .map((language) => language.language.id);
 
       // Determine languages to add and remove
       const languagesToAdd = updatedLanguageIds.filter((id) => !currentLanguageIds.includes(id));
@@ -468,10 +866,7 @@ export const updateSurveyInternal = async (
 
       // Remove languages no longer associated with the survey
       if (languagesToRemove.length > 0) {
-        data.languages.deleteMany = languagesToRemove.map((languageId) => ({
-          languageId: languageId,
-          enabled: enabledLanguageIds.includes(languageId),
-        }));
+        data.languages.deleteMany = languagesToRemove.map((languageId) => ({ languageId }));
       }
     }
 
@@ -512,6 +907,13 @@ export const updateSurveyInternal = async (
         // this survey's workspace before re-pointing it to the segment (a foreign id would hijack
         // another tenant's survey targeting). Done outside the try below, which masks errors as a
         // generic Error and would otherwise hide this rejection.
+        await assertTargetingAddsNoHiddenSurvey(
+          currentSurvey.workspaceId,
+          currentSurvey.segment?.id,
+          segment,
+          options.targetingActor
+        );
+
         if (segment.surveys && segment.surveys.length > 0) {
           const workspaceBySurveyId = await getSurveyWorkspaceIdMap(segment.surveys);
           if (
@@ -669,64 +1071,127 @@ export const updateSurveyInternal = async (
 
     // Strip isDraft from elements before saving
     if (updatedSurvey.blocks && updatedSurvey.blocks.length > 0) {
-      data.blocks = stripIsDraftFromBlocks(updatedSurvey.blocks);
+      // ENG-6782: an element re-sent without a code (an older client, the v1 API) keeps its stored
+      // code, matched by id; what is still uncoded then gets the next default.
+      data.blocks = fillSurveyBlockCodes(
+        carryOverCodes(currentSurvey.blocks, stripIsDraftFromBlocks(updatedSurvey.blocks)),
+        updatedSurvey
+      );
     }
 
     const normalizedScheduling = normalizeSurveyScheduling({
       currentStatus: currentSurvey.status,
-      closeOn: surveyData.closeOn,
-      publishOn: surveyData.publishOn,
+      closeOn: updatedSurvey.closeOn,
+      publishOn: updatedSurvey.publishOn,
       status: updatedSurvey.status,
     });
 
-    surveyData.updatedAt = new Date();
-    surveyData.publishOn = normalizedScheduling.publishOn;
-    surveyData.closeOn = normalizedScheduling.closeOn;
-
     data = {
-      ...surveyData,
+      ...pickSurveySaveColumns(updatedSurvey),
       ...data,
-      type,
+      updatedAt: new Date(),
+      publishOn: normalizedScheduling.publishOn,
+      closeOn: normalizedScheduling.closeOn,
     };
 
-    delete data.createdBy;
+    if (customCssWrite?.changed) {
+      data.customCss = customCssWrite.stored ?? Prisma.DbNull;
+    }
+
+    // A nullable JSON column takes `Prisma.DbNull`, not `null`, to store "no conditions".
+    if (data.showConditions === null) {
+      data.showConditions = Prisma.DbNull;
+    }
+    if (data.startLogic === null) {
+      data.startLogic = Prisma.DbNull;
+    }
+
+    // ENG-6934: the quotas' matrix conditions follow a row or column reorder only where quotas are
+    // licensed, as every other quota write is. The license is resolved here, outside the transaction.
+    const syncsQuotaMatrix =
+      Array.isArray(data.blocks) &&
+      hasMatrixElement(data.blocks) &&
+      (await getIsQuotasEnabledForWorkspace(currentSurvey.workspaceId));
+
     const persistedSurvey = await prisma.$transaction(
       async (tx) => {
-        const survey = await tx.survey.update({
-          where: { id: surveyId },
-          data,
-          select: selectSurvey,
-        });
+        if (creativeBlockedChange) {
+          await lockSurveyVisibility(tx, surveyId);
+          await assertNoLinkedCreatives(tx, linkedCreativesSurvey, creativeBlockedChange);
+        }
+
+        // Narrow select: what this update returns would describe the survey before the reconcile
+        // below, and the re-read at the end of the transaction is what the caller gets instead.
+        // Scoped by workspace as well as id, per the repo's data-access rule. `Survey.id` is globally
+        // unique and every caller authorizes the workspace before reaching here, so this is the rule
+        // rather than a bypass being closed — the predicate is what keeps that true if a future
+        // caller forgets.
+        //
+        // ENG-1939 at the write: the guard above reads the stored status before the transaction opens,
+        // so a publish committing in between passes it. Under `skipValidation` the payload status is
+        // always "draft", so requiring the same of the row makes this a compare-and-set: the publish
+        // wins and this save matches no row (P2025) instead of reverting it. `archivedAt: null` closes
+        // the same window on the guard's archived check — archiving a draft keeps its status, so the
+        // status predicate alone would still match. That P2025 is the guard's own refusal, not a
+        // database failure — the outer catch would otherwise report a 500. It also covers the row being
+        // deleted in the same window, which shares this refusal because none of the cases match the
+        // predicate. Like `assertNoLinkedCreatives` above, this refusal comes after the segment writes,
+        // which run outside this transaction and stay committed when it fires. Those writes can update
+        // the segment's filters, link the survey to a segment, or disconnect and delete its private
+        // segment on a type change, so a save that loses the race still changes the targeting of a
+        // survey that is now published or archived.
+        try {
+          await tx.survey.update({
+            where: skipValidation
+              ? { id: surveyId, workspaceId: currentSurvey.workspaceId, status: "draft", archivedAt: null }
+              : { id: surveyId, workspaceId: currentSurvey.workspaceId },
+            data,
+            select: { id: true },
+          });
+        } catch (error) {
+          if (
+            skipValidation &&
+            error instanceof Prisma.PrismaClientKnownRequestError &&
+            error.code === PrismaErrorType.RecordNotFound
+          ) {
+            throw new OperationNotAllowedError("Only draft surveys can be updated without validation");
+          }
+
+          throw error;
+        }
+
+        // ENG-6934: the quotas' matrix conditions follow a row or column reorder, as the blocks' do.
+        if (syncsQuotaMatrix) await syncQuotaMatrixConditions(tx, surveyId, data.blocks);
 
         // ENG-1978: write the saved fields into the EmbeddedData tables in the same transaction, so a
-        // survey never commits without them. ENG-2412: from the PAYLOAD, which is what makes the rows
-        // the write source of truth rather than a copy of the columns `data` just wrote. A caller that
-        // omits either key is not saying "delete these" — `reconcileEmbeddedData` carries that group's
-        // current rows over untouched. workspaceId comes from the stored survey for the ENG-1749
-        // reason above — never from the client.
-        //
-        // NOTE (ENG-1837): `survey` was read BEFORE this reconcile, so the `embeddedDataLinks` it
-        // carries — and the `embeddedFields` inlined from them by `transformPrismaSurvey` below —
-        // describe the PRE-reconcile rows. A save that renames or removes a field therefore returns a
-        // non-empty *stale* list. No consumer reads it today: the editor's save action feeds the
-        // return into `setLocalSurvey` / `surveyRef.current` and every editor surface resolves through
-        // `getDeclaredEmbeddedFields` (the cards); the v1 management route strips the key with
-        // `withoutInternalSurveyProjections`; the summary's single-use action discards the value and
-        // refreshes. The one surface that does carry it is the audit log's `newObject`.
-        //
-        // Deliberately NOT re-read here: it would put a second deep `selectSurvey` on the editor-save
-        // hot path for a value nothing consumes. If a future consumer needs it (ENG-1853 pointing a
-        // serializer at the rows), the fix must be a re-read through `selectSurvey` — which preserves
-        // the returned object's key shape. Do not strip or re-derive the key instead: this return
-        // value reaches `survey-menu-bar.tsx`, whose change detection deep-compares it against the
-        // editor's working copy and short-circuits on differing key counts.
+        // survey never commits without them. ENG-2412: from the PAYLOAD — the rows are the only place
+        // Embedded Data is stored (ENG-2404). A caller that omits every key is not saying "delete
+        // these" — `reconcileEmbeddedData` carries the current rows over untouched. ENG-3228:
+        // `embeddedFields`, when the payload carries it, is the complete set for both sources and the
+        // two legacy keys beside it are ignored. workspaceId comes from the stored survey for the
+        // ENG-1749 reason above — never from the client.
         await reconcileEmbeddedData(tx, {
           surveyId,
           workspaceId: currentSurvey.workspaceId,
-          patch: { variables: updatedSurvey.variables, hiddenFields: updatedSurvey.hiddenFields },
+          patch: { variables, hiddenFields, embeddedFields },
         });
 
-        return survey;
+        // Re-read AFTER the reconcile (ENG-3228). `survey` above was selected before the rows moved,
+        // so its `embeddedDataLinks` — and the `embeddedFields` inlined from them by
+        // `transformPrismaSurvey` below — would describe the PRE-reconcile state: a save that renamed
+        // a field would return the old name, and one that created a field would return it without the
+        // `id`, `key`, `locked` and storage key the editor needs to send it back next time. The editor
+        // replaces its local copy from this return, so a stale list is the difference between a second
+        // save that edits a field and one that recreates it.
+        //
+        // The second deep `selectSurvey` is the cost of that, and it has to be a re-read through the
+        // same select rather than a patch of the object in hand: this value reaches
+        // `survey-menu-bar.tsx`, whose change detection deep-compares it against the editor's working
+        // copy and short-circuits on differing key counts, so the key shape must be identical.
+        return tx.survey.findUniqueOrThrow({
+          where: { id: surveyId, workspaceId: currentSurvey.workspaceId },
+          select: selectSurveyWithCustomCss,
+        });
       },
       // Prisma's default interactive-transaction ceiling is 5s, which the write above can plausibly
       // approach on a large survey: it rewrites blocks, follow-ups, triggers and languages, then reads
@@ -743,6 +1208,10 @@ export const updateSurveyInternal = async (
     // mapping. Best-effort: a failure logs inside the helper and never blocks the save.
     await scheduleFeedbackSourceReconciliation(surveyId, currentSurvey.workspaceId, persistedSurvey.blocks);
 
+    if (customCssWrite?.changed) {
+      await invalidateCustomCssCaches(currentSurvey.workspaceId);
+    }
+
     return await reconcilePersistedSurveySchedulingIfDue({
       logSource: "survey-update",
       survey: transformPrismaSurvey<TSurvey>(persistedSurvey),
@@ -758,8 +1227,11 @@ export const updateSurveyInternal = async (
   }
 };
 
-export const updateSurvey = async (updatedSurvey: TSurvey): Promise<TSurvey> => {
-  return updateSurveyInternal(updatedSurvey);
+export const updateSurvey = async (
+  updatedSurvey: TSurvey,
+  options: TUpdateSurveyOptions = {}
+): Promise<TSurvey> => {
+  return updateSurveyInternal(updatedSurvey, false, options);
 };
 
 // Draft update without validation
@@ -784,6 +1256,16 @@ const attachSurveyCreatorToCreateData = (
     },
   };
 };
+
+const attachSurveyCreationFactsToCreateData = (
+  data: Omit<Prisma.SurveyCreateInput, "workspace">,
+  { ownerId, visibility }: TSurveyCreationFacts
+): Omit<Prisma.SurveyCreateInput, "workspace"> => ({
+  ...data,
+  visibility,
+  ownershipInitialized: true,
+  ...(ownerId ? { owner: { connect: { id: ownerId } } } : {}),
+});
 
 const attachSurveyFollowUpsToCreateData = (
   data: Omit<Prisma.SurveyCreateInput, "workspace">,
@@ -826,7 +1308,8 @@ const validateSurveyCreateDataMedia = (
 
 const assertSurveyLanguagesBelongToWorkspace = async (
   workspaceId: string,
-  languages: Array<{ language: { id: string } }> | null | undefined
+  languages: Array<{ language: { id: string } }> | null | undefined,
+  client: Prisma.TransactionClient = prisma
 ): Promise<void> => {
   const languageIds = [...new Set((languages ?? []).map((surveyLanguage) => surveyLanguage.language.id))];
   if (languageIds.length === 0) {
@@ -837,7 +1320,7 @@ const assertSurveyLanguagesBelongToWorkspace = async (
   // caller-supplied language.workspaceId — the survey payload is client-controlled, so an attacker
   // could otherwise claim a foreign language belongs to this workspace. A single batched query
   // avoids a per-language fan-out; an unknown id is absent from the map and thus rejected.
-  const dbLanguages = await prisma.language.findMany({
+  const dbLanguages = await client.language.findMany({
     where: { id: { in: languageIds } },
     select: { id: true, workspaceId: true },
   });
@@ -850,15 +1333,56 @@ const assertSurveyLanguagesBelongToWorkspace = async (
   }
 };
 
+/**
+ * ENG-6870: a survey's responses show who its targeting reached, so a save may only make the targeting
+ * read surveys the saver can see. Editing the survey's own segment answers only for the surveys the edit
+ * adds (`assertAddedSegmentSurveyFiltersVisible`): the ones the stored filters already read stay, so
+ * saving anything else on a survey an administrator targeted keeps working. A save that points the
+ * survey at another segment, or connects more surveys to this one, targets them with the whole tree, so
+ * the whole tree is checked. Without an actor to check against, a save that needs a check fails closed.
+ */
+const assertTargetingAddsNoHiddenSurvey = async (
+  workspaceId: string,
+  currentSegmentId: string | null | undefined,
+  segment: { id?: string | null; filters: TBaseFilters; surveys?: string[] },
+  actor: TSurveyActorContext | undefined
+): Promise<void> => {
+  // An organization owner or manager sees every survey: nothing to look up.
+  if (actor && !buildHiddenSurveyWhere(actor)) return;
+  const stored = segment.id
+    ? await prisma.segment.findUnique({
+        where: { id: segment.id },
+        select: { filters: true, surveys: { select: { id: true } } },
+      })
+    : null;
+  const storedSurveyIds = new Set((stored?.surveys ?? []).map((survey) => survey.id));
+  const editsOwnSegment =
+    !!segment.id &&
+    segment.id === currentSegmentId &&
+    (segment.surveys ?? []).every((surveyId) => storedSurveyIds.has(surveyId));
+  const storedFilters = editsOwnSegment ? ((stored?.filters ?? []) as TBaseFilters) : [];
+  const segmentId = segment.id ?? undefined;
+
+  if (!actor) {
+    const added = await getAddedSegmentSurveyIds(segment.filters, storedFilters, workspaceId, segmentId);
+    if (added.length === 0) return;
+    throw new Error(
+      "Adding a survey to an app survey's targeting needs the acting user or API key (ENG-6870)"
+    );
+  }
+  await assertAddedSegmentSurveyFiltersVisible(segment.filters, storedFilters, workspaceId, actor, segmentId);
+};
+
 const assertSurveySegmentBelongsToWorkspace = async (
   workspaceId: string,
-  segment: { id?: string | null } | null | undefined
+  segment: { id?: string | null } | null | undefined,
+  client: Prisma.TransactionClient = prisma
 ): Promise<void> => {
   if (!segment?.id) {
     return;
   }
 
-  const existingSegment = await prisma.segment.findUnique({
+  const existingSegment = await client.segment.findUnique({
     where: { id: segment.id },
     select: { workspaceId: true },
   });
@@ -868,10 +1392,146 @@ const assertSurveySegmentBelongsToWorkspace = async (
   }
 };
 
+const toDateOrNull = (value: unknown): Date | null => (value instanceof Date ? value : null);
+
+const buildSurveyLanguagesCreateData = (
+  languages: TSurveyCreateInput["languages"]
+): Prisma.SurveyLanguageCreateNestedManyWithoutSurveyInput | undefined => {
+  if (!languages?.length) {
+    return undefined;
+  }
+
+  return {
+    create: languages.map((surveyLanguage) => ({
+      language: {
+        connect: {
+          id: surveyLanguage.language.id,
+        },
+      },
+      default: surveyLanguage.default,
+      enabled: surveyLanguage.enabled,
+    })),
+  };
+};
+
+/**
+ * ENG-3228: same refusal as the update path — the legacy projection the read seam will derive
+ * from these rows has to be one `ZSurvey` can parse, and a shared entry is canonicalized from its
+ * library row first so the projection checked is the one that will actually be derived.
+ * `reconcileEmbeddedData` re-runs the link refusals inside the transaction, doing it up front
+ * turns a bad link into a 400 rather than a rolled-back create.
+ */
+const assertCreateEmbeddedFieldsAreStorable = async (
+  workspaceId: string,
+  embeddedFields: TSurveyCreateInput["embeddedFields"],
+  client: Prisma.TransactionClient = prisma
+): Promise<void> => {
+  if (embeddedFields === undefined) {
+    return;
+  }
+
+  const desired = await assertLinkableEmbeddedFields(client, {
+    workspaceId,
+    desired: linkedToDesiredEmbeddedFields(embeddedFields),
+  });
+  assertDerivedLegacyColumnsAreStorable(toLegacyEmbeddedFields(desired));
+};
+
+/** ENG-6870: a new survey's targeting, connected or seeded, may only read surveys its creator can see. */
+const assertCreateTargetingVisible = async (
+  workspaceId: string,
+  segment: { id?: string | null } | null | undefined,
+  privateSegmentFilters: TBaseFilters,
+  actor: TSurveyActorContext,
+  db: Prisma.TransactionClient | typeof prisma
+): Promise<void> => {
+  if (privateSegmentFilters.length > 0) {
+    await assertSegmentSurveyFiltersVisible(privateSegmentFilters, workspaceId, actor);
+  }
+  if (!segment?.id) return;
+  const connected = await db.segment.findUnique({ where: { id: segment.id }, select: { filters: true } });
+  if (connected) {
+    await assertSegmentSurveyFiltersVisible(
+      connected.filters as TBaseFilters,
+      workspaceId,
+      actor,
+      segment.id
+    );
+  }
+};
+
+/** The private targeting segment an app survey is created with, written in the survey's transaction. */
+const createPrivateSegmentForSurvey = async (
+  tx: Prisma.TransactionClient,
+  { surveyId, workspaceId, filters }: { surveyId: string; workspaceId: string; filters: TBaseFilters }
+): Promise<void> => {
+  const newSegment = await tx.segment.create({
+    data: {
+      title: surveyId,
+      filters,
+      isPrivate: true,
+      workspace: {
+        connect: {
+          id: workspaceId,
+        },
+      },
+    },
+  });
+
+  await tx.survey.update({
+    where: {
+      id: surveyId,
+    },
+    data: {
+      segment: {
+        connect: {
+          id: newSegment.id,
+        },
+      },
+    },
+  });
+};
+
+export type TCreateSurveyOptions = Readonly<{
+  /**
+   * ENG-3282: visibility and owner, from `resolveSurveyCreationFacts` — never from the request body,
+   * whose schema does not carry them. Required so no creation path can forget it.
+   */
+  creationFacts: TSurveyCreationFacts;
+  privateSegmentFilters?: TBaseFilters;
+  /**
+   * ENG-6870: who is creating the survey. Its targeting — `privateSegmentFilters`, or the segment the body
+   * connects — may only read surveys this actor can see. Required so no creation path can forget it.
+   */
+  targetingActor: TSurveyActorContext;
+  /**
+   * ENG-2949: custom CSS already resolved by the shared custom CSS service (plan checked, processed).
+   * `ZSurveyCreateInput` strips `customCss` from the body, so this is the only way a create stores it.
+   */
+  customCss?: TCustomCssStored | null;
+  /**
+   * ENG-6845: a transaction the caller opened, for a create that must land together with the caller's
+   * own writes (an import's References) or not at all. The writes, and the reads of the References the
+   * caller may have created in it, go through it; the work this create runs after its commit waits for
+   * the caller's — see {@link TSurveyWriteTransaction}.
+   * Omitted, the create opens and commits its own transaction, as it always has.
+   */
+  transaction?: TSurveyWriteTransaction;
+}>;
+
+/**
+ * A nullable JSON column's value as Prisma writes it: `null` is stored as SQL NULL (`Prisma.DbNull`).
+ * Not `??`: `undefined` must stay `undefined`, which leaves the column to its default.
+ */
+const toNullableJsonColumn = <T>(value: T | null): T | typeof Prisma.DbNull => {
+  if (value === null) return Prisma.DbNull;
+  return value;
+};
+
 export const createSurvey = async (
   workspaceId: string,
   surveyBody: TSurveyCreateInput,
-  privateSegmentFilters: TBaseFilters = []
+  { creationFacts, privateSegmentFilters = [], customCss, transaction, targetingActor }: TCreateSurveyOptions
 ): Promise<TSurvey> => {
   const [parsedWorkspaceId, parsedSurveyBody] = validateInputs(
     [workspaceId, ZId],
@@ -879,55 +1539,69 @@ export const createSurvey = async (
   );
 
   try {
-    const { createdBy, languages, segment, followUps, styling, ...restSurveyBody } = parsedSurveyBody;
-    await assertSurveyLanguagesBelongToWorkspace(parsedWorkspaceId, languages);
-    await assertSurveySegmentBelongsToWorkspace(parsedWorkspaceId, segment);
+    const {
+      createdBy,
+      languages,
+      segment,
+      followUps,
+      styling,
+      // ENG-3228: accepted input, but never spread into Prisma — `Survey` owns relations named
+      // `embeddedData` / `embeddedDataLinks`, so it would become a nested relation write. It reaches
+      // the database as the rows `reconcileEmbeddedData` writes. ENG-2404: so do the two legacy
+      // keys, which have no column to spread into any more.
+      embeddedFields,
+      variables,
+      hiddenFields,
+      ...restSurveyBody
+    } = parsedSurveyBody;
+    // Under a caller's transaction, the reads below have to see what it already wrote: an import creates
+    // the languages, action classes and shared fields this survey points at in that same transaction.
+    const db = transaction?.tx ?? prisma;
+    await assertSurveyLanguagesBelongToWorkspace(parsedWorkspaceId, languages, db);
+    await assertSurveySegmentBelongsToWorkspace(parsedWorkspaceId, segment, db);
+    await assertCreateTargetingVisible(parsedWorkspaceId, segment, privateSegmentFilters, targetingActor, db);
 
     // ENG-1839: `existing` is empty because a create authors every name fresh — there is nothing to
     // grandfather yet. Covers templates, `POST /api/v1/management/surveys` and the v3 create route.
     // The survey COPY flow does its own `tx.survey.create` and never reaches here, which is what
     // keeps duplicating a survey that already declares `country` working.
-    assertValidNewDeclaredFields({ existing: {}, incoming: restSurveyBody });
+    assertValidNewDeclaredFields({ existing: {}, incoming: parsedSurveyBody });
+
+    await assertCreateEmbeddedFieldsAreStorable(parsedWorkspaceId, embeddedFields, db);
 
     // An app survey can never be shown without a trigger, so block creating one directly in a
-    // non-draft status with zero triggers (mirrors the editor's publish guard).
+    // non-draft status with zero triggers (mirrors the editor's publish guard). No creative can open a
+    // survey that doesn't exist yet.
     if (
-      isAppSurveyMissingTriggersToPublish(
-        restSurveyBody.type ?? "link",
-        restSurveyBody.status ?? "draft",
-        restSurveyBody.triggers
-      )
+      isAppSurveyMissingTriggersToPublish({
+        type: restSurveyBody.type ?? "link",
+        status: restSurveyBody.status ?? "draft",
+        triggers: restSurveyBody.triggers,
+        isOpenedByCreative: false,
+      })
     ) {
       throw new InvalidInputError(APP_SURVEY_TRIGGER_REQUIRED_MESSAGE);
     }
-    const normalizedCloseOn = restSurveyBody.closeOn instanceof Date ? restSurveyBody.closeOn : null;
-    const normalizedPublishOn = restSurveyBody.publishOn instanceof Date ? restSurveyBody.publishOn : null;
-    const surveyLanguagesCreateData: Prisma.SurveyLanguageCreateNestedManyWithoutSurveyInput | undefined =
-      languages?.length
-        ? {
-            create: languages.map((surveyLanguage) => ({
-              language: {
-                connect: {
-                  id: surveyLanguage.language.id,
-                },
-              },
-              default: surveyLanguage.default,
-              enabled: surveyLanguage.enabled,
-            })),
-          }
-        : undefined;
-
-    const actionClasses = await getActionClasses(parsedWorkspaceId);
+    const normalizedCloseOn = toDateOrNull(restSurveyBody.closeOn);
+    const normalizedPublishOn = toDateOrNull(restSurveyBody.publishOn);
+    const actionClasses = transaction
+      ? await getActionClassesInTransaction(transaction.tx, parsedWorkspaceId)
+      : await getActionClasses(parsedWorkspaceId);
 
     const baseData = {
       ...restSurveyBody,
+      ...(restSurveyBody.blocks
+        ? { blocks: fillSurveyBlockCodes(restSurveyBody.blocks, parsedSurveyBody) }
+        : {}),
       styling: styling === null ? Prisma.JsonNull : styling,
+      showConditions: toNullableJsonColumn(restSurveyBody.showConditions),
+      startLogic: toNullableJsonColumn(restSurveyBody.startLogic),
       ...normalizeSurveyScheduling({
         closeOn: normalizedCloseOn,
         publishOn: normalizedPublishOn,
         status: restSurveyBody.status ?? "draft",
       }),
-      languages: surveyLanguagesCreateData,
+      languages: buildSurveyLanguagesCreateData(languages),
       segment: segment?.id ? { connect: { id: segment.id } } : undefined,
       triggers: restSurveyBody.triggers
         ? handleTriggerUpdates(restSurveyBody.triggers, [], actionClasses)
@@ -935,7 +1609,13 @@ export const createSurvey = async (
       attributeFilters: undefined,
     } as Omit<Prisma.SurveyCreateInput, "workspace">;
     const data = validateSurveyCreateDataMedia(
-      attachSurveyFollowUpsToCreateData(attachSurveyCreatorToCreateData(baseData, createdBy), followUps)
+      attachSurveyFollowUpsToCreateData(
+        attachSurveyCreationFactsToCreateData(
+          attachSurveyCreatorToCreateData(baseData, createdBy),
+          creationFacts
+        ),
+        followUps
+      )
     );
 
     const organization = await getOrganizationByWorkspaceId(parsedWorkspaceId);
@@ -946,72 +1626,63 @@ export const createSurvey = async (
     // Create the survey and — for app surveys — its private targeting segment atomically. The survey,
     // the segment (seeded with any caller-supplied filters), and the segment connection must all land
     // or none, so a mid-write failure can't leave a survey with missing or partial targeting.
-    const survey = await prisma.$transaction(
-      async (tx) => {
-        const createdSurvey = await tx.survey.create({
-          data: {
-            ...data,
-            workspace: {
-              connect: {
-                id: parsedWorkspaceId,
-              },
+    const writeSurvey = async (tx: Prisma.TransactionClient) => {
+      const createdSurvey = await tx.survey.create({
+        data: {
+          ...data,
+          ...(customCss ? { customCss } : {}),
+          workspace: {
+            connect: {
+              id: parsedWorkspaceId,
             },
           },
-          select: selectSurvey,
-        });
+        },
+        select: selectSurvey,
+      });
 
-        if (createdSurvey.type === "app") {
-          const newSegment = await tx.segment.create({
-            data: {
-              title: createdSurvey.id,
-              filters: privateSegmentFilters,
-              isPrivate: true,
-              workspace: {
-                connect: {
-                  id: parsedWorkspaceId,
-                },
-              },
-            },
-          });
-
-          await tx.survey.update({
-            where: {
-              id: createdSurvey.id,
-            },
-            data: {
-              segment: {
-                connect: {
-                  id: newSegment.id,
-                },
-              },
-            },
-          });
-        }
-
-        // ENG-1978: a survey created from a template, the API or a duplicate can already carry
-        // variables and hidden fields, so the tables have to be populated at creation, not just on the
-        // next save.
-        await reconcileEmbeddedData(tx, {
+      if (createdSurvey.type === "app") {
+        await createPrivateSegmentForSurvey(tx, {
           surveyId: createdSurvey.id,
           workspaceId: parsedWorkspaceId,
-          patch: { variables: createdSurvey.variables, hiddenFields: createdSurvey.hiddenFields },
+          filters: privateSegmentFilters,
         });
+      }
 
-        // Re-read after the reconcile, not before it. `createdSurvey` was selected before the links
-        // existed, so its `embeddedDataLinks` is empty — and since ENG-2412 removed the legacy
-        // fallback, returning it would report a freshly created survey as having no Embedded Data at
-        // all. Cheap here in a way it would not be on the editor-save path: creation happens once per
-        // survey, and this also picks up the private-segment connect above, which `createdSurvey`
-        // predates.
-        return tx.survey.findUniqueOrThrow({ where: { id: createdSurvey.id }, select: selectSurvey });
-      },
-      // This transaction predates ENG-1978, but the reconcile above adds a read plus two writes per
-      // field inside it, and neither `variables` nor `hiddenFields` is bounded — so a large template or
-      // API create could now reach Prisma's 5s default where it used to fit. Matched to the other
-      // reconcile call sites (enumerated on `getDeclaredEmbeddedFields`) rather than left to inherit
-      // a ceiling this work made easier to hit.
-      { timeout: 20_000, maxWait: 10_000 }
-    );
+      // ENG-1978: a survey created from a template, the API or a duplicate can already carry
+      // variables and hidden fields, so the tables have to be populated at creation, not just on the
+      // next save. From the payload (ENG-2404): the rows are the only thing this create stores
+      // them in. ENG-3228: a payload that declared its fields as rows takes that branch instead.
+      await reconcileEmbeddedData(tx, {
+        surveyId: createdSurvey.id,
+        workspaceId: parsedWorkspaceId,
+        // `validateInputs` types its result as the schema's input, where a variable's `value` is
+        // optional; `ZSurveyCreateInput` has already applied its prefault, so every one is set.
+        patch: { variables: variables as TSurveyVariables | undefined, hiddenFields, embeddedFields },
+      });
+
+      // Re-read after the reconcile, not before it. `createdSurvey` was selected before the links
+      // existed, so its `embeddedDataLinks` is empty — and since ENG-2412 removed the legacy
+      // fallback, returning it would report a freshly created survey as having no Embedded Data at
+      // all. Cheap here in a way it would not be on the editor-save path: creation happens once per
+      // survey, and this also picks up the private-segment connect above, which `createdSurvey`
+      // predates.
+      return tx.survey.findUniqueOrThrow({
+        where: { id: createdSurvey.id },
+        select: selectSurveyWithCustomCss,
+      });
+    };
+
+    const survey = transaction
+      ? await writeSurvey(transaction.tx)
+      : await prisma.$transaction(
+          writeSurvey,
+          // This transaction predates ENG-1978, but the reconcile in it adds a read plus two writes per
+          // field, and neither `variables` nor `hiddenFields` is bounded — so a large template or API
+          // create could now reach Prisma's 5s default where it used to fit. Matched to the other
+          // reconcile call sites (a `reconcileEmbeddedData(` grep enumerates them) rather than left to
+          // inherit a ceiling this work made easier to hit.
+          SURVEY_WRITE_TRANSACTION_OPTIONS
+        );
 
     // TODO: Fix this, this happens because the survey type "web" is no longer in the zod types but its required in the schema for migration
     // @ts-expect-error
@@ -1029,17 +1700,31 @@ export const createSurvey = async (
       }),
     };
 
-    const reconciledSurvey = await reconcilePersistedSurveySchedulingIfDue({
-      logSource: "survey-create",
-      survey: transformedSurvey,
-      workspaceId: parsedWorkspaceId,
-    });
+    const finishAfterCommit = async (): Promise<TSurvey> => {
+      const reconciledSurvey = await reconcilePersistedSurveySchedulingIfDue({
+        logSource: "survey-create",
+        survey: transformedSurvey,
+        workspaceId: parsedWorkspaceId,
+      });
 
-    if (createdBy) {
-      await subscribeOrganizationMembersToSurveyResponses(reconciledSurvey.id, createdBy, organization.id);
+      if (createdBy) {
+        await subscribeOrganizationMembersToSurveyResponses(reconciledSurvey.id, createdBy, organization.id);
+      }
+
+      return reconciledSurvey;
+    };
+
+    if (transaction) {
+      transaction.afterCommit(finishAfterCommit);
+      return transformedSurvey;
     }
 
-    return reconciledSurvey;
+    try {
+      return await finishAfterCommit();
+    } catch (error) {
+      // The survey has committed: a caller must not answer this as nothing created, nor retry it.
+      throw new SurveyWriteAfterCommitError(transformedSurvey, error);
+    }
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
       logger.error(error, "Error creating survey");

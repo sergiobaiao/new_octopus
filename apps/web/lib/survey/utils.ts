@@ -4,36 +4,17 @@ import { InvalidInputError } from "@formbricks/types/errors";
 import { TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import { TSegment } from "@formbricks/types/segment";
 import { IMAGE_FILE_EXTENSIONS } from "@formbricks/types/storage";
+import { sanitizeThemeStyling } from "@formbricks/types/styling-values";
 import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import {
   TSurveyElement,
   TSurveyElementTypeEnum,
   TSurveyPictureChoice,
 } from "@formbricks/types/surveys/elements";
-import {
-  TSurvey,
-  TSurveyQuestion,
-  TSurveyQuestionTypeEnum,
-  TSurveyStatus,
-  TSurveyType,
-} from "@formbricks/types/surveys/types";
+import { TSurvey } from "@formbricks/types/surveys/types";
 import { withInlinedEmbeddedFields } from "@/lib/embedded-data/survey-fields";
 import { isValidVideoUrl } from "@/lib/utils/video-upload";
 import { isValidImageFile } from "@/modules/storage/utils";
-
-/**
- * A live (non-draft) app survey must have at least one trigger, otherwise it can never be displayed
- * ("live but dormant"). The survey editor only enforces this client-side, so every server write path
- * (create + update, including the v3 API) applies this check to keep the API in parity with the UI.
- */
-export const APP_SURVEY_TRIGGER_REQUIRED_MESSAGE =
-  "An app survey must have at least one trigger to be set to a non-draft status.";
-
-export const isAppSurveyMissingTriggersToPublish = (
-  type: TSurveyType,
-  status: TSurveyStatus,
-  triggers: readonly unknown[] | null | undefined
-): boolean => type === "app" && status !== "draft" && (triggers?.length ?? 0) === 0;
 
 /**
  * Actionable hint appended to invalid-image messages. Names the supported formats and explains why
@@ -56,12 +37,17 @@ export const transformPrismaSurvey = <T extends TSurvey | TJsWorkspaceStateSurve
 
   const transformedSurvey = {
     // ENG-1837: swaps the raw `embeddedDataLinks` relation for the inlined `embeddedFields` the read
-    // seam consumes, so the Prisma relation shape never leaks onto TSurvey. A no-op for surveys read
-    // through a select without the join — those fall back to their legacy columns in the accessor.
+    // seam consumes, so the Prisma relation shape never leaks onto TSurvey, and derives the legacy
+    // `variables` / `hiddenFields` from the same rows (ENG-2404). A no-op for surveys read through a
+    // select without the join — those carry no Embedded Data at all.
     ...withInlinedEmbeddedFields(surveyPrisma),
     displayPercentage: Number(surveyPrisma.displayPercentage) || null,
     segment,
     customHeadScriptsMode: surveyPrisma.customHeadScriptsMode,
+    // Theme values are not validated on write (the API accepts any string, ENG-3723), so a stored value
+    // that could add CSS (ENG-2950) is dropped here, before it reaches the editor, its previews or an API
+    // read. The renderer drops the same values, so nothing a respondent sees changes.
+    ...(surveyPrisma.styling && { styling: sanitizeThemeStyling(surveyPrisma.styling) }),
   } as T;
 
   return transformedSurvey;
@@ -76,7 +62,7 @@ export const anySurveyHasFilters = (surveys: TSurvey[]): boolean => {
   });
 };
 
-export const checkForInvalidImagesInQuestions = (questions: TSurveyQuestion[]) => {
+export const checkForInvalidImagesInQuestions = (questions: TSurvey["questions"]) => {
   questions.forEach((question, qIndex) => {
     if (question.imageUrl && !isValidImageFile(question.imageUrl)) {
       throw new InvalidInputError(
@@ -84,7 +70,7 @@ export const checkForInvalidImagesInQuestions = (questions: TSurveyQuestion[]) =
       );
     }
 
-    if (question.type === TSurveyQuestionTypeEnum.PictureSelection) {
+    if (question.type === "pictureSelection") {
       if (!Array.isArray(question.choices)) {
         throw new InvalidInputError(`Choices missing for question ${String(qIndex + 1)}`);
       }

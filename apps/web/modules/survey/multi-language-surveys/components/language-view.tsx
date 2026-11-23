@@ -3,6 +3,7 @@
 import { ArrowUpRight, EllipsisVerticalIcon } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { toast } from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { Language } from "@formbricks/database/prisma-browser";
 import { getLanguageLabel } from "@formbricks/i18n-utils/utils";
@@ -31,21 +32,27 @@ import {
   SelectValue,
 } from "@/modules/ui/components/select";
 import { Switch } from "@/modules/ui/components/switch";
+import { applyAutoSelectLanguageRule } from "../lib/auto-select-language";
+import { hasLockedTranslations } from "../lib/published-translation-lock";
 import {
   computeTranslationProgress,
   extractTranslatableStrings,
   getProgressColor,
   getProgressTextColor,
+  makeLanguageSoleDefault,
+  removeAllTranslations,
   removeLanguageKeysFromSurvey,
 } from "../lib/utils";
 import { ManageTranslationsModal } from "./manage-translations-modal";
 
 interface LanguageViewProps {
-  localSurvey: TSurvey;
-  setLocalSurvey: (survey: TSurvey) => void;
-  workspaceLanguages: Language[];
-  locale: TUserLocale;
-  setHasIncompleteTranslations: (has: boolean) => void;
+  readonly localSurvey: TSurvey;
+  /** The survey as stored: what the published lock compares the translations against. */
+  readonly persistedSurvey: TSurvey;
+  readonly setLocalSurvey: (survey: TSurvey) => void;
+  readonly workspaceLanguages: Language[];
+  readonly locale: TUserLocale;
+  readonly setHasIncompleteTranslations: (has: boolean) => void;
 }
 
 interface ConfirmationModalInfo {
@@ -59,6 +66,7 @@ interface ConfirmationModalInfo {
 
 export const LanguageView = ({
   localSurvey,
+  persistedSurvey,
   setLocalSurvey,
   workspaceLanguages,
   locale,
@@ -145,15 +153,30 @@ export const LanguageView = ({
     setHasIncompleteTranslations(hasIncomplete);
   }, [localSurvey.languages, translatableStrings, isMultiLanguageActivated, setHasIncompleteTranslations]);
 
+  // Every language change made here goes through this, so "Use browser language by default" turns on
+  // when multi-language is first activated and off when it is deactivated (see the rule's docs).
+  const updateLocalSurvey = (updatedSurvey: TSurvey) => {
+    setLocalSurvey(applyAutoSelectLanguageRule(localSurvey, updatedSurvey));
+  };
+
   const updateSurveyTranslations = (survey: TSurvey, updatedLanguages: TSurveyLanguage[]) => {
     const translatedSurveyResult = addMultiLanguageLabels(survey, extractLanguageCodes(updatedLanguages));
     const updatedSurvey = { ...translatedSurveyResult, languages: updatedLanguages };
-    setLocalSurvey(updatedSurvey as TSurvey);
+    updateLocalSurvey(updatedSurvey as TSurvey);
+  };
+
+  // Answers are stored as the option text, so a published survey keeps the translations it already has:
+  // removing a language, or changing the default (which removes them all), would be refused on save.
+  const isRemovalLocked = (languageCode?: string): boolean => {
+    if (!hasLockedTranslations(persistedSurvey, languageCode)) return false;
+    toast.error(t("workspace.surveys.edit.lock_explanation_option_text"));
+    return true;
   };
 
   const handleActivationSwitch = () => {
     if (isMultiLanguageActivated) {
       if (localSurvey.languages.length > 0) {
+        if (isRemovalLocked()) return;
         setConfirmationModalInfo({
           open: true,
           title: t("workspace.surveys.edit.remove_translations"),
@@ -161,14 +184,7 @@ export const LanguageView = ({
           buttonText: t("workspace.surveys.edit.remove_translations"),
           buttonVariant: "destructive",
           onConfirm: () => {
-            // Strip all non-default language keys from the survey data
-            let cleanedSurvey = localSurvey;
-            for (const lang of localSurvey.languages) {
-              if (!lang.default) {
-                cleanedSurvey = removeLanguageKeysFromSurvey(cleanedSurvey, lang.language.code);
-              }
-            }
-            setLocalSurvey({ ...cleanedSurvey, languages: [] });
+            updateLocalSurvey({ ...removeAllTranslations(localSurvey), languages: [] });
             setIsMultiLanguageActivated(false);
             setConfirmationModalInfo((prev) => ({ ...prev, open: false }));
           },
@@ -206,7 +222,7 @@ export const LanguageView = ({
     const cleanedSurvey = removeLanguageKeysFromSurvey(localSurvey, language.code);
 
     setConfirmationModalInfo((prev) => ({ ...prev, open: false }));
-    setLocalSurvey({ ...cleanedSurvey, languages: newLanguages });
+    updateLocalSurvey({ ...cleanedSurvey, languages: newLanguages });
   };
 
   const handleToggleLanguage = (code: string) => {
@@ -221,12 +237,12 @@ export const LanguageView = ({
           const updatedLanguages = localSurvey.languages.map((l) =>
             l.language.code === code ? { ...l, enabled: false } : l
           );
-          setLocalSurvey({ ...localSurvey, languages: updatedLanguages });
+          updateLocalSurvey({ ...localSurvey, languages: updatedLanguages });
         } else {
           // No translations — remove from survey object and clean up i18n keys
           const cleanedSurvey = removeLanguageKeysFromSurvey(localSurvey, code);
           const updatedLanguages = localSurvey.languages.filter((l) => l.language.code !== code);
-          setLocalSurvey({ ...cleanedSurvey, languages: updatedLanguages });
+          updateLocalSurvey({ ...cleanedSurvey, languages: updatedLanguages });
         }
       } else {
         // Re-enabling — ensure i18n keys exist for any new translatable strings
@@ -249,6 +265,7 @@ export const LanguageView = ({
   };
 
   const handleRemoveTranslations = (code: string) => {
+    if (isRemovalLocked(code)) return;
     const label = getLanguageLabel(code, locale) ?? code;
     const progress = computeTranslationProgress(translatableStrings, code);
     const hasTranslations = progress.translated > 0;
@@ -265,38 +282,54 @@ export const LanguageView = ({
         // removed language can never linger and later corrupt the default (ENG-2001).
         const cleanedSurvey = removeLanguageKeysFromSurvey(localSurvey, code);
         const updatedLanguages = localSurvey.languages.filter((l) => l.language.code !== code);
-        setLocalSurvey({ ...cleanedSurvey, languages: updatedLanguages });
+        updateLocalSurvey({ ...cleanedSurvey, languages: updatedLanguages });
+        setConfirmationModalInfo((prev) => ({ ...prev, open: false }));
+      },
+    });
+  };
+
+  // Changing the default means removing every translation first, so both entry points share one
+  // confirmation that says so. From the default row the survey drops back to no languages; from
+  // "Make default" on a language, that language becomes the sole default in the same step.
+  const openChangeDefaultConfirmation = (onConfirm: () => void) => {
+    setConfirmationModalInfo({
+      open: true,
+      title: t("workspace.surveys.edit.change_default"),
+      body: t("workspace.surveys.edit.to_change_the_default_you_need_to_remove_all_translations_first"),
+      buttonText: t("workspace.surveys.edit.remove_and_change_default"),
+      buttonVariant: "destructive",
+      onConfirm: () => {
+        onConfirm();
         setConfirmationModalInfo((prev) => ({ ...prev, open: false }));
       },
     });
   };
 
   const handleChangeDefault = () => {
-    setConfirmationModalInfo({
-      open: true,
-      title: t("workspace.surveys.edit.remove_translations"),
-      body: t("workspace.surveys.edit.this_action_will_remove_all_the_translations_from_this_survey"),
-      buttonText: t("workspace.surveys.edit.remove_translations"),
-      buttonVariant: "destructive",
-      onConfirm: () => {
-        // Actually strip every non-default language's keys from the survey object. Using
-        // updateSurveyTranslations([]) here only re-seeds keys and leaves stale empty code keys
-        // behind, which can later be promoted into a broken default (ENG-2001).
-        let cleanedSurvey = localSurvey;
-        for (const lang of localSurvey.languages) {
-          if (!lang.default) {
-            cleanedSurvey = removeLanguageKeysFromSurvey(cleanedSurvey, lang.language.code);
-          }
-        }
-        setLocalSurvey({ ...cleanedSurvey, languages: [] });
-        setIsMultiLanguageActivated(false);
-        setConfirmationModalInfo((prev) => ({ ...prev, open: false }));
-      },
+    if (isRemovalLocked()) return;
+    openChangeDefaultConfirmation(() => {
+      // Actually strip every non-default language's keys from the survey object. Using
+      // updateSurveyTranslations([]) here only re-seeds keys and leaves stale empty code keys
+      // behind, which can later be promoted into a broken default (ENG-2001).
+      updateLocalSurvey({ ...removeAllTranslations(localSurvey), languages: [] });
+      setIsMultiLanguageActivated(false);
     });
+  };
+
+  const handleMakeDefault = (code: string) => {
+    const language =
+      workspaceLanguages.find((l) => l.code === code) ??
+      localSurvey.languages.find((sl) => sl.language.code === code)?.language;
+    if (!language || isRemovalLocked()) return;
+    openChangeDefaultConfirmation(() => updateLocalSurvey(makeLanguageSoleDefault(localSurvey, language)));
   };
 
   const handleLanguageSwitchToggle = () => {
     setLocalSurvey({ ...localSurvey, showLanguageSwitch: !localSurvey.showLanguageSwitch });
+  };
+
+  const handleAutoSelectLanguageToggle = () => {
+    setLocalSurvey({ ...localSurvey, autoSelectLanguage: !localSurvey.autoSelectLanguage });
   };
 
   const openTranslationModal = (code: string) => {
@@ -409,9 +442,7 @@ export const LanguageView = ({
                           </button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
-                          <DropdownMenuItem
-                            className="text-red-600 focus:text-red-600"
-                            onClick={handleChangeDefault}>
+                          <DropdownMenuItem onClick={handleChangeDefault}>
                             {t("workspace.surveys.edit.change_default")}
                           </DropdownMenuItem>
                         </DropdownMenuContent>
@@ -469,25 +500,30 @@ export const LanguageView = ({
                           <Switch checked={enabled} onCheckedChange={() => handleToggleLanguage(code)} />
                         </td>
                         <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
-                          {inSurvey && (
-                            <DropdownMenu>
-                              <DropdownMenuTrigger asChild>
-                                <button type="button" className="rounded-sm p-1 hover:bg-slate-100">
-                                  <EllipsisVerticalIcon className="size-4 text-slate-500" />
-                                </button>
-                              </DropdownMenuTrigger>
-                              <DropdownMenuContent align="end">
-                                <DropdownMenuItem onClick={() => openTranslationModal(code)}>
-                                  {t("workspace.surveys.edit.manage_translations")}
-                                </DropdownMenuItem>
-                                <DropdownMenuItem
-                                  className="text-red-600 focus:text-red-600"
-                                  onClick={() => handleRemoveTranslations(code)}>
-                                  {t("workspace.surveys.edit.remove_translations")}
-                                </DropdownMenuItem>
-                              </DropdownMenuContent>
-                            </DropdownMenu>
-                          )}
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <button type="button" className="rounded-sm p-1 hover:bg-slate-100">
+                                <EllipsisVerticalIcon className="size-4 text-slate-500" />
+                              </button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem onClick={() => handleMakeDefault(code)}>
+                                {t("workspace.surveys.edit.make_default")}
+                              </DropdownMenuItem>
+                              {inSurvey && (
+                                <>
+                                  <DropdownMenuItem onClick={() => openTranslationModal(code)}>
+                                    {t("workspace.surveys.edit.manage_translations")}
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    className="text-red-600 focus:text-red-600"
+                                    onClick={() => handleRemoveTranslations(code)}>
+                                    {t("workspace.surveys.edit.remove_translations")}
+                                  </DropdownMenuItem>
+                                </>
+                              )}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         </td>
                       </tr>
                     );
@@ -516,6 +552,18 @@ export const LanguageView = ({
             description={t(
               "workspace.surveys.edit.enable_participants_to_switch_the_survey_language_at_any_point_during_the_survey"
             )}
+            childBorder={true}
+          />
+
+          {/* Use browser language by default toggle */}
+          <AdvancedOptionToggle
+            customContainerClass="px-0 pt-0"
+            htmlId="autoSelectLanguage"
+            disabled={enabledLanguages.length <= 1}
+            isChecked={!!localSurvey.autoSelectLanguage}
+            onToggle={handleAutoSelectLanguageToggle}
+            title={t("workspace.surveys.edit.auto_select_browser_language")}
+            description={t("workspace.surveys.edit.auto_select_browser_language_description")}
             childBorder={true}
           />
         </div>
@@ -560,6 +608,7 @@ export const LanguageView = ({
         defaultLanguageName={
           defaultLanguage ? (getLanguageLabel(defaultLanguage.code, locale) ?? defaultLanguage.code) : ""
         }
+        persistedSurvey={persistedSurvey}
         workspaceId={workspaceId}
         isAIAvailable={isAIAvailable}
         aiUnavailableReason={aiUnavailableReason}

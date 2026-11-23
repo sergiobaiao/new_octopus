@@ -8,13 +8,17 @@ export {
   resetLanguageModelCache,
 } from "./provider";
 export {
+  AIOAuthTokenError,
+  type AIOAuthTokenErrorCode,
   AIOutputTokenLimitError,
   type AIOutputTokenLimitErrorDetails,
   type AIProviderErrorInfo,
   classifyAIProviderError,
 } from "./errors";
+/** Exposed so apps/web's startup validation can be checked against the adapter's rule by test. */
+export { isSecureCredentialUrl } from "./shared";
 export { generateText } from "./text";
-export { generateObject } from "./object";
+export { buildSchemaInstructions, generateObject, SCHEMA_INSTRUCTIONS_SEPARATOR } from "./object";
 export { streamObject } from "./stream-object";
 export type { TAIProvider } from "@formbricks/types/ai";
 export type {

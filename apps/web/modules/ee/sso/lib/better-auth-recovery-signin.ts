@@ -5,25 +5,46 @@ import { setSessionCookie } from "better-auth/cookies";
 import { z } from "zod";
 import { prisma } from "@formbricks/database";
 import { logger } from "@formbricks/logger";
-import { WEBAPP_URL } from "@/lib/constants";
+import { EMAIL_AUTH_ENABLED, WEBAPP_URL } from "@/lib/constants";
 import { verifyToken } from "@/lib/jwt";
 import { getValidatedCallbackUrl } from "@/lib/utils/url";
-import { getSsoRecoveryFailureRedirectUrl } from "@/modules/ee/sso/lib/sso-recovery";
+import {
+  SSO_RECOVERY_PROOF_COOKIE_NAME,
+  SSO_RECOVERY_PROOF_COOKIE_OPTIONS,
+  createSsoRecoveryProof,
+  getSsoRecoveryStateIdFromCompletionUrl,
+} from "@/modules/ee/sso/lib/recovery-proof";
+import {
+  getSsoRecoveryFailureRedirectUrl,
+  getSsoRecoverySecondFactorRedirectUrl,
+  getSsoRecoverySecondFactorUnavailableRedirectUrl,
+} from "@/modules/ee/sso/lib/sso-recovery";
 
 /**
  * SSO-recovery magic-link sign-in (ENG-1054, Phase 7) — the Better Auth replacement for the NextAuth
  * `"token"` CredentialsProvider's `sso_recovery` path. Verifies the `sso_recovery` JWT, establishes a
- * Better Auth session, then redirects to the recovery completion route (which verifies identity and
- * links the SSO account — already BA-compatible).
+ * Better Auth session (or, for a verified 2FA account, defers to the login page), then redirects to the
+ * recovery completion route (which verifies identity and links the SSO account — already BA-compatible).
  *
  * Deliberately recovery-SCOPED — not BA's general `magicLink` plugin, which would introduce a new
  * passwordless auth method (out of scope for the like-for-like migration). Live: the `[...all]` handler
  * is mounted and the recovery email points here. Also harness-testable via `auth.api.ssoRecoverySignIn`.
  *
+ * Opening the link also sets the recovery proof cookie (`recovery-proof.ts`, ENG-7310). Completion
+ * requires it, so only the browser that opened the mailed link can finish the recovery.
+ *
  * Failures (invalid/expired token, inactive user) are logged and redirected to the recovery failure
  * page; the security-critical outcome — the account link — is audited by `completeSsoRecovery`, and
- * abuse is bounded by the `/sso-recovery/*` rate limit (auth.ts). The token is replayable until its
- * 1-day expiry, matching the legacy `"token"` provider (not single-use).
+ * abuse is bounded by the `/sso-recovery/*` rate limit (auth.ts). The token is replayable until it
+ * expires (`VERIFICATION_LINK_TTL_SECONDS`), matching the legacy `"token"` provider (not single-use).
+ *
+ * The link proves mailbox access only, so it must not stand in for a second factor (ENG-7266). A user
+ * with a verified email and 2FA gets no session here: they are sent to the login page with the
+ * completion URL as `callbackUrl`, sign in with password + TOTP (or an SSO provider already linked),
+ * and recovery completes from there. Where the instance has credential sign-in off, that page cannot
+ * ask for the factor at all, so the redirect carries an error code naming the dead end instead. Unverified
+ * accounts keep the direct session: completing recovery strips their local factors anyway (ENG-2557),
+ * since the mailbox owner may not be who set them.
  */
 export const ssoRecoverySignInPlugin = {
   id: "sso-recovery",
@@ -42,25 +63,57 @@ export const ssoRecoverySignInPlugin = {
 
         let destination: string | null = null;
         try {
-          const { id, purpose } = await verifyToken(token);
+          const { id, purpose, ssoRecoveryStateId } = await verifyToken(token);
           if (purpose !== "sso_recovery") {
             throw new Error("Token is not an SSO recovery token");
           }
           // isActive is a Formbricks column, not a Better Auth field — check it directly.
-          const dbUser = await prisma.user.findUnique({ where: { id }, select: { isActive: true } });
+          const dbUser = await prisma.user.findUnique({
+            where: { id },
+            select: { isActive: true, emailVerified: true, twoFactorEnabled: true },
+          });
           if (!dbUser || dbUser.isActive === false) {
             throw new Error("User not found or inactive");
           }
-          const user = await ctx.context.internalAdapter.findUserById(id);
-          if (!user) {
-            throw new Error("User not found");
+          // The mailbox is proven here and nowhere else, so this is where the browser that will finish
+          // recovery gets its proof (ENG-7310). Set before either branch: the 2FA one completes too,
+          // in this same browser, after the login page.
+          //
+          // Only for the recovery this token was mailed for: the state is read from the unsigned
+          // `callbackUrl`, so it must match the one signed into the token. A token minted before that
+          // claim existed gets no proof; its holder can only start recovery again for a new link.
+          const stateId = getSsoRecoveryStateIdFromCompletionUrl(callbackUrl, WEBAPP_URL);
+          if (stateId && stateId === ssoRecoveryStateId) {
+            ctx.setCookie(
+              SSO_RECOVERY_PROOF_COOKIE_NAME,
+              createSsoRecoveryProof(id, stateId),
+              SSO_RECOVERY_PROOF_COOKIE_OPTIONS
+            );
           }
-          const session = await ctx.context.internalAdapter.createSession(user.id, false);
-          if (!session) {
-            throw new Error("Failed to create recovery session");
+
+          if (dbUser.emailVerified && dbUser.twoFactorEnabled) {
+            // The login page is only a way through when it can ask for the factor. With credential
+            // sign-in off it renders no form, and the identity that started recovery is unlinked by
+            // definition — so say so instead of looping the user through the provider again.
+            logger.info(
+              { userId: id, emailAuthEnabled: EMAIL_AUTH_ENABLED },
+              "SSO recovery sign-in deferred to login: account has 2FA"
+            );
+            destination = EMAIL_AUTH_ENABLED
+              ? getSsoRecoverySecondFactorRedirectUrl(callbackUrl)
+              : getSsoRecoverySecondFactorUnavailableRedirectUrl(callbackUrl);
+          } else {
+            const user = await ctx.context.internalAdapter.findUserById(id);
+            if (!user) {
+              throw new Error("User not found");
+            }
+            const session = await ctx.context.internalAdapter.createSession(user.id, false);
+            if (!session) {
+              throw new Error("Failed to create recovery session");
+            }
+            await setSessionCookie(ctx, { session, user });
+            destination = getValidatedCallbackUrl(callbackUrl, WEBAPP_URL) ?? WEBAPP_URL;
           }
-          await setSessionCookie(ctx, { session, user });
-          destination = getValidatedCallbackUrl(callbackUrl, WEBAPP_URL) ?? WEBAPP_URL;
         } catch (err) {
           logger.error(err, "SSO recovery sign-in failed");
         }

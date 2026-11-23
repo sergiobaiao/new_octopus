@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TActionClass } from "@formbricks/types/action-classes";
 import { formatDateTimeForDisplay } from "@/lib/utils/datetime";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { ErrorComponent } from "@/modules/ui/components/error-component";
 import { Label } from "@/modules/ui/components/label";
 import { LoadingSpinner } from "@/modules/ui/components/loading-spinner";
@@ -12,7 +12,7 @@ import { getActiveInactiveSurveysAction } from "@/modules/workspaces/settings/(s
 import { ACTION_TYPE_ICON_LOOKUP } from "@/modules/workspaces/settings/(setup)/app-connection/utils";
 
 interface ActivityTabProps {
-  actionClass: TActionClass;
+  readonly actionClass: TActionClass;
 }
 
 export const ActionActivityTab = ({ actionClass }: ActivityTabProps) => {

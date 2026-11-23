@@ -1,7 +1,8 @@
 import "server-only";
 import { oauthProviderResourceClient } from "@better-auth/oauth-provider/resource-client";
 import type { AuthInfo, ServerContext } from "@modelcontextprotocol/server";
-import type { JWTPayload } from "jose";
+import { getJwks } from "better-auth/oauth2";
+import { type JWTPayload, createLocalJWKSet, decodeProtectedHeader } from "jose";
 import type { NextRequest } from "next/server";
 import { prisma } from "@formbricks/database";
 import { logger } from "@formbricks/logger";
@@ -17,11 +18,15 @@ import {
 import type { TV3Authentication } from "@/app/api/v3/lib/types";
 import { withAuthorizationSurface } from "@/lib/authorization/context";
 import { parseApiKeyV2 } from "@/lib/crypto";
+import { hasOnlyDashboardViewerRoles } from "@/lib/membership/dashboard-viewer";
 import { authenticateApiKeyFromHeaders, getBearerTokenFromHeaders } from "@/modules/api/lib/api-key-auth";
 import { auth } from "@/modules/auth/lib/auth";
+import { trimScopesForDashboardViewer } from "@/modules/auth/lib/dashboard-viewer-oauth-scopes";
 import {
   MCP_CHALLENGE_SCOPE,
+  MCP_READ_SCOPES,
   MCP_RESOURCE_SCOPES,
+  MCP_WRITE_SCOPES,
   getAuthIssuerUrl,
   getMcpOAuthJwksUrl,
   getMcpOrigin,
@@ -49,17 +54,6 @@ const JWT_ACCESS_TOKEN_TYPE = "at+jwt";
 
 const oauthResourceClient = oauthProviderResourceClient(auth);
 
-const JWKS_FAILURE_CODES = new Set([
-  "ECONNREFUSED",
-  "ECONNRESET",
-  "ENETUNREACH",
-  "ENOTFOUND",
-  "ETIMEDOUT",
-  "ERR_JWKS_MULTIPLE_MATCHING_KEYS",
-  "ERR_JWKS_NO_MATCHING_KEY",
-  "ERR_JWKS_TIMEOUT",
-]);
-
 const getErrorCode = (error: unknown): string | undefined => {
   if (typeof error !== "object" || error === null || !("code" in error)) {
     return undefined;
@@ -68,23 +62,65 @@ const getErrorCode = (error: unknown): string | undefined => {
   return typeof error.code === "string" ? error.code : undefined;
 };
 
-const getMcpOAuthFailureDetails = (error: unknown) => {
+/**
+ * `failureSource` tells an operator which step failed — `jwks_fetch` means this server could not load
+ * its own signing keys, which is what `MCP_OAUTH_JWKS_URL` fixes. The raw message is never logged.
+ */
+const getMcpOAuthFailureDetails = (error: unknown, failureSource: "jwks_fetch" | "token_verification") => {
   const errorName = error instanceof Error ? error.name : "UnknownError";
   const cause = error instanceof Error ? error.cause : undefined;
   const errorCode = getErrorCode(error) ?? getErrorCode(cause);
-  const failureSource =
-    errorName === "TypeError" || (errorCode !== undefined && JWKS_FAILURE_CODES.has(errorCode))
-      ? "jwks_fetch"
-      : "token_verification";
 
   return { errorCode, errorName, failureSource };
 };
+
+const hasDecodableProtectedHeader = (token: string): boolean => {
+  try {
+    decodeProtectedHeader(token);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Loads the key set before `verifyBearerToken` does, because that call hides every way the load fails:
+ * an endpoint answering non-2xx becomes a bare `Error("Jwks failed: …")`, and an unreachable one (DNS,
+ * refused connection, no hairpin to the public origin) has its `TypeError` swallowed into the same
+ * `no token payload` 401 as a garbage token. `getJwks` is the library's own loader and URL-keyed cache,
+ * so it surfaces the real error, and on success `verifyBearerToken` reads the set cached here instead
+ * of fetching again. `createLocalJWKSet` rejects a 200 that is not a key set (a proxy's login page),
+ * which the library would otherwise cache and trip over later as another swallowed `TypeError`.
+ *
+ * Skipped for a token whose header does not decode: `getJwks` would refuse it before fetching, and
+ * `verifyBearerToken` rejects it anyway.
+ */
+async function loadMcpOAuthJwks(
+  token: string,
+  jwksUrl: string
+): Promise<{ ok: true } | { ok: false; error: unknown }> {
+  if (!hasDecodableProtectedHeader(token)) {
+    return { ok: true };
+  }
+
+  try {
+    createLocalJWKSet(await getJwks(token, { jwksFetch: jwksUrl }));
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
 
 export type TMcpAuthInfo = AuthInfo & {
   extra: {
     formbricksAuthentication: TV3Authentication;
     requestId: string;
     authMethod: "apiKey" | "oauth";
+    /**
+     * Set on an OAuth token whose user holds only the Dashboard viewer role (ADR-0025). Such a token is
+     * trimmed to `dashboards:read`, and the dashboard-bound chart read accepts it on that scope alone.
+     */
+    dashboardViewerOnly?: boolean;
   };
 };
 
@@ -125,19 +161,23 @@ function isOriginAllowed(request: NextRequest): boolean {
   }
 }
 
+/**
+ * Scopes for the API-key path, derived from the key's workspace permissions: every read scope always,
+ * and every write scope once the key holds `write` or `manage` on any workspace.
+ *
+ * Every family is granted, `responses:*` (ENG-2862) and `dashboards:*` (ENG-6581) included, because it
+ * widens nothing: the scope only opens the tool, and the operation behind it still checks the key's
+ * permission on the workspace it names — exactly what the same key gets over REST. The PII argument
+ * that gives responses their own scope is about the **OAuth** path, where a user grants scopes at
+ * consent and a token minted for surveys must not silently carry respondent answers — that is handled
+ * by the scope being separately grantable, not by omitting it here.
+ */
 function getMcpScopes(authentication: TAuthenticationApiKey): string[] {
-  const scopes = new Set(["surveys:read", "workflows:read", "feedbackRecords:read"]);
-  if (
-    authentication.workspacePermissions.some(
-      (permission) => permission.permission === "write" || permission.permission === "manage"
-    )
-  ) {
-    scopes.add("surveys:write");
-    scopes.add("workflows:write");
-    scopes.add("feedbackRecords:write");
-  }
+  const canWrite = authentication.workspacePermissions.some(
+    (permission) => permission.permission === "write" || permission.permission === "manage"
+  );
 
-  return Array.from(scopes);
+  return canWrite ? [...MCP_READ_SCOPES, ...MCP_WRITE_SCOPES] : [...MCP_READ_SCOPES];
 }
 
 function createApiKeyMcpAuthInfo(authentication: TAuthenticationApiKey, requestId: string): TMcpAuthInfo {
@@ -244,13 +284,22 @@ function createOAuthMcpAuthInfo(payload: JWTPayload, requestId: string): TMcpAut
   };
 }
 
-async function isOAuthUserActive(userId: string): Promise<boolean> {
+/**
+ * What every OAuth request needs to know about its user, in one read: whether the user is active, and
+ * whether every membership they hold is the Dashboard viewer role (`hasOnlyDashboardViewerRoles`).
+ */
+async function getOAuthUserStanding(
+  userId: string
+): Promise<{ isActive: boolean; isDashboardViewerOnly: boolean }> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { isActive: true },
+    select: { isActive: true, memberships: { select: { role: true } } },
   });
 
-  return user?.isActive === true;
+  return {
+    isActive: user?.isActive === true,
+    isDashboardViewerOnly: hasOnlyDashboardViewerRoles(user?.memberships ?? []),
+  };
 }
 
 /**
@@ -261,7 +310,13 @@ async function isOAuthUserActive(userId: string): Promise<boolean> {
  * `http` is optional because it is absent on non-HTTP transports. Ours is HTTP-only, so in practice it
  * is always there — but the tools already handle a missing token, so nothing needs to assert it.
  */
-export type TMcpToolContext = Pick<ServerContext, "http">;
+/**
+ * `mcpReq` joins `http` here for the multi-round-trip tools: a confirmation arrives as
+ * `mcpReq.inputResponses` and its sealed state as `mcpReq.requestState()`, neither of which is
+ * reachable through `http`. Still a `Pick` rather than the whole `ServerContext`, so a tool cannot
+ * quietly start driving the server from inside a handler.
+ */
+export type TMcpToolContext = Pick<ServerContext, "http" | "mcpReq">;
 
 /**
  * The single place that knows where the SDK puts verified auth on the handler context. Every tool goes
@@ -432,6 +487,18 @@ async function authenticateMcpOAuthBearer(
   log: ReturnType<typeof logger.withContext>
 ): Promise<TMcpAuthenticationResult> {
   let payload: JWTPayload;
+  const jwksUrl = getMcpOAuthJwksUrl();
+
+  const jwks = await loadMcpOAuthJwks(token, jwksUrl);
+  if (!jwks.ok) {
+    return await rejectUnauthenticatedMcpRequest({
+      requestId,
+      instance,
+      log,
+      logMessage: "MCP OAuth authentication failed",
+      logContext: getMcpOAuthFailureDetails(jwks.error, "jwks_fetch"),
+    });
+  }
 
   try {
     // Renamed from `verifyAccessToken` in Better Auth 1.7 (ENG-2343). `hasAcceptedMcpAudience` below is
@@ -460,7 +527,7 @@ async function authenticateMcpOAuthBearer(
         // purpose is binding token audiences.
         typ: JWT_ACCESS_TOKEN_TYPE,
       },
-      jwksUrl: getMcpOAuthJwksUrl(),
+      jwksUrl,
     });
   } catch (error) {
     return await rejectUnauthenticatedMcpRequest({
@@ -468,7 +535,7 @@ async function authenticateMcpOAuthBearer(
       instance,
       log,
       logMessage: "MCP OAuth authentication failed",
-      logContext: getMcpOAuthFailureDetails(error),
+      logContext: getMcpOAuthFailureDetails(error, "token_verification"),
     });
   }
 
@@ -498,7 +565,8 @@ async function authenticateMcpOAuthBearer(
   }
 
   const sessionAuthentication = authInfo.extra.formbricksAuthentication as Session;
-  if (!(await isOAuthUserActive(sessionAuthentication.user.id))) {
+  const standing = await getOAuthUserStanding(sessionAuthentication.user.id);
+  if (!standing.isActive) {
     return await rejectUnauthenticatedMcpRequest({
       requestId,
       instance,
@@ -506,6 +574,17 @@ async function authenticateMcpOAuthBearer(
       logMessage: "MCP OAuth token user is inactive",
       logContext: { clientId: authInfo.clientId },
     });
+  }
+
+  // ADR-0025: a Dashboard viewer's grant never reaches past `dashboards:read`, whatever the token
+  // carries. Consent already narrows new grants; this bounds a token minted before the user became a
+  // viewer, for the up-to-15 minutes it stays valid, and any grant a revocation missed. Trimming applies
+  // to a user who is a viewer in every organization they belong to. A user who is a viewer in one
+  // organization and holds another role elsewhere keeps their scopes: each operation still asks SpiceDB,
+  // which refuses them everything but dashboard reads in the viewer organization.
+  if (standing.isDashboardViewerOnly) {
+    authInfo.scopes = trimScopesForDashboardViewer(authInfo.scopes);
+    authInfo.extra.dashboardViewerOnly = true;
   }
 
   // Minimum grant required to authenticate against the MCP server at all: at least ONE *resource*
@@ -558,6 +637,11 @@ async function authenticateMcpOAuthBearer(
 export function hasMcpScopes(authInfo: AuthInfo | undefined, requiredScopes: string[]): boolean {
   const scopes = authInfo?.scopes ?? [];
   return requiredScopes.every((scope) => scopes.includes(scope));
+}
+
+/** True for an OAuth token whose user holds only the Dashboard viewer role (set at authentication). */
+export function isMcpDashboardViewerOnly(authInfo: AuthInfo | undefined): boolean {
+  return authInfo?.extra?.dashboardViewerOnly === true;
 }
 
 /** True when the caller holds at least one of `allowedScopes` (any-of, unlike `hasMcpScopes`). */

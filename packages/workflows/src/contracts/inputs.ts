@@ -2,6 +2,7 @@ import { z } from "zod";
 import { ZWorkflowStatus } from "../types/common";
 import { ZWorkflowDefinition } from "../types/document";
 import { ZWorkflowRunStatus } from "../types/runs";
+import { zPostgresText } from "./postgres-text";
 
 /**
  * Route-agnostic operation inputs for the v3 Workflows API. HTTP concerns (the `filter[...]`
@@ -82,8 +83,7 @@ export const ZListWorkflowsInput = z
       .min(1)
       .optional()
       .describe("Parsed form of filter[status][in]. Omitting it returns every status except archived."),
-    nameContains: z
-      .string()
+    nameContains: zPostgresText()
       .min(1)
       .max(512)
       .optional()
@@ -91,6 +91,12 @@ export const ZListWorkflowsInput = z
     sortBy: ZWorkflowSortBy.default("updatedAt").describe(
       "The cursor token is bound to the selected sort order."
     ),
+    includeTotalCount: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Parsed form of includeTotalCount. When true, meta.totalCount is the number of workflows matching the same filters across all pages; otherwise it is null."
+      ),
   })
   .describe("Lists workflow list items for a workspace.");
 export type TListWorkflowsInput = z.infer<typeof ZListWorkflowsInput>;

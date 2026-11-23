@@ -1,5 +1,8 @@
+import * as Appearance from "@/lib/common/appearance";
 import { CommandQueue, CommandType } from "@/lib/common/command-queue";
+import { onDebugEvent } from "@/lib/common/debug";
 import {
+  FORMBRICKS_DEBUG_EVENT,
   type TFormbricksEventName,
   type TFormbricksEventPayloads,
   offFormbricksEvent,
@@ -7,17 +10,30 @@ import {
 } from "@/lib/common/events";
 import * as Setup from "@/lib/common/setup";
 import { getIsDebug } from "@/lib/common/utils";
+import { reconcileCreatives } from "@/lib/creatives/creatives";
 import * as Action from "@/lib/survey/action";
 import { EmbeddedDataStore, type TEmbeddedDataInput } from "@/lib/survey/embedded-data";
 import { checkPageUrl } from "@/lib/survey/no-code-action";
 import * as Attribute from "@/lib/user/attribute";
 import * as User from "@/lib/user/user";
 import { type TConfigInput, type TLegacyConfigInput } from "@/types/config";
+import { type Result, okVoid } from "@/types/error";
 import { type TTrackProperties } from "@/types/survey";
 
 const queue = CommandQueue.getInstance();
 
-const setup = async (setupConfig: TConfigInput): Promise<void> => {
+/** `reconcileCreatives` as a queued command, which must report a result. */
+const redrawCreatives = (): Result<void, never> => {
+  reconcileCreatives();
+  return okVoid();
+};
+
+const setup = async (setupConfigWithAppearance: TConfigInput): Promise<void> => {
+  // Appearance is local, not part of the persisted setup config, and must be in place before the
+  // first survey renders, so it is applied here rather than through the queue.
+  const { appearance, ...setupConfig } = setupConfigWithAppearance;
+  if (appearance !== undefined) setAppearance(appearance);
+
   // If the initConfig has a userId or attributes, we need to use the legacy init
 
   if (
@@ -70,6 +86,9 @@ const setAttributes = async (attributes: Record<string, string>): Promise<void> 
 
 const setLanguage = async (language: string): Promise<void> => {
   await queue.add(Attribute.setAttributes, CommandType.UserAction, true, { language });
+  // Creatives follow the visitor's language (ENG-4003). A general action runs only once the language
+  // update above has landed in the config.
+  await queue.add(redrawCreatives, CommandType.GeneralAction);
 };
 
 const logout = async (): Promise<void> => {
@@ -122,6 +141,9 @@ const clearEmbeddedData = (...args: [] | [key: string]): void => {
  * reality rather than off the `track()` calls it made. The same events, under the same names, go
  * out as `window.dataLayer` pushes for Google Tag Manager.
  *
+ * `formbricks_debug` (debug mode only) explains why each survey did or did not show. It stays off the
+ * dataLayer, and a new subscriber first receives what already happened on the page.
+ *
  * Subscriptions are independent of setup(): registering before or after setup() both work, and a
  * handler stays registered across logout() until it is removed.
  *
@@ -132,7 +154,10 @@ const clearEmbeddedData = (...args: [] | [key: string]): void => {
 const on = <E extends TFormbricksEventName>(
   event: E,
   handler: (payload: TFormbricksEventPayloads[E]) => void
-): (() => void) => onFormbricksEvent(event, handler);
+): (() => void) =>
+  event === FORMBRICKS_DEBUG_EVENT
+    ? onDebugEvent(handler as (payload: TFormbricksEventPayloads[typeof FORMBRICKS_DEBUG_EVENT]) => void)
+    : onFormbricksEvent(event, handler);
 
 /**
  * Remove a subscription registered with on().
@@ -158,6 +183,25 @@ const setNonce = (nonce: string | undefined): void => {
   // Set nonce in surveys package if it's already loaded
 
   globalThis.window.formbricksSurveys?.setNonce?.(nonce);
+
+  // Creatives already on the page redraw with it: a style element without the nonce stays blocked.
+  reconcileCreatives();
+};
+
+/**
+ * Set how surveys and creatives render: "light" (default), "dark", or "system" to follow the browser
+ * setting. Not queued, so it works before setup(), and an open survey or a shown creative switches in place.
+ * @param appearance - "light" | "dark" | "system"
+ */
+const setAppearance = (appearance: Appearance.TAppearance): void => {
+  if (!Appearance.setAppearance(appearance)) {
+    console.warn(
+      `🧱 Formbricks - Warning: Unknown appearance "${String(appearance)}", keeping the current one`
+    );
+    return;
+  }
+  // Creatives follow the survey's appearance (ENG-3998); a no-op before setup.
+  reconcileCreatives();
 };
 
 const formbricks = {
@@ -173,6 +217,7 @@ const formbricks = {
   logout,
   registerRouteChange,
   setNonce,
+  setAppearance,
   setEmbeddedData,
   clearEmbeddedData,
   on,

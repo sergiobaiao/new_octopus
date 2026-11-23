@@ -4,10 +4,14 @@ allOf:
     required:
       - choices
     properties:
+      code:
+        $ref: ./SurveyQuestionCode.yml
       type:
         type: string
         enum:
           - multipleChoiceSingle
+      optionsCopiedFrom:
+        $ref: ./SurveyOptionsCopiedFrom.yml
       choices:
         type: array
         minItems: 2

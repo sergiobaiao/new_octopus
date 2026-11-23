@@ -11,6 +11,7 @@ import { assertCan } from "@/lib/authorization";
 import { capturePostHogEvent } from "@/lib/posthog";
 import { getResponseCountBySurveyId } from "@/lib/response/service";
 import { getSurvey, updateSurvey } from "@/lib/survey/service";
+import { resolveSurveyActorContext } from "@/lib/survey/visibility/actor-context";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
 import { convertToCsv } from "@/lib/utils/file-conversion";
 import { getOrganizationIdFromSurveyId, getWorkspaceIdFromSurveyId } from "@/lib/utils/helper";
@@ -31,13 +32,14 @@ const ZSendEmbedSurveyPreviewEmailAction = z.object({
 export const sendEmbedSurveyPreviewEmailAction = authenticatedActionClient
   .inputSchema(ZSendEmbedSurveyPreviewEmailAction)
   .action(async ({ ctx, parsedInput }) => {
+    // Authorized first, so a forbidden survey and a missing one answer alike (ENG-3282).
+    await assertCan({ type: "user", id: ctx.user.id }, "survey.read", {
+      type: "survey",
+      id: parsedInput.surveyId,
+    });
+
     const organizationId = await getOrganizationIdFromSurveyId(parsedInput.surveyId);
     const organizationLogoUrl = await getOrganizationLogoUrl(organizationId);
-
-    await assertCan({ type: "user", id: ctx.user.id }, "workspace.read", {
-      type: "workspace",
-      id: await getWorkspaceIdFromSurveyId(parsedInput.surveyId),
-    });
 
     const survey = await getSurvey(parsedInput.surveyId);
     if (!survey) {
@@ -50,13 +52,16 @@ export const sendEmbedSurveyPreviewEmailAction = authenticatedActionClient
       .replaceAll("?preview=true&;", "?")
       .replaceAll("?preview=true", "");
 
-    return await sendEmbedSurveyPreviewEmail(
-      ctx.user.email,
-      emailHtml,
-      survey.workspaceId,
-      ctx.user.locale,
-      organizationLogoUrl || ""
-    );
+    return await sendEmbedSurveyPreviewEmail({
+      to: ctx.user.email,
+      innerHtml: emailHtml,
+      workspaceId: survey.workspaceId,
+      locale: ctx.user.locale,
+      actorUserId: ctx.user.id,
+      logoUrl: organizationLogoUrl || "",
+      surveyId: survey.id,
+      organizationId,
+    });
   });
 
 const ZResetSurveyAction = z.object({
@@ -66,13 +71,15 @@ const ZResetSurveyAction = z.object({
 
 export const resetSurveyAction = authenticatedActionClient.inputSchema(ZResetSurveyAction).action(
   withAuditLogging("updated", "survey", async ({ ctx, parsedInput }) => {
-    const organizationId = await getOrganizationIdFromSurveyId(parsedInput.surveyId);
-    const workspaceId = await getWorkspaceIdFromSurveyId(parsedInput.surveyId);
-
-    await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
-      type: "workspace",
-      id: workspaceId,
+    // Reset irreversibly deletes every response and display, so it needs manage access on the survey
+    // rather than the write access that edits it. Checked on the survey, not the workspace, so private
+    // surveys and pending visibility changes stay fail-closed (ENG-3282).
+    await assertCan({ type: "user", id: ctx.user.id }, "survey.manage", {
+      type: "survey",
+      id: parsedInput.surveyId,
     });
+
+    const organizationId = await getOrganizationIdFromSurveyId(parsedInput.surveyId);
 
     ctx.auditLoggingCtx.organizationId = organizationId;
     ctx.auditLoggingCtx.surveyId = parsedInput.surveyId;
@@ -127,9 +134,9 @@ export const generateExampleResponsesAction = authenticatedActionClient
       const organizationId = await getOrganizationIdFromSurveyId(parsedInput.surveyId);
       const workspaceId = await getWorkspaceIdFromSurveyId(parsedInput.surveyId);
 
-      await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
-        type: "workspace",
-        id: workspaceId,
+      await assertCan({ type: "user", id: ctx.user.id }, "survey.write", {
+        type: "survey",
+        id: parsedInput.surveyId,
       });
 
       // Set before the gates below so a rejected or failed attempt is still attributed to the right
@@ -196,9 +203,9 @@ const ZGetEmailHtmlAction = z.object({
 export const getEmailHtmlAction = authenticatedActionClient
   .inputSchema(ZGetEmailHtmlAction)
   .action(async ({ ctx, parsedInput }) => {
-    await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
-      type: "workspace",
-      id: await getWorkspaceIdFromSurveyId(parsedInput.surveyId),
+    await assertCan({ type: "user", id: ctx.user.id }, "survey.write", {
+      type: "survey",
+      id: parsedInput.surveyId,
     });
 
     return await getEmailTemplateHtml(parsedInput.surveyId, ctx.user.locale);
@@ -220,15 +227,16 @@ export const generatePersonalLinksAction = authenticatedActionClient
       throw new OperationNotAllowedError("Contacts are not enabled for this workspace");
     }
 
-    await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
-      type: "workspace",
-      id: workspaceId,
+    await assertCan({ type: "user", id: ctx.user.id }, "survey.write", {
+      type: "survey",
+      id: parsedInput.surveyId,
     });
 
     // Get contacts and generate personal links
     const contactsResult = await generatePersonalLinks(
       parsedInput.surveyId,
       parsedInput.segmentId,
+      await resolveSurveyActorContext({ type: "user", id: ctx.user.id }, organizationId),
       parsedInput.expirationDays
     );
 
@@ -295,9 +303,9 @@ const ZUpdateSingleUseLinksAction = z.object({
 export const updateSingleUseLinksAction = authenticatedActionClient
   .inputSchema(ZUpdateSingleUseLinksAction)
   .action(async ({ ctx, parsedInput }) => {
-    await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
-      type: "workspace",
-      id: await getWorkspaceIdFromSurveyId(parsedInput.surveyId),
+    await assertCan({ type: "user", id: ctx.user.id }, "survey.write", {
+      type: "survey",
+      id: parsedInput.surveyId,
     });
 
     const survey = await getSurvey(parsedInput.surveyId);

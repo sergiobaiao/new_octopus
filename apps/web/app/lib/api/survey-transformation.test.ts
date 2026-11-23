@@ -2,11 +2,16 @@ import { describe, expect, test } from "vitest";
 import { InvalidInputError } from "@formbricks/types/errors";
 import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import { TSurveyCTAElement } from "@formbricks/types/surveys/elements";
-import { TSurveyQuestion, TSurveyQuestionTypeEnum } from "@formbricks/types/surveys/types";
+import {
+  TSurveyQuestion,
+  TSurveyQuestionTypeEnum,
+  ZSurveyLogicAction,
+} from "@formbricks/types/surveys/types";
 import {
   transformBlocksToQuestions,
   transformQuestionsToBlocks,
   validateSurveyInput,
+  withoutInternalSurveyProjections,
 } from "./survey-transformation";
 
 describe("validateSurveyInput", () => {
@@ -100,6 +105,31 @@ describe("transformQuestionsToBlocks", () => {
     expect(blocks).toHaveLength(2);
     expect(blocks[0].name).toBe("Block 1");
     expect(blocks[1].name).toBe("Block 2");
+  });
+
+  test("codes the converted questions and answer options, skipping the names it is given (ENG-6782)", () => {
+    const questions = [
+      { id: "a", type: TSurveyQuestionTypeEnum.OpenText, headline: { default: "A" } },
+      {
+        id: "b",
+        type: TSurveyQuestionTypeEnum.MultipleChoiceSingle,
+        headline: { default: "B" },
+        choices: [
+          { id: "x", label: { default: "X" } },
+          { id: "y", label: { default: "Y" } },
+        ],
+      },
+      { id: "c", type: TSurveyQuestionTypeEnum.OpenText, headline: { default: "C" }, code: "mine" },
+    ] as unknown as TSurveyQuestion[];
+
+    const blocks = transformQuestionsToBlocks(questions, [], ["Q1"]);
+
+    const [a, b, c] = blocks.map((block) => block.elements[0]) as unknown as {
+      code: string;
+      choices?: { code: string }[];
+    }[];
+    expect([a.code, b.code, c.code]).toEqual(["q2", "q3", "mine"]);
+    expect(b.choices?.map((choice) => choice.code)).toEqual(["1", "2"]);
   });
 
   test("should migrate CTA question with external button", () => {
@@ -496,6 +526,52 @@ describe("transformBlocksToQuestions", () => {
     if (action.objective === "jumpToQuestion" || action.objective === "requireAnswer") {
       expect(action.target).toBe("q2");
     }
+  });
+
+  test("keeps a Mark as low quality action, so the v1 questions view round-trips it (ENG-6933)", () => {
+    const blocks = [
+      {
+        id: "b1",
+        name: "Block 1",
+        elements: [
+          {
+            id: "q1",
+            type: "openText",
+            headline: { default: "Hours?" },
+            required: false,
+            inputType: "number",
+          },
+        ],
+        logic: [
+          {
+            id: "l1",
+            conditions: {
+              id: "cg1",
+              connector: "and" as const,
+              conditions: [
+                {
+                  id: "c1",
+                  leftOperand: { value: "q1", type: "element" },
+                  operator: "isGreaterThan",
+                  rightOperand: { type: "static", value: 112 },
+                },
+              ],
+            },
+            actions: [{ id: "a1", objective: "markLowQuality" }],
+          },
+        ],
+      },
+    ] as unknown as TSurveyBlock[];
+
+    const questions = transformBlocksToQuestions(blocks, []);
+
+    expect(questions[0].logic?.[0].actions).toEqual([{ id: "a1", objective: "markLowQuality" }]);
+    expect(
+      ZSurveyLogicAction.safeParse({ id: "clact123456789012345678901", objective: "markLowQuality" }).success
+    ).toBe(true);
+    expect(transformQuestionsToBlocks(questions)[0].logic?.[0].actions).toEqual([
+      { id: "a1", objective: "markLowQuality" },
+    ]);
   });
 
   test("should convert element type to question type in logic conditions", () => {
@@ -1284,6 +1360,13 @@ describe("Edge Cases", () => {
   });
 });
 
+type TCoded = {
+  code: string;
+  choices: { code: string }[];
+  rows: { code: string }[];
+  columns: { code: string }[];
+};
+
 describe("round-trip transformation", () => {
   test("should maintain question structure through round-trip transformation", () => {
     const originalQuestions = [
@@ -1316,6 +1399,42 @@ describe("round-trip transformation", () => {
     expect(transformedQuestions[0].headline).toEqual({ default: "What is your name?" });
     expect(transformedQuestions[0].buttonLabel).toEqual({ default: "Next" });
     expect(transformedQuestions[1].type).toBe("multipleChoiceSingle");
+  });
+
+  test("carries question, answer, row and column codes both ways (ENG-6778)", () => {
+    const originalQuestions = [
+      {
+        id: "q2",
+        code: "age",
+        type: "multipleChoiceSingle",
+        headline: { default: "Choose one" },
+        required: false,
+        choices: [
+          { id: "c1", code: "1", label: { default: "Option 1" } },
+          { id: "c2", code: "2", label: { default: "Option 2" } },
+        ],
+        shuffleOption: "none",
+      },
+      {
+        id: "q3",
+        code: "grid",
+        type: "matrix",
+        headline: { default: "Grid" },
+        required: false,
+        rows: [{ id: "r1", code: "1", label: { default: "Row" } }],
+        columns: [{ id: "k1", code: "9", label: { default: "Col" } }],
+        shuffleOption: "none",
+      },
+    ] as unknown as TSurveyQuestion[];
+
+    const blocks = transformQuestionsToBlocks(originalQuestions, []);
+    expect(blocks[0].elements[0]).toMatchObject({ code: "age" });
+
+    const questions = transformBlocksToQuestions(blocks, []) as unknown as TCoded[];
+    expect(questions[0].code).toBe("age");
+    expect(questions[0].choices.map((choice: { code: string }) => choice.code)).toEqual(["1", "2"]);
+    expect(questions[1].rows[0].code).toBe("1");
+    expect(questions[1].columns[0].code).toBe("9");
   });
 
   test("should maintain logic through round-trip transformation", () => {
@@ -1369,5 +1488,89 @@ describe("round-trip transformation", () => {
     if (action.objective === "jumpToQuestion" || action.objective === "requireAnswer") {
       expect(action.target).toBe("q2");
     }
+  });
+});
+
+describe("signature questions", () => {
+  const signatureQuestion = {
+    id: "sig1",
+    type: TSurveyQuestionTypeEnum.Signature,
+    headline: { default: "Sign here" },
+    required: true,
+    allowTypedSignature: false,
+    buttonLabel: { default: "Next" },
+  } as unknown as TSurveyQuestion;
+
+  test("should carry a legacy signature question into a one-element block and back", () => {
+    const blocks = transformQuestionsToBlocks([signatureQuestion], []);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].elements[0]).toMatchObject({
+      id: "sig1",
+      type: "signature",
+      allowTypedSignature: false,
+    });
+    expect(blocks[0].buttonLabel).toEqual({ default: "Next" });
+
+    const [roundTripped] = transformBlocksToQuestions(blocks, []);
+    expect(roundTripped).toMatchObject({
+      id: "sig1",
+      type: TSurveyQuestionTypeEnum.Signature,
+      headline: { default: "Sign here" },
+      allowTypedSignature: false,
+      buttonLabel: { default: "Next" },
+    });
+  });
+
+  test("should keep an is-signed logic condition on a signature through the round trip", () => {
+    const questions = [
+      {
+        ...signatureQuestion,
+        logic: [
+          {
+            id: "rule1",
+            conditions: {
+              id: "group1",
+              connector: "and",
+              conditions: [
+                {
+                  id: "cond1",
+                  leftOperand: { type: "question", value: "sig1" },
+                  operator: "isSubmitted",
+                },
+              ],
+            },
+            actions: [{ id: "action1", objective: "jumpToQuestion", target: "q2" }],
+          },
+        ],
+      },
+      { id: "q2", type: "openText", headline: { default: "Thanks" }, required: false },
+    ] as unknown as TSurveyQuestion[];
+
+    const blocks = transformQuestionsToBlocks(questions, []);
+    expect(blocks[0].logic?.[0].conditions.conditions[0]).toMatchObject({
+      leftOperand: { type: "element", value: "sig1" },
+      operator: "isSubmitted",
+    });
+
+    const [first] = transformBlocksToQuestions(blocks, []) as unknown as {
+      logic: { conditions: { conditions: unknown[] } }[];
+    }[];
+    expect(first.logic[0].conditions.conditions[0]).toMatchObject({
+      leftOperand: { type: "question", value: "sig1" },
+      operator: "isSubmitted",
+    });
+  });
+});
+
+describe("withoutInternalSurveyProjections", () => {
+  test("keeps stored custom CSS out of the legacy v1 contract (ENG-2949)", () => {
+    const survey = {
+      id: "s1",
+      name: "Survey",
+      customCss: { light: { source: "a{}", compiled: "x" }, dark: null, processorVersion: 1 },
+    };
+
+    expect(withoutInternalSurveyProjections(survey)).toEqual({ id: "s1", name: "Survey" });
   });
 });

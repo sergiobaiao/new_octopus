@@ -10,6 +10,7 @@ import { can } from "@/lib/authorization";
 import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { deleteResponse, getResponse } from "@/lib/response/service";
 import { getSurvey } from "@/lib/survey/service";
+import { RESPONSE_ACTION_FOR_METHOD, canApiKeyReachSurveyResource } from "@/lib/survey/visibility/api-key";
 import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
 import { formatValidationErrorsForV1Api, validateResponseData } from "@/modules/api/lib/validation";
 import { resolveStorageUrlsInObject, validateClientFileUploads } from "@/modules/storage/utils";
@@ -45,6 +46,12 @@ async function fetchAndAuthorizeResponse(
       { type: "apiKey", id: authentication.apiKeyId },
       getWorkspaceAuthorizationActionForMethod(requiredPermission),
       { type: "workspace", id: survey.workspaceId }
+    )) ||
+    // ENG-3282: responses follow their survey; a restricted survey's are out of an API key's reach.
+    !(await canApiKeyReachSurveyResource(
+      authentication.apiKeyId,
+      RESPONSE_ACTION_FOR_METHOD[requiredPermission],
+      { type: "response", id: responseId }
     ))
   ) {
     return { error: responses.unauthorizedResponse() };
@@ -147,9 +154,20 @@ export const PUT = withV1ApiWrapper({
         };
       }
 
+      // Parsed first, so the size caps refuse an oversized body before the validators below walk it.
+      const inputValidation = ZResponseUpdateInput.safeParse(responseUpdate);
+      if (!inputValidation.success) {
+        return {
+          response: responses.badRequestResponse(
+            "Fields are missing or incorrectly formatted",
+            transformErrorToDetails(inputValidation.error)
+          ),
+        };
+      }
+
       if (
         !validateClientFileUploads({
-          data: responseUpdate.data,
+          data: inputValidation.data.data,
           workspaceId: result.survey.workspaceId,
           surveyId: result.survey.id,
           blocks: result.survey.blocks,
@@ -169,8 +187,8 @@ export const PUT = withV1ApiWrapper({
       // Validate response data against validation rules
       const validationErrors = validateResponseData(
         result.survey.blocks,
-        responseUpdate.data,
-        responseUpdate.language ?? "en",
+        inputValidation.data.data,
+        inputValidation.data.language ?? "en",
         result.survey.questions
       );
 
@@ -184,17 +202,11 @@ export const PUT = withV1ApiWrapper({
         };
       }
 
-      const inputValidation = ZResponseUpdateInput.safeParse(responseUpdate);
-      if (!inputValidation.success) {
-        return {
-          response: responses.badRequestResponse(
-            "Fields are missing or incorrectly formatted",
-            transformErrorToDetails(inputValidation.error)
-          ),
-        };
-      }
-
-      const updated = await updateResponseWithQuotaEvaluation(params.responseId, inputValidation.data);
+      const updated = await updateResponseWithQuotaEvaluation(
+        params.responseId,
+        result.survey.id,
+        inputValidation.data
+      );
       if (auditLog) {
         auditLog.newObject = updated;
       }

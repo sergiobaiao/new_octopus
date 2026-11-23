@@ -5,12 +5,8 @@ import { ZId } from "@formbricks/types/common";
 import { assertOrganizationAIConfigured, getOrganizationAIConfig } from "@/lib/ai/service";
 import { assertCan } from "@/lib/authorization";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
-import {
-  getOrganizationIdFromSurveyId,
-  getOrganizationIdFromWorkspaceId,
-  getWorkspaceIdFromSurveyId,
-} from "@/lib/utils/helper";
-import { ZAITranslationField, translateFields } from "./translate-fields";
+import { getOrganizationIdFromSurveyId, getOrganizationIdFromWorkspaceId } from "@/lib/utils/helper";
+import { ZAITranslationFields, translateFields } from "./translate-fields";
 
 const ZCheckAITranslationAvailableAction = z.object({
   surveyId: ZId,
@@ -20,9 +16,9 @@ export const checkAITranslationAvailableAction = authenticatedActionClient
   .inputSchema(ZCheckAITranslationAvailableAction)
   .action(async ({ ctx, parsedInput }) => {
     const organizationId = await getOrganizationIdFromSurveyId(parsedInput.surveyId);
-    await assertCan({ type: "user", id: ctx.user.id }, "workspace.read", {
-      type: "workspace",
-      id: await getWorkspaceIdFromSurveyId(parsedInput.surveyId),
+    await assertCan({ type: "user", id: ctx.user.id }, "survey.read", {
+      type: "survey",
+      id: parsedInput.surveyId,
     });
 
     const aiConfig = await getOrganizationAIConfig(organizationId);
@@ -44,7 +40,7 @@ export const checkAITranslationAvailableAction = authenticatedActionClient
 
 const ZTranslateSurveyFieldsAction = z.object({
   workspaceId: ZId,
-  fields: z.array(ZAITranslationField).min(1),
+  fields: ZAITranslationFields,
   sourceLanguage: z.string().min(1),
   targetLanguage: z.string().min(1),
 });
@@ -61,7 +57,7 @@ export const translateSurveyFieldsAction = authenticatedActionClient
 
     await assertOrganizationAIConfigured(organizationId);
 
-    const translations = await translateFields({
+    const outcome = await translateFields({
       organizationId,
       workspaceId: parsedInput.workspaceId,
       userId: ctx.user.id,
@@ -70,5 +66,5 @@ export const translateSurveyFieldsAction = authenticatedActionClient
       targetLanguage: parsedInput.targetLanguage,
     });
 
-    return { translations };
+    return outcome;
   });

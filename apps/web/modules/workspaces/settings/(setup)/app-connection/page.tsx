@@ -1,5 +1,3 @@
-"use server";
-
 import Link from "next/link";
 import { WidgetStatusIndicator } from "@/app/(app)/workspaces/[workspaceId]/components/WidgetStatusIndicator";
 import { SettingsCard } from "@/app/(app)/workspaces/[workspaceId]/settings/components/SettingsCard";
@@ -14,7 +12,11 @@ import { PageHeader } from "@/modules/ui/components/page-header";
 import { getWorkspaceAuth } from "@/modules/workspaces/lib/utils";
 import { InstallMethodCards } from "./components/install-method-cards";
 
-export const AppConnectionPage = async ({ params }: { params: Promise<{ workspaceId: string }> }) => {
+export const AppConnectionPage = async ({
+  params,
+}: {
+  readonly params: Promise<{ workspaceId: string }>;
+}) => {
   const t = await getTranslate();
   const { workspaceId } = await params;
   const workspaceIdMigrationUrl =
@@ -43,7 +45,7 @@ Paste this snippet into your <head> on every page:
   !function(){
       var appUrl = "${WEBAPP_URL}";
       var workspaceId = "${workspace.id}";
-  var t=document.createElement("script");t.type="text/javascript",t.async=!0,t.src=appUrl+"/js/formbricks.umd.cjs";var e=document.getElementsByTagName("script")[0];e.parentNode.insertBefore(t,e),setTimeout(function(){window.formbricks.setup({workspaceId: workspaceId, appUrl: appUrl})},500)}();
+  var t=document.createElement("script");t.type="text/javascript",t.async=!0,t.src=appUrl+"/js/formbricks.umd.cjs";t.onload=function(){window.formbricks.setup({workspaceId: workspaceId, appUrl: appUrl})};var e=document.getElementsByTagName("script")[0];e.parentNode.insertBefore(t,e)}();
   </script>
   <!-- END Formbricks Surveys -->
 
@@ -175,7 +177,7 @@ To debug, add ?formbricksDebug=true to your app URL and check the browser consol
 !function(){
     var appUrl = "${WEBAPP_URL}";
     var workspaceId = "${workspace.id}";
-var t=document.createElement("script");t.type="text/javascript",t.async=!0,t.src=appUrl+"/js/formbricks.umd.cjs";var e=document.getElementsByTagName("script")[0];e.parentNode.insertBefore(t,e),setTimeout(function(){window.formbricks.setup({workspaceId: workspaceId, appUrl: appUrl})},500)}();
+var t=document.createElement("script");t.type="text/javascript",t.async=!0,t.src=appUrl+"/js/formbricks.umd.cjs";t.onload=function(){window.formbricks.setup({workspaceId: workspaceId, appUrl: appUrl})};var e=document.getElementsByTagName("script")[0];e.parentNode.insertBefore(t,e)}();
 </script>
 <!-- END Formbricks Surveys -->`;
 

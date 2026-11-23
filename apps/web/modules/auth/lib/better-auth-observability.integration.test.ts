@@ -1,4 +1,3 @@
-import { createLocalAccountIssuer } from "@better-auth/core/db";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
 import { resetDb } from "@/integration/reset-db";
@@ -21,15 +20,15 @@ vi.mock("@/modules/auth/lib/utils", async (importOriginal) => {
 
 /**
  * Integration coverage for the Phase 7 observability parity (ENG-1054) against real Postgres: a
- * successful Better Auth sign-in emits the same `signedIn` audit event the NextAuth route did, via the
- * session.create.after database hook (better-auth-observability.ts).
+ * successful Better Auth sign-in emits the same `signedIn` audit event the NextAuth route did, via
+ * `signInAuditPlugin` (better-auth-observability.ts).
  */
 beforeEach(async () => {
   await resetDb();
   vi.clearAllMocks();
 });
 
-describe("Observability — signedIn audit on session creation (real Postgres)", () => {
+describe("Observability — signedIn audit on a completed sign-in (real Postgres)", () => {
   test("a successful password sign-in emits a signedIn success audit event", async () => {
     const password = "Observe-Me1!";
     const user = await prisma.user.create({
@@ -47,9 +46,6 @@ describe("Observability — signedIn audit on session creation (real Postgres)",
         provider: "credential",
         providerAccountId: user.id,
         password: user.password!,
-        // Represents an already-migrated existing account (ENG-2343); sign-in's findCredentialAccount
-        // filters on this.
-        issuer: createLocalAccountIssuer("credential"),
       },
     });
 
@@ -89,9 +85,6 @@ describe("Observability — failed-login audit on a rejected sign-in (real Postg
         provider: "credential",
         providerAccountId: user.id,
         password: user.password!,
-        // Represents an already-migrated existing account (ENG-2343); sign-in's findCredentialAccount
-        // filters on this.
-        issuer: createLocalAccountIssuer("credential"),
       },
     });
 

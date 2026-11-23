@@ -1,7 +1,11 @@
-import { type TIngestFlag } from "@formbricks/types/embedded-data-ingest";
-import { RESPONSE_ALREADY_FINISHED_ERROR_CODE, ResourceNotFoundError } from "@formbricks/types/errors";
-import { TResponse, TResponseUpdateInput } from "@formbricks/types/responses";
+import {
+  RESPONSE_ALREADY_FINISHED_ERROR_CODE,
+  ResourceNotFoundError,
+  ResponseAlreadyFinishedError,
+} from "@formbricks/types/errors";
+import { TClientResponseUpdateInput, TResponse } from "@formbricks/types/responses";
 import { TSurveyElement } from "@formbricks/types/surveys/elements";
+import { TResponseNotShown } from "@formbricks/types/surveys/not-shown";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { type ApiErrorResult, handleApiError } from "@/app/lib/api/handle-api-error";
 import { responses } from "@/app/lib/api/response";
@@ -17,13 +21,14 @@ import { createQuotaFullObject } from "@/modules/ee/quotas/lib/helpers";
 import { validateClientFileUploads } from "@/modules/storage/utils";
 import { verifyLinkSurveyPinToken } from "@/modules/survey/link/lib/pin-token";
 import { VERIFIED_EMAIL_RESPONSE_KEY } from "@/modules/survey/link/lib/verify-email-gate";
-import { updateResponseWithQuotaEvaluation } from "./response";
+import { getStoredResponseNotShown, updateResponseWithQuotaEvaluation } from "./response";
 import { getValidatedResponseUpdateInput } from "./validated-response-update-input";
 
 type TRouteResult = ApiErrorResult;
 
 type TExistingResponseResult = { existingResponse: TResponse } | TRouteResult;
 type TSurveyResult = { survey: TSurvey } | TRouteResult;
+type TNotShownResult = { notShown: TResponseNotShown | null } | TRouteResult;
 type TUpdatedResponseResult =
   | { updatedResponse: Awaited<ReturnType<typeof updateResponseWithQuotaEvaluation>> }
   | TRouteResult;
@@ -44,10 +49,21 @@ const handleDatabaseError = (error: unknown, responseId: string): TRouteResult =
   return handleApiError(error, { cors: true });
 };
 
+// The SDK's response queue keys off `details.code` to stop retrying, so both places that refuse a finished
+// response answer the same way.
+const responseAlreadyFinished = (): TRouteResult => ({
+  response: responses.badRequestResponse(
+    "Response is already finished",
+    { code: RESPONSE_ALREADY_FINISHED_ERROR_CODE },
+    true
+  ),
+});
+
 const validateResponse = (
   response: TResponse,
   survey: TSurvey,
-  responseUpdateInput: TResponseUpdateInput
+  responseUpdateInput: TClientResponseUpdateInput,
+  notShown: TResponseNotShown | null
 ) => {
   const mergedData = {
     ...response.data,
@@ -58,7 +74,8 @@ const validateResponse = (
     survey.blocks,
     mergedData,
     responseUpdateInput.language ?? response.language ?? "en",
-    survey.questions
+    survey.questions,
+    notShown
   );
 
   if (validationErrors) {
@@ -84,6 +101,22 @@ const getExistingResponse = async (responseId: string): Promise<TExistingRespons
   }
 };
 
+/**
+ * The not-shown record the update leaves on the response, for validation (ENG-7332). The survey sends
+ * its whole record with every update; an update without one keeps the stored record (ENG-6936).
+ */
+const getNotShownForValidation = async (
+  responseId: string,
+  responseUpdateInput: TClientResponseUpdateInput
+): Promise<TNotShownResult> => {
+  if (responseUpdateInput.notShown !== undefined) return { notShown: responseUpdateInput.notShown };
+  try {
+    return { notShown: await getStoredResponseNotShown(responseId) };
+  } catch (error) {
+    return handleDatabaseError(error, responseId);
+  }
+};
+
 const getSurveyForResponse = async (responseId: string, surveyId: string): Promise<TSurveyResult> => {
   try {
     const survey = await getSurvey(surveyId);
@@ -97,8 +130,9 @@ const getSurveyForResponse = async (responseId: string, surveyId: string): Promi
 const validateUpdateRequest = (
   existingResponse: TResponse,
   survey: TSurvey,
-  responseUpdateInput: TResponseUpdateInput,
-  workspaceId: string
+  responseUpdateInput: TClientResponseUpdateInput,
+  workspaceId: string,
+  notShown: TResponseNotShown | null
 ): TRouteResult | undefined => {
   // Mirror the POST endpoint: a closed survey accepts no submissions, including finalizing a partial
   // response created while it was open (ENG-1654).
@@ -110,14 +144,10 @@ const validateUpdateRequest = (
     };
   }
 
+  // A cheap early exit only: the authoritative check runs under the row lock in
+  // updateResponseWithQuotaEvaluation, since the response can be finished after this read.
   if (existingResponse.finished) {
-    return {
-      response: responses.badRequestResponse(
-        "Response is already finished",
-        { code: RESPONSE_ALREADY_FINISHED_ERROR_CODE },
-        true
-      ),
-    };
+    return responseAlreadyFinished();
   }
 
   if (
@@ -152,24 +182,22 @@ const validateUpdateRequest = (
     };
   }
 
-  return validateResponse(existingResponse, survey, responseUpdateInput);
+  return validateResponse(existingResponse, survey, responseUpdateInput, notShown);
 };
 
 const getUpdatedResponse = async (
-  responseId: string,
-  responseUpdateInput: TResponseUpdateInput,
-  ingestFlags: readonly TIngestFlag[]
+  update: Parameters<typeof updateResponseWithQuotaEvaluation>[0]
 ): Promise<TUpdatedResponseResult> => {
+  const { responseId } = update;
   try {
-    const updatedResponse = await updateResponseWithQuotaEvaluation(
-      responseId,
-      responseUpdateInput,
-      ingestFlags
-    );
+    const updatedResponse = await updateResponseWithQuotaEvaluation(update);
     return { updatedResponse };
   } catch (error) {
     if (error instanceof ResourceNotFoundError) {
       return { response: responses.notFoundResponse("Response", responseId, true) };
+    }
+    if (error instanceof ResponseAlreadyFinishedError) {
+      return responseAlreadyFinished();
     }
     return handleApiError(error, { cors: true });
   }
@@ -248,12 +276,30 @@ export const putResponseHandler = async ({
     responseUpdateInput.data = ingestResult.data;
   }
 
-  const validationResult = validateUpdateRequest(existingResponse, survey, responseUpdateInput, workspaceId);
+  const notShownResult = await getNotShownForValidation(responseId, responseUpdateInput);
+  if ("response" in notShownResult) {
+    return notShownResult;
+  }
+
+  const validationResult = validateUpdateRequest(
+    existingResponse,
+    survey,
+    responseUpdateInput,
+    workspaceId,
+    notShownResult.notShown
+  );
   if (validationResult) {
     return validationResult;
   }
 
-  const updatedResponseResult = await getUpdatedResponse(responseId, responseUpdateInput, ingestResult.flags);
+  // `survey` was loaded from the stored response's surveyId, never from the request body.
+  const updatedResponseResult = await getUpdatedResponse({
+    responseId,
+    workspaceId,
+    surveyId: survey.id,
+    responseInput: responseUpdateInput,
+    ingestFlags: ingestResult.flags,
+  });
   if ("response" in updatedResponseResult) {
     return updatedResponseResult;
   }
@@ -268,6 +314,8 @@ export const putResponseHandler = async ({
     response: responseData,
   });
 
+  // The update ran on a locked, unfinished row, so `finished` here is this request's own transition: the
+  // finish event fires once per response, never again for a later write.
   if (updatedResponse.finished) {
     await sendToPipeline({
       event: "responseFinished",

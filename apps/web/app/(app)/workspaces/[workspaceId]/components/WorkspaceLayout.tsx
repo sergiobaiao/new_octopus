@@ -1,27 +1,31 @@
-import { cookies } from "next/headers";
+import type { cookies } from "next/headers";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
 import { MainNavigation } from "@/app/(app)/workspaces/[workspaceId]/components/MainNavigation";
 import { TopControlBar } from "@/app/(app)/workspaces/[workspaceId]/components/TopControlBar";
 import { IS_DEVELOPMENT, IS_FORMBRICKS_CLOUD, IS_FORMBRICKS_SURVEYS_CONFIGURED } from "@/lib/constants";
-import { getPublicDomain } from "@/lib/getPublicUrl";
 import { getAccessFlags } from "@/lib/membership/utils";
-import { getPostHogFeatureFlag } from "@/lib/posthog/get-feature-flag";
 import { getTrialDaysRemaining } from "@/lib/trial-countdown";
 import { getTranslate } from "@/lingodotdev/server";
 import { TrialEndingWarningModal } from "@/modules/ee/billing/components/trial-ending-warning-modal";
 import { TrialResponseWarningModal } from "@/modules/ee/billing/components/trial-response-warning-modal";
+import { CreativesAccessProvider } from "@/modules/ee/creatives/components/creatives-access-provider";
+import { getCreativesAccess } from "@/modules/ee/creatives/lib/access";
+import { isCreativesVisible } from "@/modules/ee/creatives/lib/access-rules";
 import { getPendingDowngradeSchedule } from "@/modules/ee/license-check/lib/license";
 import { getOrganizationWorkspacesLimit } from "@/modules/ee/license-check/lib/utils";
 import { LimitsReachedBanner } from "@/modules/ui/components/limits-reached-banner";
 import { PendingDowngradeBanner } from "@/modules/ui/components/pending-downgrade-banner";
 import { TWorkspaceLayoutData } from "@/modules/workspaces/types/workspace-auth";
 
-interface WorkspaceLayoutProps {
-  layoutData: TWorkspaceLayoutData;
-  children?: React.ReactNode;
-}
-
 type TCookieStore = Awaited<ReturnType<typeof cookies>>;
+
+interface WorkspaceLayoutProps {
+  readonly layoutData: TWorkspaceLayoutData;
+  // Resolved by the parent layout before the `page` authorization surface opens. Reading `cookies()`
+  // here would race a mid-render request close (ENG-3375).
+  readonly cookieStore: TCookieStore;
+  readonly children?: React.ReactNode;
+}
 
 // Response-limit warning for Hobby (free) plan: 200 = 80% of the 250/mo cap, 250 = limit reached.
 const getResponseWarningThreshold = (
@@ -55,9 +59,8 @@ const getTrialEndingDaysRemaining = (trialEnd: string | Date, cookieStore: TCook
   return null;
 };
 
-export const WorkspaceLayout = async ({ layoutData, children }: WorkspaceLayoutProps) => {
+export const WorkspaceLayout = async ({ layoutData, cookieStore, children }: WorkspaceLayoutProps) => {
   const t = await getTranslate();
-  const publicDomain = getPublicDomain();
 
   // Destructure all data from props (NO database queries)
   const {
@@ -80,18 +83,9 @@ export const WorkspaceLayout = async ({ layoutData, children }: WorkspaceLayoutP
   // Hobby (free) plan only — excludes trial and paid (Pro/Scale) orgs.
   const isHobby = IS_FORMBRICKS_CLOUD && organization.billing?.stripe?.plan === "hobby";
 
-  const [
-    organizationWorkspacesLimit,
-    newTrialBannerVariant,
-    responseWarningVariant,
-    trialEndingVariant,
-    cookieStore,
-  ] = await Promise.all([
+  const [organizationWorkspacesLimit, creativesAccess] = await Promise.all([
     getOrganizationWorkspacesLimit(organization.id),
-    getPostHogFeatureFlag(user.id, "a-b_navigation_rich-trial-banner-v2"),
-    isHobby ? getPostHogFeatureFlag(user.id, "a-b_workspace_trial-response-warning") : Promise.resolve(null),
-    isTrialing ? getPostHogFeatureFlag(user.id, "a-b_workspace_trial-ending-warning") : Promise.resolve(null),
-    isTrialing || isHobby ? cookies() : Promise.resolve(null),
+    getCreativesAccess({ organizationId: organization.id, workspaceId: workspace.id }),
   ]);
   const isOwnerOrManager = isOwner || isManager;
 
@@ -101,82 +95,84 @@ export const WorkspaceLayout = async ({ layoutData, children }: WorkspaceLayoutP
   }
 
   // (Hobby response warning and trial-ending target mutually exclusive audiences, so no stacking.)
-  const responseWarningThreshold =
-    isHobby && responseWarningVariant === "test" && cookieStore
-      ? getResponseWarningThreshold(responseCount, cookieStore)
-      : null;
+  const responseWarningThreshold = isHobby ? getResponseWarningThreshold(responseCount, cookieStore) : null;
 
   const trialEnd = organization.billing?.stripe?.trialEnd;
   const trialEndingDaysRemaining =
-    isTrialing && trialEndingVariant === "test" && cookieStore && trialEnd
-      ? getTrialEndingDaysRemaining(trialEnd, cookieStore)
-      : null;
+    isTrialing && trialEnd ? getTrialEndingDaysRemaining(trialEnd, cookieStore) : null;
 
-  // Countdown for the sidebar's TrialAlert. `isTrialing` already carries the same cloud +
+  // Countdown for the sidebar's trial banner. `isTrialing` already carries the same cloud +
   // "trialing" subscription guard the sidebar used to apply itself.
   const trialDaysRemaining = isTrialing && trialEnd ? getTrialDaysRemaining(trialEnd) : null;
 
   const billingHref = `/workspaces/${workspace.id}/settings/organization/billing`;
 
   return (
-    <div className="flex h-screen min-h-screen flex-col overflow-hidden">
-      {/* Hide the limits-reached toast for Hobby users in the response-warning test variant — the modal replaces it with richer copy + CTAs. */}
-      {IS_FORMBRICKS_CLOUD && !isTrialing && !(isHobby && responseWarningVariant === "test") && (
-        <LimitsReachedBanner organization={organization} responseCount={responseCount} />
-      )}
+    <CreativesAccessProvider access={creativesAccess}>
+      <div className="flex h-screen min-h-screen flex-col overflow-hidden">
+        {/* Hide the limits-reached toast for Hobby users: the response-warning modal replaces it with richer copy + CTAs. */}
+        {IS_FORMBRICKS_CLOUD && !isTrialing && !isHobby && (
+          <LimitsReachedBanner organization={organization} responseCount={responseCount} />
+        )}
 
-      <PendingDowngradeBanner
-        organizationId={organization.id}
-        {...getPendingDowngradeSchedule(lastChecked)}
-        isPendingDowngrade={isPendingDowngrade ?? false}
-        active={active}
-        locale={user.locale}
-        status={status}
-      />
-
-      {responseWarningThreshold && (
-        <TrialResponseWarningModal
-          threshold={responseWarningThreshold}
-          billingHref={billingHref}
-          responseCount={responseCount}
+        <PendingDowngradeBanner
+          organizationId={organization.id}
+          {...getPendingDowngradeSchedule(lastChecked)}
+          isPendingDowngrade={isPendingDowngrade ?? false}
+          active={active}
+          locale={user.locale}
+          status={status}
         />
-      )}
 
-      {trialEndingDaysRemaining && (
-        <TrialEndingWarningModal daysRemaining={trialEndingDaysRemaining} billingHref={billingHref} />
-      )}
-
-      <div className="flex h-full">
-        <MainNavigation
-          organization={organization}
-          user={user}
-          workspace={{ id: workspace.id, name: workspace.name }}
-          isFormbricksCloud={IS_FORMBRICKS_CLOUD}
-          isDevelopment={IS_DEVELOPMENT}
-          membershipRole={membership.role}
-          publicDomain={publicDomain}
-          organizationWorkspacesLimit={organizationWorkspacesLimit}
-          isLicenseActive={active}
-          isAccessControlAllowed={isAccessControlAllowed}
-          responseCount={responseCount}
-          newTrialBannerVariant={newTrialBannerVariant}
-          isFormbricksSurveysConfigured={IS_FORMBRICKS_SURVEYS_CONFIGURED}
-          trialDaysRemaining={trialDaysRemaining}
-        />
-        <div id="mainContent" className="flex flex-1 flex-col overflow-hidden bg-slate-50">
-          <TopControlBar
-            currentOrganizationId={organization.id}
-            isMultiOrgEnabled={isMultiOrgEnabled}
-            organizationWorkspacesLimit={organizationWorkspacesLimit}
-            isFormbricksCloud={IS_FORMBRICKS_CLOUD}
-            isLicenseActive={active}
-            isOwnerOrManager={isOwnerOrManager}
-            isAccessControlAllowed={isAccessControlAllowed}
-            membershipRole={membership.role}
+        {responseWarningThreshold && (
+          <TrialResponseWarningModal
+            threshold={responseWarningThreshold}
+            billingHref={billingHref}
+            responseCount={responseCount}
           />
-          <div className="flex-1 overflow-y-auto">{children}</div>
+        )}
+
+        {trialEndingDaysRemaining && (
+          <TrialEndingWarningModal
+            daysRemaining={trialEndingDaysRemaining}
+            billingHref={billingHref}
+            endsOnHobby={organization.billing?.stripe?.trialEndsOnHobby === true}
+          />
+        )}
+
+        <div className="flex h-full">
+          <MainNavigation
+            organization={organization}
+            user={user}
+            workspace={{ id: workspace.id, name: workspace.name }}
+            isFormbricksCloud={IS_FORMBRICKS_CLOUD}
+            isDevelopment={IS_DEVELOPMENT}
+            membershipRole={membership.role}
+            organizationWorkspacesLimit={organizationWorkspacesLimit}
+            isLicenseActive={active}
+            isNoLicense={status === "no-license"}
+            isAccessControlAllowed={isAccessControlAllowed}
+            responseCount={responseCount}
+            isFormbricksSurveysConfigured={IS_FORMBRICKS_SURVEYS_CONFIGURED}
+            trialDaysRemaining={trialDaysRemaining}
+            isCreativesVisible={isCreativesVisible(creativesAccess)}
+          />
+          <div id="mainContent" className="flex flex-1 flex-col overflow-hidden bg-slate-50">
+            <TopControlBar
+              currentOrganizationId={organization.id}
+              isMultiOrgEnabled={isMultiOrgEnabled}
+              organizationWorkspacesLimit={organizationWorkspacesLimit}
+              isFormbricksCloud={IS_FORMBRICKS_CLOUD}
+              isLicenseActive={active}
+              isNoLicense={status === "no-license"}
+              isOwnerOrManager={isOwnerOrManager}
+              isAccessControlAllowed={isAccessControlAllowed}
+              membershipRole={membership.role}
+            />
+            <div className="flex-1 overflow-y-auto">{children}</div>
+          </div>
         </div>
       </div>
-    </div>
+    </CreativesAccessProvider>
   );
 };

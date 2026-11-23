@@ -13,12 +13,18 @@ import {
 } from "@/lib/constants";
 import { getPublicDomain } from "@/lib/getPublicUrl";
 import { getSurvey } from "@/lib/survey/service";
+import { getUserVisibleSurveyWhere } from "@/lib/survey/visibility/actor-context";
 import { getUser } from "@/lib/user/service";
 import { getTranslate } from "@/lingodotdev/server";
 import { getSegments } from "@/modules/ee/contacts/segments/lib/segments";
+import { SurveyRetentionNote } from "@/modules/ee/data-retention/components/survey/survey-retention-note";
+import { getSurveyDataRetentionContext } from "@/modules/ee/data-retention/lib/survey-context";
 import { getIsContactsEnabled, getIsQuotasEnabled } from "@/modules/ee/license-check/lib/utils";
 import { getOrganizationBilling } from "@/modules/survey/lib/survey";
 import { getSurveyAuth } from "@/modules/survey/lib/survey-auth";
+import { RestrictedSurveyBanner } from "@/modules/survey/visibility/components/restricted-survey-banner";
+import { getSurveyVisibilityViewer } from "@/modules/survey/visibility/lib/gate";
+import { showRestrictedBanner } from "@/modules/survey/visibility/lib/markers";
 import { IdBadge } from "@/modules/ui/components/id-badge";
 import { PageContentWrapper } from "@/modules/ui/components/page-content-wrapper";
 import { PageHeader } from "@/modules/ui/components/page-header";
@@ -35,12 +41,15 @@ const SurveyPage = async (
     return notFound();
   }
 
-  const { session, isReadOnly, workspace, organization } = await getSurveyAuth(params.workspaceId, surveyId);
+  const { session, isReadOnly, canManage, workspace, organization } = await getSurveyAuth(
+    params.workspaceId,
+    surveyId
+  );
 
   const survey = await getSurvey(params.surveyId);
 
   if (!survey) {
-    throw new ResourceNotFoundError(t("common.survey"), params.surveyId);
+    return notFound();
   }
 
   const user = await getUser(session.user.id);
@@ -50,7 +59,10 @@ const SurveyPage = async (
   }
 
   const isContactsEnabled = await getIsContactsEnabled(organization.id);
-  const segments = isContactsEnabled ? await getSegments(workspace.id) : [];
+  // ENG-3282: segments reach the browser, so their survey references name only surveys this viewer sees.
+  const segments = isContactsEnabled
+    ? await getSegments(workspace.id, await getUserVisibleSurveyWhere(session.user.id, organization.id))
+    : [];
 
   if (!organization) {
     throw new ResourceNotFoundError(t("common.organization"), null);
@@ -65,7 +77,12 @@ const SurveyPage = async (
   const aiUnavailableReason = getAISmartToolsUnavailableReason(aiConfig) ?? null;
 
   // Fetch initial survey summary data on the server to prevent duplicate API calls during hydration
-  const initialSurveySummary = await getSurveySummary(surveyId);
+  const [initialSurveySummary, { surveyVisibilityGate, visibility, surveyAccess, ownerName }, dataRetention] =
+    await Promise.all([
+      getSurveySummary(surveyId),
+      getSurveyVisibilityViewer(survey, session.user.id, organization.id),
+      getSurveyDataRetentionContext(organization, session.user.id),
+    ]);
 
   const publicDomain = getPublicDomain();
 
@@ -76,6 +93,7 @@ const SurveyPage = async (
         cta={
           <SurveyAnalysisCTA
             isReadOnly={isReadOnly}
+            canManage={canManage}
             user={user}
             publicDomain={publicDomain}
             responseCount={initialSurveySummary?.meta.totalResponses ?? 0}
@@ -89,6 +107,18 @@ const SurveyPage = async (
         }>
         <SurveyAnalysisNavigation survey={survey} activeId="summary" />
       </PageHeader>
+      {showRestrictedBanner({
+        enforced: surveyVisibilityGate.enforced,
+        visibility,
+        access: surveyAccess,
+      }) && <RestrictedSurveyBanner ownerName={ownerName} />}
+      {dataRetention ? (
+        <SurveyRetentionNote
+          surveyId={survey.id}
+          organizationId={dataRetention.organizationId}
+          timeZone={dataRetention.timeZone}
+        />
+      ) : null}
       <SummaryPage
         survey={survey}
         surveyId={params.surveyId}

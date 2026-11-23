@@ -1,6 +1,8 @@
 import { createId } from "@paralleldrive/cuid2";
 import type { TFunction } from "i18next";
 import type { TSurveyBlock } from "@formbricks/types/surveys/blocks";
+import { collectDeclaredFieldNames } from "@formbricks/types/surveys/declared-field-guard";
+import { fillMissingCodes } from "@formbricks/types/surveys/fill-missing-codes";
 import type {
   TSurveyEndScreenCard,
   TSurveyEnding,
@@ -11,6 +13,7 @@ import type {
 } from "@formbricks/types/surveys/types";
 import type { TTemplate, TTemplateRole } from "@formbricks/types/templates";
 import { createI18nString, extractLanguageCodes } from "@/lib/i18n/utils";
+import { DEFAULT_ENDING_CARD_BUTTON_LINK } from "@/lib/survey/default-ending-card";
 
 // Helper function to create standard jump logic based on operator
 export const createJumpLogic = (
@@ -84,8 +87,7 @@ export const getDefaultEndingCard = (languages: TSurveyLanguage[], t: TFunction)
     headline: createI18nString(t("templates.default_ending_card_headline"), languageCodes),
     subheader: createI18nString(t("templates.default_ending_card_subheader"), languageCodes),
     buttonLabel: createI18nString(t("templates.default_ending_card_button_label"), languageCodes),
-    buttonLink:
-      "https://formbricks.com?utm_source=formbricks-app&utm_medium=survey&utm_campaign=default_ending_cta",
+    buttonLink: DEFAULT_ENDING_CARD_BUTTON_LINK,
   };
 };
 
@@ -151,3 +153,16 @@ export const buildSurvey = (
     },
   };
 };
+
+/**
+ * A template with every question and answer option coded (ENG-6782). Templates are built in code
+ * without codes; coding them here means the preview, the editor and every survey created from one
+ * start fully coded.
+ */
+export const withTemplateCodes = (template: TTemplate): TTemplate => ({
+  ...template,
+  preset: {
+    ...template.preset,
+    blocks: fillMissingCodes(template.preset.blocks, collectDeclaredFieldNames(template.preset)),
+  },
+});

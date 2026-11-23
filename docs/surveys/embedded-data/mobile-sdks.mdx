@@ -4,13 +4,16 @@ description: "setEmbeddedData and clearEmbeddedData on React Native, iOS, Androi
 icon: "mobile"
 ---
 
-All four mobile SDKs carry the same [Embedded Data](/surveys/embedded-data/overview) API as the JavaScript SDK, with the same contract: merge into an in-memory bag, snapshot it when a survey is displayed, never persist it.
+<Note>These examples require SDK support. Check [published feature availability](/surveys/website-app-surveys/sdk-compatibility#embedded-data-on-mobile) before updating your app.</Note>
+
+
+The mobile SDK implementations use the same [Embedded Data](/surveys/embedded-data/overview) API as the JavaScript SDK, with the same contract: merge into an in-memory bag, snapshot it when a survey is displayed, never persist it.
 
 The rules are identical everywhere, so read the [`setEmbeddedData` reference](/surveys/embedded-data/set-embedded-data) for the semantics. This page covers what differs per language.
 
 <Note>
-  Values reach a response only through the fields the survey declares in its **Hidden Fields** card. Declare
-  the field first, then push a value under the same name.
+  Values reach a response only through the fields the survey declares in its **Embedded Data** card, with the
+  source set to **Passed in**. Declare the field first, then push a value under its key.
 </Note>
 
 <Note>

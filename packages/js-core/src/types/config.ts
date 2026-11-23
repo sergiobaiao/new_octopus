@@ -1,4 +1,19 @@
+import type { TCreativePayload } from "@formbricks/creatives";
+import type { TShowConditions } from "@formbricks/types/show-conditions";
+
 type TJsonObject = Record<string, unknown>;
+
+/** Respondent-facing compiled custom CSS for one scope (mirrors `TCustomCssCompiled` in @formbricks/types). */
+export interface TCustomCssCompiled {
+  light?: string;
+  dark?: string;
+}
+
+/** The renderer's explicit `customCss` prop (mirrors `TRendererCustomCss` in @formbricks/types). */
+export interface TRendererCustomCss {
+  workspace?: TCustomCssCompiled | null;
+  survey?: TCustomCssCompiled | null;
+}
 
 export type TActionClassPageUrlRule =
   | "exactMatch"
@@ -66,8 +81,10 @@ export interface TWorkspaceStateSurvey {
   variables: TJsonObject[];
   type: "link" | "app";
   showLanguageSwitch: boolean | null;
+  autoSelectLanguage?: boolean | null;
   endings: TJsonObject[];
   autoClose: number | null;
+  keepEndingCardOpen?: boolean;
   status: "draft" | "inProgress" | "paused" | "completed";
   // This variable should be called `cooldownPeriod`, not `recontactDays`. It is related to the
   // Survey Cooldown Period feature (across surveys) and not the Recontact Options (per survey).
@@ -100,6 +117,8 @@ export interface TWorkspaceStateSurvey {
   // Minimal segment shape; full filter logic is evaluated server-side and must not reach the browser.
   segment?: { id: string; hasFilters: boolean };
   displayPercentage: number | null;
+  // Show conditions checked when a trigger fires (ENG-3926). Absent when the server predates them.
+  showConditions?: TShowConditions;
   styling?: TSurveyStyling;
   // Per-survey gate for the post-interaction segment refresh: whether an interaction with THIS survey
   // (display / response / finish) can change any live survey's membership. Absent for workspaces
@@ -109,6 +128,9 @@ export interface TWorkspaceStateSurvey {
     onResponse: boolean;
     onFinished: boolean;
   };
+  // Compiled survey custom CSS (ENG-3552). Forwarded to the renderer untouched; absent when the
+  // survey has none or the server withholds it.
+  customCss?: TCustomCssCompiled;
 }
 
 export interface TWorkspaceStateSettings {
@@ -120,15 +142,26 @@ export interface TWorkspaceStateSettings {
   placement: "bottomLeft" | "bottomRight" | "topLeft" | "topRight" | "center";
   inAppSurveyBranding: boolean;
   styling: TWorkspaceStyling;
+  // Compiled workspace custom CSS (ENG-3552), sent once per workspace state rather than per survey.
+  customCss?: TCustomCssCompiled;
 }
 
 export interface TWorkspaceState {
   expiresAt: Date;
+  /** When the server built the response (ENG-3994). Absent from servers before creatives. */
+  serverTime?: string;
+  /**
+   * What to add to the device clock to read the server's, worked out by the SDK when the state arrived
+   * (`getClockOffset`) and kept with it, so creative schedules hold on every page of the hour.
+   */
+  clockOffset?: number;
   data: {
     surveys: TWorkspaceStateSurvey[];
     actionClasses: TWorkspaceStateActionClass[];
     settings: TWorkspaceStateSettings;
     recaptchaSiteKey?: string;
+    /** Present only when the workspace has deliverable creatives (`@formbricks/creatives` types). */
+    creatives?: TCreativePayload[];
   };
 }
 
@@ -171,6 +204,10 @@ export interface TConfigInput {
   environmentId?: string;
   workspaceId?: string;
   appUrl: string;
+  /** Warm the survey renderer cache during setup. Set false when the host CSP blocks prefetch. Defaults to true. */
+  prefetch?: boolean;
+  /** How surveys and creatives render. Defaults to light; can be changed later with `setAppearance`. */
+  appearance?: "light" | "dark" | "system";
 }
 
 export interface TStylingColor {
@@ -185,6 +222,8 @@ export interface TBaseStyling {
   accentBgColor?: TStylingColor | null;
   accentBgColorSelected?: TStylingColor | null;
   fontFamily?: string | null;
+  /** Page font (ENG-3864): the page's font instead of the survey font; absent means off. */
+  pageFont?: boolean | null;
 
   // Buttons
   buttonBgColor?: TStylingColor | null;
@@ -236,7 +275,6 @@ export interface TBaseStyling {
   cardBackgroundColor?: TStylingColor | null;
   cardBorderColor?: TStylingColor | null;
   highlightBorderColor?: TStylingColor | null;
-  isDarkModeEnabled?: boolean | null;
   roundness?: TDimension;
   cardArrangement?: {
     // "cardless" is only supported for link surveys.

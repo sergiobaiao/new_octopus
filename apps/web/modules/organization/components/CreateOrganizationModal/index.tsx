@@ -6,7 +6,7 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { createOrganizationAction } from "@/modules/organization/actions";
 import { Button } from "@/modules/ui/components/button";
 import {
@@ -22,8 +22,8 @@ import { Input } from "@/modules/ui/components/input";
 import { Label } from "@/modules/ui/components/label";
 
 interface CreateOrganizationModalProps {
-  open: boolean;
-  setOpen: (v: boolean) => void;
+  readonly open: boolean;
+  readonly setOpen: (v: boolean) => void;
 }
 
 type FormValues = {

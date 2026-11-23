@@ -2,7 +2,7 @@
 
 import { useAutoAnimate } from "@formkit/auto-animate/react";
 import { createId } from "@paralleldrive/cuid2";
-import { PlusIcon } from "lucide-react";
+import { CopyIcon, PlusIcon } from "lucide-react";
 import { type JSX } from "react";
 import { useTranslation } from "react-i18next";
 import { IMAGE_FILE_EXTENSIONS } from "@formbricks/types/storage";
@@ -12,21 +12,33 @@ import { TUserLocale } from "@formbricks/types/user";
 import { cn } from "@/lib/cn";
 import { createI18nString, extractLanguageCodes } from "@/lib/i18n/utils";
 import { ElementFormInput } from "@/modules/survey/components/element-form-input";
-import { ValidationRulesEditor } from "@/modules/survey/editor/components/validation-rules-editor";
+import { ImageAltTextButton } from "@/modules/survey/components/element-form-input/components/image-alt-text-button";
+import { isValueIncomplete } from "@/modules/survey/components/element-form-input/utils";
+import { useCopyId } from "@/modules/survey/editor/components/copy-id-button";
+import {
+  HiddenOptionBadge,
+  OptionHideButton,
+  type TSetOptionHidden,
+} from "@/modules/survey/editor/components/option-hide-button";
+import { PublishedLockNotice } from "@/modules/survey/editor/components/published-lock-notice";
+import { NO_ELEMENT_LOCK, TElementLock } from "@/modules/survey/editor/lib/published-lock";
 import { Button } from "@/modules/ui/components/button";
 import { FileInput } from "@/modules/ui/components/file-input";
 import { Label } from "@/modules/ui/components/label";
 import { Switch } from "@/modules/ui/components/switch";
 
 interface PictureSelectionFormProps {
-  localSurvey: TSurvey;
-  element: TSurveyPictureSelectionElement;
-  elementIdx: number;
-  updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
-  isInvalid: boolean;
-  locale: TUserLocale;
-  isStorageConfigured: boolean;
-  isExternalUrlsAllowed?: boolean;
+  readonly localSurvey: TSurvey;
+  readonly element: TSurveyPictureSelectionElement;
+  readonly elementIdx: number;
+  readonly updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
+  readonly isInvalid: boolean;
+  readonly locale: TUserLocale;
+  readonly isStorageConfigured: boolean;
+  readonly isExternalUrlsAllowed?: boolean;
+  readonly lock?: TElementLock;
+  /** The Hide quick action on each picture (ENG-6949). */
+  readonly onSetOptionHidden?: TSetOptionHidden;
 }
 
 export const PictureSelectionForm = ({
@@ -38,10 +50,13 @@ export const PictureSelectionForm = ({
   locale,
   isStorageConfigured = true,
   isExternalUrlsAllowed,
+  lock = NO_ELEMENT_LOCK,
+  onSetOptionHidden,
 }: PictureSelectionFormProps): JSX.Element => {
   const workspaceId = localSurvey.workspaceId;
   const surveyLanguageCodes = extractLanguageCodes(localSurvey.languages);
   const { t } = useTranslation();
+  const copyId = useCopyId();
   const handleChoiceDeletion = (choiceValue: string) => {
     // Filter out the deleted choice from the choices array
     const newChoices = element.choices?.filter((choice) => choice.id !== choiceValue) || [];
@@ -71,6 +86,69 @@ export const PictureSelectionForm = ({
     updateElement(elementIdx, {
       choices: updatedChoices,
     });
+  };
+
+  // ElementFormInput writes `{ imageAltText }` through `updateElement`; route it onto the one choice instead.
+  const updateChoiceAltText = (choiceId: string) => (_elementIdx: number, data: Partial<TSurveyElement>) => {
+    updateElement(elementIdx, {
+      choices: element.choices.map((choice) =>
+        choice.id === choiceId ? { ...choice, imageAltText: data.imageAltText } : choice
+      ),
+    });
+  };
+
+  const renderChoiceAltTextButton = (url: string) => {
+    const choiceIdx = element.choices.findIndex((choice) => choice.imageUrl === url);
+    if (choiceIdx === -1) return null;
+    const choice = element.choices[choiceIdx];
+    const label = t("workspace.surveys.edit.image_alt_text_choice_n", { n: choiceIdx + 1 });
+    const isHidden = choice.hidden === true;
+    return (
+      <>
+        {/* A Hidden picture reads as hidden (ENG-6949): washed out, with the Flow tab's Hidden badge. */}
+        {isHidden && <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-white/50" />}
+        {onSetOptionHidden && (
+          <OptionHideButton
+            item={choice}
+            listKey="choices"
+            onSetHidden={onSetOptionHidden}
+            triggerClassName="absolute top-2 left-2"
+            className="size-7"
+          />
+        )}
+        {isHidden && <HiddenOptionBadge className="absolute top-3 left-11 bg-white" />}
+        <button
+          type="button"
+          aria-label={t("workspace.surveys.edit.copy_option_id")}
+          title={`${t("workspace.surveys.edit.copy_option_id")}: ${choice.id}`}
+          data-testid="copy-option-id"
+          data-option-id={choice.id}
+          className="absolute right-2 bottom-2 flex cursor-pointer items-center rounded-md bg-slate-100 p-1 text-slate-700 opacity-60 transition-opacity hover:opacity-100 focus-visible:opacity-100"
+          onClick={(e) => {
+            e.preventDefault();
+            void copyId(choice.id);
+          }}>
+          <CopyIcon className="size-3.5" />
+        </button>
+        <ImageAltTextButton
+          label={label}
+          hasAltText={Boolean(choice.imageAltText?.default?.trim())}
+          isInvalid={isValueIncomplete("imageAltText", isInvalid, surveyLanguageCodes, choice.imageAltText)}>
+          <ElementFormInput
+            id="imageAltText"
+            value={choice.imageAltText ?? createI18nString("", surveyLanguageCodes)}
+            label={label}
+            placeholder={t("workspace.surveys.edit.image_alt_text_placeholder")}
+            localSurvey={localSurvey}
+            elementIdx={elementIdx}
+            isInvalid={isInvalid}
+            updateElement={updateChoiceAltText(choice.id)}
+            locale={locale}
+            isStorageConfigured={isStorageConfigured}
+          />
+        </ImageAltTextButton>
+      </>
+    );
   };
 
   const [parent] = useAutoAnimate();
@@ -145,6 +223,13 @@ export const PictureSelectionForm = ({
             multiple={true}
             maxSizeInMB={5}
             isStorageConfigured={isStorageConfigured}
+            renderImageAction={renderChoiceAltTextButton}
+            getRemoveLockReason={(url) => {
+              const choice = element.choices.find((c) => c.imageUrl === url);
+              return choice && lock.isOptionLocked("choices", choice.id)
+                ? t("workspace.surveys.edit.lock_explanation_option_delete")
+                : undefined;
+            }}
           />
         </div>
       </div>
@@ -153,6 +238,8 @@ export const PictureSelectionForm = ({
         <Switch
           id="multi-select-toggle"
           checked={element.allowMulti}
+          // Single and multiple selection store different answers: a published question keeps its mode.
+          disabled={lock.isTypeLocked}
           onClick={(e) => {
             e.stopPropagation();
             const newAllowMulti = !element.allowMulti;
@@ -172,8 +259,9 @@ export const PictureSelectionForm = ({
         />
         <Label htmlFor="multi-select-toggle" className="cursor-pointer">
           <div className="ml-2">
-            <h3 className="text-sm font-semibold text-slate-700">
+            <h3 className="flex items-center gap-1 text-sm font-semibold text-slate-700">
               {t("workspace.surveys.edit.allow_multi_select")}
+              {lock.isTypeLocked && <PublishedLockNotice kind="type" />}
             </h3>
             <p className="text-xs font-normal text-slate-500">
               {t("workspace.surveys.edit.allow_users_to_select_more_than_one_image")}
@@ -181,18 +269,6 @@ export const PictureSelectionForm = ({
           </div>
         </Label>
       </div>
-      {element.allowMulti && (
-        <ValidationRulesEditor
-          elementType={element.type}
-          validation={element.validation}
-          onUpdateValidation={(validation) => {
-            updateElement(elementIdx, {
-              validation,
-            });
-          }}
-          element={element}
-        />
-      )}
     </form>
   );
 };

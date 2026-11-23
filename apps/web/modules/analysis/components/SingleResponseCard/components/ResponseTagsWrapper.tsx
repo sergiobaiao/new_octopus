@@ -7,7 +7,7 @@ import { logger } from "@formbricks/logger";
 import { TResponse } from "@formbricks/types/responses";
 import { TTag } from "@formbricks/types/tags";
 import { TUserLocale } from "@formbricks/types/user";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { IdBadge } from "@/modules/ui/components/id-badge";
 import { Tag } from "@/modules/ui/components/tag";
 import { TagsCombobox } from "@/modules/ui/components/tags-combobox";
@@ -16,17 +16,17 @@ import { createTagAction, createTagToResponseAction, deleteTagOnResponseAction }
 import { SingleResponseCardMetadata } from "./SingleResponseCardMetadata";
 
 interface ResponseTagsWrapperProps {
-  tags: {
+  readonly tags: {
     tagId: string;
     tagName: string;
   }[];
-  workspaceId: string;
-  responseId: string;
-  environmentTags: TTag[];
-  updateFetchedResponses: () => void;
-  isReadOnly?: boolean;
-  response: TResponse;
-  locale: TUserLocale;
+  readonly workspaceId: string;
+  readonly responseId: string;
+  readonly environmentTags: TTag[];
+  readonly updateFetchedResponses: () => void;
+  readonly isReadOnly?: boolean;
+  readonly response: TResponse;
+  readonly locale: TUserLocale;
 }
 
 export const ResponseTagsWrapper: React.FC<ResponseTagsWrapperProps> = ({

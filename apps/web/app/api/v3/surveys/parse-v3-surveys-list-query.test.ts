@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { encodeSurveyListPageCursor } from "@/modules/survey/list/lib/survey-page";
 import { collectMultiValueQueryParam, parseV3SurveysListQuery } from "./parse-v3-surveys-list-query";
 
 const wid = "clxx1234567890123456789012";
@@ -34,7 +35,7 @@ describe("parseV3SurveysListQuery", () => {
       expect(r.invalid_params[0]).toEqual({
         name: "foo",
         reason:
-          "Unsupported query parameter. Use only workspaceId, limit, cursor, includeTotalCount, filter[name][contains], filter[status][in], filter[type][in], sortBy.",
+          "Unsupported query parameter. Use only workspaceId, limit, cursor, includeTotalCount, filter[name][contains], filter[status][in], filter[type][in], filter[visibility][in], filter[owner][in], filter[singleUse][eq], filter[pinProtected][eq], sortBy, view.",
       });
   });
 
@@ -45,7 +46,7 @@ describe("parseV3SurveysListQuery", () => {
       expect(r.invalid_params[0]).toEqual({
         name: "after",
         reason:
-          "Unsupported query parameter. Use only workspaceId, limit, cursor, includeTotalCount, filter[name][contains], filter[status][in], filter[type][in], sortBy.",
+          "Unsupported query parameter. Use only workspaceId, limit, cursor, includeTotalCount, filter[name][contains], filter[status][in], filter[type][in], filter[visibility][in], filter[owner][in], filter[singleUse][eq], filter[pinProtected][eq], sortBy, view.",
       });
     }
   });
@@ -57,7 +58,7 @@ describe("parseV3SurveysListQuery", () => {
       expect(r.invalid_params[0]).toEqual({
         name: "name",
         reason:
-          "Unsupported query parameter. Use only workspaceId, limit, cursor, includeTotalCount, filter[name][contains], filter[status][in], filter[type][in], sortBy.",
+          "Unsupported query parameter. Use only workspaceId, limit, cursor, includeTotalCount, filter[name][contains], filter[status][in], filter[type][in], filter[visibility][in], filter[owner][in], filter[singleUse][eq], filter[pinProtected][eq], sortBy, view.",
       });
     }
   });
@@ -70,8 +71,49 @@ describe("parseV3SurveysListQuery", () => {
       expect(r.cursor).toBeNull();
       expect(r.includeTotalCount).toBe(true);
       expect(r.sortBy).toBe("updatedAt");
+      expect(r.view).toBe("summary");
       expect(r.filterCriteria).toBeUndefined();
     }
+  });
+
+  describe("view (ENG-6861)", () => {
+    test("parses view=full and view=summary", () => {
+      const full = parseV3SurveysListQuery(params(`workspaceId=${wid}&view=full`));
+      expect(full.ok && full.view).toBe("full");
+      const summary = parseV3SurveysListQuery(params(`workspaceId=${wid}&view=summary`));
+      expect(summary.ok && summary.view).toBe("summary");
+    });
+
+    test("rejects an unknown view", () => {
+      const r = parseV3SurveysListQuery(params(`workspaceId=${wid}&view=detail`));
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.invalid_params[0].name).toBe("view");
+    });
+
+    test("caps limit at the full-view maximum, and only for view=full", () => {
+      const atCap = parseV3SurveysListQuery(params(`workspaceId=${wid}&view=full&limit=50`));
+      expect(atCap.ok && atCap.limit).toBe(50);
+
+      const overCap = parseV3SurveysListQuery(params(`workspaceId=${wid}&view=full&limit=51`));
+      expect(overCap).toEqual({
+        ok: false,
+        invalid_params: [{ name: "limit", reason: "With view=full, limit must be at most 50." }],
+      });
+
+      const summary = parseV3SurveysListQuery(params(`workspaceId=${wid}&view=summary&limit=51`));
+      expect(summary.ok && summary.limit).toBe(51);
+    });
+
+    test("rejects lang: the list returns every configured language", () => {
+      const r = parseV3SurveysListQuery(params(`workspaceId=${wid}&view=full&lang=de-DE`));
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.invalid_params[0].name).toBe("lang");
+    });
+
+    test("keeps the default limit for view=full", () => {
+      const r = parseV3SurveysListQuery(params(`workspaceId=${wid}&view=full`));
+      expect(r.ok && r.limit).toBe(20);
+    });
   });
 
   /**
@@ -112,6 +154,21 @@ describe("parseV3SurveysListQuery", () => {
     }
   });
 
+  test("maps the single-use and PIN filters to booleans in the filter criteria", () => {
+    const r = parseV3SurveysListQuery(
+      params(`workspaceId=${wid}&filter[singleUse][eq]=false&filter[pinProtected][eq]=true`)
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.filterCriteria).toEqual({ singleUse: false, pinProtected: true });
+  });
+
+  test("rejects a single-use or PIN filter that is not true or false", () => {
+    for (const qs of ["filter[singleUse][eq]=no", "filter[pinProtected][eq]=1"]) {
+      const r = parseV3SurveysListQuery(params(`workspaceId=${wid}&${qs}`));
+      expect(r.ok).toBe(false);
+    }
+  });
+
   test("invalid status", () => {
     const r = parseV3SurveysListQuery(params(`workspaceId=${wid}&filter[status][in]=notastatus`));
     expect(r.ok).toBe(false);
@@ -145,7 +202,7 @@ describe("parseV3SurveysListQuery", () => {
       expect(r.invalid_params[0]).toEqual({
         name: "filter[createdBy][in]",
         reason:
-          "Unsupported query parameter. Use only workspaceId, limit, cursor, includeTotalCount, filter[name][contains], filter[status][in], filter[type][in], sortBy.",
+          "Unsupported query parameter. Use only workspaceId, limit, cursor, includeTotalCount, filter[name][contains], filter[status][in], filter[type][in], filter[visibility][in], filter[owner][in], filter[singleUse][eq], filter[pinProtected][eq], sortBy, view.",
       });
     }
   });
@@ -161,5 +218,59 @@ describe("parseV3SurveysListQuery", () => {
         },
       ]);
     }
+  });
+
+  /** Postgres `text` cannot hold U+0000; let through, the code fails the query and answers 500 (ENG-3550). */
+  test("rejects a NULL byte in the name filter", () => {
+    const r = parseV3SurveysListQuery(params(`workspaceId=${wid}&filter[name][contains]=a%00b`));
+    expect(r).toEqual({
+      ok: false,
+      invalid_params: [{ name: "filter[name][contains]", reason: "must not contain NULL bytes" }],
+    });
+  });
+
+  /** The cursor is unsigned, so its strings are client input that reaches the `WHERE` clause. */
+  test("rejects a NULL byte in a cursor's id as an invalid cursor", () => {
+    const cursor = encodeSurveyListPageCursor({
+      version: 1,
+      sortBy: "name",
+      value: "Alpha",
+      id: "survey\u0000",
+    });
+    const r = parseV3SurveysListQuery(params(`workspaceId=${wid}&sortBy=name&cursor=${cursor}`));
+    expect(r).toEqual({ ok: false, invalid_params: [{ name: "cursor", reason: "The cursor is invalid." }] });
+  });
+});
+
+describe("visibility and owner filters (ENG-3282)", () => {
+  const workspaceId = "clxx1234567890123456789012";
+
+  test("parses repeated and comma-separated values into the visibility filter", () => {
+    const result = parseV3SurveysListQuery(
+      new URLSearchParams(
+        `workspaceId=${workspaceId}&filter[visibility][in]=restricted&filter[owner][in]=me,others`
+      )
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      visibilityFilter: { owner: ["me", "others"], visibility: ["restricted"] },
+    });
+  });
+
+  test("rejects a value outside either enum", () => {
+    expect(
+      parseV3SurveysListQuery(new URLSearchParams(`workspaceId=${workspaceId}&filter[visibility][in]=secret`))
+        .ok
+    ).toBe(false);
+    expect(
+      parseV3SurveysListQuery(new URLSearchParams(`workspaceId=${workspaceId}&filter[owner][in]=you`)).ok
+    ).toBe(false);
+  });
+
+  test("carries no visibility filter when none is given", () => {
+    expect(parseV3SurveysListQuery(new URLSearchParams(`workspaceId=${workspaceId}`))).toMatchObject({
+      visibilityFilter: {},
+    });
   });
 });

@@ -5,11 +5,19 @@
 # Generated artifacts: the tool that writes them would immediately undo any
 # formatting, which would turn `pnpm format:check` red on an unrelated PR.
 pnpm-lock.yaml
+.devcontainer/devcontainer-lock.json
 docs/api-v3-reference/openapi.yml
+docs/schemas/
 docs/api-v3-reference/.redocly.lint-ignore.yaml
 charts/**/README.md
 charts/spicedb-operator/crds/authzed.com_spicedbclusters.yaml
 charts/spicedb-operator/files/update-graph.yaml
+
+# Agent skills installed from upstream and pinned by hash in skills-lock.json.
+# The next `skills` update overwrites any local formatting, so leave them as
+# shipped.
+.agents/skills/
+skills-lock.json
 
 # Helm templates are Go templates that only look like YAML — Prettier's YAML
 # parser cannot parse them.

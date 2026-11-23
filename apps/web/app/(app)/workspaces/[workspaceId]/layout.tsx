@@ -1,3 +1,4 @@
+import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { WorkspaceLayout as WorkspaceLayoutComponent } from "@/app/(app)/workspaces/[workspaceId]/components/WorkspaceLayout";
 import { WorkspaceContextWrapper } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
@@ -8,8 +9,8 @@ import { getWorkspaceLayoutData } from "@/modules/workspaces/lib/utils";
 import WorkspaceStorageHandler from "./components/WorkspaceStorageHandler";
 
 const WorkspaceLayout = async (props: {
-  params: Promise<{ workspaceId: string }>;
-  children: React.ReactNode;
+  readonly params: Promise<{ workspaceId: string }>;
+  readonly children: React.ReactNode;
 }) => {
   const params = await props.params;
   const { children } = props;
@@ -18,6 +19,11 @@ const WorkspaceLayout = async (props: {
   if (!session?.user) {
     return redirect(`/auth/login`);
   }
+
+  // Must stay above getWorkspaceLayoutData: it opens the `page` authorization surface, which calls
+  // `after()`. Once a request closes mid-render, Next flips every store that called `after()` to phase
+  // "after", and a later `cookies()` call throws (ENG-3375). A store read before that stays usable.
+  const cookieStore = await cookies();
 
   const layoutData = await getWorkspaceLayoutData(params.workspaceId, session.user.id);
 
@@ -39,7 +45,9 @@ const WorkspaceLayout = async (props: {
           isFormbricksCloud: IS_FORMBRICKS_CLOUD,
           enterpriseLicenseRequestFormUrl: ENTERPRISE_LICENSE_REQUEST_FORM_URL,
         }}>
-        <WorkspaceLayoutComponent layoutData={layoutData}>{children}</WorkspaceLayoutComponent>
+        <WorkspaceLayoutComponent layoutData={layoutData} cookieStore={cookieStore}>
+          {children}
+        </WorkspaceLayoutComponent>
       </WorkspaceContextWrapper>
     </>
   );

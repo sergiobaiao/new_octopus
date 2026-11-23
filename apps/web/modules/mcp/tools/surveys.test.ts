@@ -1,4 +1,3 @@
-import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { z } from "zod";
 import { ApiKeyPermission } from "@formbricks/database/prisma";
@@ -7,19 +6,26 @@ import {
   createdResponse,
   noContentResponse,
   problemBadRequest,
+  problemConfirmationRequired,
+  problemConflict,
   problemForbidden,
+  problemSurveyHasLinkedCreatives,
   successListResponse,
   successResponse,
 } from "@/app/api/v3/lib/response";
+import type { TV3AuditLog } from "@/app/api/v3/lib/types";
 import {
   createV3SurveyResponseFromRawInput,
   deleteV3Survey,
+  editV3SurveyBlocksResponse,
   getV3Survey,
   listV3Surveys,
   patchV3SurveyResponse,
+  setV3SurveyBlockOrderResponse,
   validateV3SurveyFromRawInput,
 } from "@/app/api/v3/surveys/lib/operations";
 import { buildListSurveysSearchParams, registerSurveyTools } from "./surveys";
+import { type ToolCallEra, callToolOverHttp, errorText } from "./test-utils";
 
 // Asserted as a shape, not by calling getMcpResourceUrl() here: comparing production's value with
 // itself would still pass if it regressed to the bare path "/api/mcp" — the ENG-2173 bug. The
@@ -33,6 +39,17 @@ vi.mock("@/app/api/v3/surveys/lib/operations", () => ({
   getV3Survey: vi.fn(),
   listV3Surveys: vi.fn(),
   patchV3SurveyResponse: vi.fn(),
+  editV3SurveyBlocksResponse: vi.fn(),
+  setV3SurveyBlockOrderResponse: vi.fn(),
+  // Real behaviour, not a vi.fn: the handler mints insert ids through this before building the
+  // `applied` list, so stubbing it out would hide whether the id reaches the caller. The real
+  // implementation is covered in app/api/v3/surveys/lib/operations.test.ts.
+  withGeneratedInsertIds: (ops: { op: string; block?: Record<string, unknown> }[]) =>
+    ops.map((op) =>
+      op.op === "insert" && op.block?.id === undefined
+        ? { ...op, block: { ...op.block, id: "generated_block_id" } }
+        : op
+    ),
   validateV3SurveyFromRawInput: vi.fn(),
 }));
 
@@ -161,7 +178,7 @@ describe("registerSurveyTools", () => {
   test("registers survey tools with planning annotations", () => {
     const { server, tools } = createToolServer();
 
-    expect(server.registerTool).toHaveBeenCalledTimes(6);
+    expect(server.registerTool).toHaveBeenCalledTimes(8);
     expect(tools.get("list_surveys")?.config).toMatchObject({
       title: "List surveys",
       annotations: {
@@ -175,6 +192,24 @@ describe("registerSurveyTools", () => {
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
+        idempotentHint: true,
+      },
+    });
+    expect(tools.get("edit_survey_blocks")?.config).toMatchObject({
+      title: "Edit survey blocks",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+      },
+    });
+    // Idempotent unlike every other survey write: the same order yields the same survey, and an
+    // order that already matches performs no write at all.
+    expect(tools.get("set_survey_block_order")?.config).toMatchObject({
+      title: "Set survey block order",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
         idempotentHint: true,
       },
     });
@@ -197,6 +232,8 @@ describe("registerSurveyTools", () => {
         "defaultLanguage",
         "metadata",
         "languages",
+        "showLanguageSwitch",
+        "autoSelectLanguage",
         "welcomeCard",
         "blocks",
         "endings",
@@ -402,6 +439,138 @@ describe("registerSurveyTools", () => {
     });
   });
 
+  test("validate_survey runs the custom CSS variant read-only, even for a read-scoped OAuth token", async () => {
+    const { tools } = createToolServer();
+    const validationBody = {
+      operation: "customCss" as const,
+      workspaceId: "clxx1234567890123456789012",
+      scope: "survey" as const,
+      surveyId: "clsv1234567890123456789012",
+      data: { customCss: { light: "a{}", dark: null } },
+    };
+    vi.mocked(validateV3SurveyFromRawInput).mockResolvedValue(
+      successResponse(
+        {
+          valid: true,
+          operation: "customCss",
+          invalid_params: [],
+          customCss: { light: "x", dark: null },
+          warnings: [],
+        },
+        { requestId: "req_tool" }
+      )
+    );
+
+    const result = await tools
+      .get("validate_survey")!
+      .handler(validationBody, { http: { authInfo: readOnlyOAuthAuthInfo } });
+
+    expect(validateV3SurveyFromRawInput).toHaveBeenCalledWith(
+      expect.objectContaining({ body: validationBody })
+    );
+    expect(buildV3AuditLog).not.toHaveBeenCalled();
+    expect(result.structuredContent.data).toMatchObject({ valid: true, operation: "customCss" });
+  });
+
+  test("create_survey accepts custom CSS source and rejects compiled output at the tool boundary", () => {
+    const { tools } = createToolServer();
+    const schema = tools.get("create_survey")!.config.inputSchema as z.ZodType;
+    const base = {
+      workspaceId: "clxx1234567890123456789012",
+      name: "Styled",
+      blocks: [{ name: "Block", elements: [] }],
+    };
+
+    expect(schema.safeParse({ ...base, customCss: { light: "a{}", dark: null } }).success).toBe(true);
+    expect(schema.safeParse({ ...base, customCss: null }).success).toBe(true);
+    expect(
+      schema.safeParse({ ...base, customCss: { light: "a{}", dark: null, compiled: "x" } }).success
+    ).toBe(false);
+  });
+
+  test("create_survey takes typed embeddedFields (ENG-6930)", () => {
+    const { tools } = createToolServer();
+    const schema = tools.get("create_survey")!.config.inputSchema as z.ZodType;
+    const base = {
+      workspaceId: "clxx1234567890123456789012",
+      name: "Typed",
+      blocks: [{ name: "Block", elements: [] }],
+    };
+
+    expect(
+      schema.safeParse({
+        ...base,
+        embeddedFields: [{ key: "plan_tier" }, { name: "score", source: "computed", dataType: "number" }],
+      }).success
+    ).toBe(true);
+  });
+
+  describe("confirmation on surveys with responses (ENG-6930)", () => {
+    const surveyId = "clxx1234567890123456789012";
+    const cases: [string, Record<string, unknown>, unknown, Record<string, unknown>][] = [
+      [
+        "patch_survey",
+        { surveyId, data: { name: "Renamed" } },
+        patchV3SurveyResponse,
+        { body: { name: "Renamed" } },
+      ],
+      [
+        "edit_survey_blocks",
+        { surveyId, ops: [{ op: "remove", id: "blk_a" }] },
+        editV3SurveyBlocksResponse,
+        { body: { ops: [{ op: "remove", id: "blk_a" }] } },
+      ],
+      [
+        "set_survey_block_order",
+        { surveyId, order: ["blk_a"] },
+        setV3SurveyBlockOrderResponse,
+        { body: { order: ["blk_a"] } },
+      ],
+      ["delete_survey", { surveyId }, deleteV3Survey, {}],
+    ];
+
+    test("every tool that changes a survey takes `confirm` and hands it to the operation, not the body", async () => {
+      const { tools } = createToolServer();
+      vi.mocked(buildV3AuditLog).mockReturnValue({ status: "failure" } as unknown as TV3AuditLog);
+
+      for (const [name, input, operation, expected] of cases) {
+        vi.mocked(operation as typeof patchV3SurveyResponse).mockResolvedValue(
+          successResponse({ id: surveyId }, { requestId: "req_tool" })
+        );
+        const schema = tools.get(name)!.config.inputSchema as z.ZodType;
+        expect(schema.safeParse({ ...input, confirm: true }).success, name).toBe(true);
+        expect(String(tools.get(name)!.config.description), name).toMatch(/confirm: true/);
+
+        await tools.get(name)!.handler({ ...input, confirm: true }, { http: { authInfo } });
+
+        expect(operation, name).toHaveBeenCalledWith(
+          expect.objectContaining({ ...expected, surveyId, writeConfirmation: { confirmed: true } })
+        );
+      }
+    });
+
+    test("relays the refusal as an error carrying the caution text", async () => {
+      const { tools } = createToolServer();
+      vi.mocked(buildV3AuditLog).mockReturnValue({ status: "failure" } as unknown as TV3AuditLog);
+      vi.mocked(patchV3SurveyResponse).mockResolvedValue(
+        problemConfirmationRequired(
+          "req_tool",
+          "This survey has responses. Pass confirm: true after the user agrees."
+        )
+      );
+
+      const result = await tools
+        .get("patch_survey")!
+        .handler({ surveyId, data: { name: "Renamed" } }, { http: { authInfo } });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent.error).toMatchObject({
+        status: 428,
+        detail: "This survey has responses. Pass confirm: true after the user agrees.",
+      });
+    });
+  });
+
   test("patch_survey queues a successful audit log", async () => {
     const { tools } = createToolServer();
     const auditLog = { status: "failure" };
@@ -428,6 +597,7 @@ describe("registerSurveyTools", () => {
       requestId: "req_tool",
       instance: "/api/mcp",
       auditLog,
+      writeConfirmation: { confirmed: false },
     });
     expect(auditLog.status).toBe("success");
     expect(queueV3AuditLog).toHaveBeenCalledWith(auditLog, "req_tool", expect.any(Object));
@@ -456,6 +626,7 @@ describe("registerSurveyTools", () => {
       requestId: "req_tool",
       instance: "/api/mcp",
       auditLog,
+      writeConfirmation: { confirmed: false },
     });
     expect(auditLog.status).toBe("success");
     expect(queueV3AuditLog).toHaveBeenCalledWith(auditLog, "req_tool", expect.any(Object));
@@ -493,24 +664,49 @@ describe("registerSurveyTools", () => {
     expect(queueV3AuditLog).toHaveBeenCalledWith(auditLog, "req_tool", expect.any(Object));
   });
 
-  test("write tools return MCP errors for read-only OAuth scopes", async () => {
+  test("delete_survey relays the 409 naming the creatives that still open the survey", async () => {
     const { tools } = createToolServer();
-
-    const result = await tools.get("delete_survey")!.handler(
-      {
-        surveyId: "clxx1234567890123456789012",
-      },
-      { http: { authInfo: readOnlyOAuthAuthInfo } }
+    vi.mocked(buildV3AuditLog).mockReturnValue({ status: "failure" } as unknown as TV3AuditLog);
+    const creatives = [{ id: "clcr1234567890123456789012", name: "Feedback tab" }];
+    vi.mocked(deleteV3Survey).mockResolvedValue(
+      problemSurveyHasLinkedCreatives("req_conflict", creatives, "/api/mcp")
     );
 
-    expect(deleteV3Survey).not.toHaveBeenCalled();
+    const result = await tools
+      .get("delete_survey")!
+      .handler({ surveyId: "clxx1234567890123456789012" }, { http: { authInfo } });
+
     expect(result.isError).toBe(true);
     expect(result.structuredContent.error).toMatchObject({
-      status: 403,
-      code: "forbidden",
-      detail: "OAuth token does not include the required MCP scope: surveys:write",
-      requestId: "req_tool",
+      status: 409,
+      code: "survey_has_linked_creatives",
+      details: { creatives },
     });
+  });
+
+  test("write tools return MCP errors for read-only OAuth scopes", async () => {
+    const { tools } = createToolServer();
+    const surveyId = "clxx1234567890123456789012";
+    // Every write tool, so a new one registered under `surveys:read` by mistake fails here. For an
+    // OAuth user who holds the write role, this scope is the only barrier.
+    const cases: [string, Record<string, unknown>, unknown][] = [
+      ["delete_survey", { surveyId }, deleteV3Survey],
+      ["edit_survey_blocks", { surveyId, ops: [{ op: "remove", id: "blk_a" }] }, editV3SurveyBlocksResponse],
+      ["set_survey_block_order", { surveyId, order: ["blk_a"] }, setV3SurveyBlockOrderResponse],
+    ];
+
+    for (const [name, input, operation] of cases) {
+      const result = await tools.get(name)!.handler(input, { http: { authInfo: readOnlyOAuthAuthInfo } });
+
+      expect(operation, name).not.toHaveBeenCalled();
+      expect(result.isError, name).toBe(true);
+      expect(result.structuredContent.error, name).toMatchObject({
+        status: 403,
+        code: "forbidden",
+        detail: "OAuth token does not include the required MCP scope: surveys:write",
+        requestId: "req_tool",
+      });
+    }
   });
 
   // Covers the MCP scope gate only — validateV3SurveyFromRawInput is mocked here, so this passed
@@ -574,69 +770,8 @@ describe("registerSurveyTools", () => {
  * the strictness is genuinely load-bearing and removing it fails this test.
  */
 describe("tool arguments are validated by the SDK (ENG-2256)", () => {
-  type ToolCallOutcome = {
-    result?: { isError?: boolean; content?: { type: string; text?: string }[] };
-  };
-
-  // Both protocol legs are exercised: the one endpoint answers both (`mcp-handler` serves with
-  // `legacy: "stateless"`), and validation must not differ between them. A 2026-07-28 request carries
-  // the `Mcp-Method`/`Mcp-Name` headers and the `_meta` envelope the revision requires; a legacy one is
-  // a plain JSON-RPC POST whose response comes back SSE-framed.
-  const callTool = async (
-    name: string,
-    args: Record<string, unknown>,
-    era: "modern" | "legacy" = "modern"
-  ): Promise<ToolCallOutcome> => {
-    const handler = createMcpHandler(() => {
-      const server = new McpServer({ name: "test", version: "0.0.0" });
-      registerSurveyTools(server);
-      return server;
-    });
-
-    const modern = era === "modern";
-    const response = await handler.fetch(
-      new Request("https://formbricks.test/api/mcp", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          ...(modern ? { "Mcp-Method": "tools/call", "Mcp-Name": name } : {}),
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "tools/call",
-          params: {
-            name,
-            arguments: args,
-            ...(modern
-              ? {
-                  _meta: {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                  },
-                }
-              : {}),
-          },
-        }),
-      }),
-      { authInfo }
-    );
-
-    const text = await response.text();
-    const payload = response.headers.get("content-type")?.includes("text/event-stream")
-      ? text
-          .split("\n")
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice("data:".length).trim())
-          .join("")
-      : text;
-
-    return JSON.parse(payload) as ToolCallOutcome;
-  };
-
-  const errorText = (outcome: ToolCallOutcome) =>
-    outcome.result?.content?.map((block) => block.text ?? "").join("") ?? "";
+  const callTool = (name: string, args: Record<string, unknown>, era?: ToolCallEra) =>
+    callToolOverHttp({ registerTools: registerSurveyTools, authInfo, name, args, era });
 
   test.each(["modern", "legacy"] as const)(
     "rejects an undeclared argument instead of silently dropping it (%s era)",
@@ -691,5 +826,165 @@ describe("tool arguments are validated by the SDK (ENG-2256)", () => {
 
     expect(outcome.result?.isError).toBeUndefined();
     expect(listV3Surveys).toHaveBeenCalled();
+  });
+
+  describe("block editing tools (ENG-3069)", () => {
+    const surveyId = "clxx1234567890123456789012";
+    const fullResource = {
+      id: surveyId,
+      name: "Survey",
+      updatedAt: "2026-04-21T10:00:00.000Z",
+      blocks: [{ id: "blk_a" }, { id: "blk_b" }],
+    };
+
+    test("edit_survey_blocks forwards the ops body and queues a successful audit log", async () => {
+      const { tools } = createToolServer();
+      const auditLog = { status: "failure" };
+      vi.mocked(buildV3AuditLog).mockReturnValue(auditLog as any);
+      vi.mocked(editV3SurveyBlocksResponse).mockResolvedValue(
+        successResponse(fullResource, { requestId: "req_tool" })
+      );
+
+      const result = await tools.get("edit_survey_blocks")!.handler(
+        {
+          surveyId,
+          ops: [{ op: "remove", id: "blk_b" }],
+          expectedUpdatedAt: "2026-04-21T10:00:00.000Z",
+        },
+        { http: { authInfo } }
+      );
+
+      expect(buildV3AuditLog).toHaveBeenCalledWith(apiKeyAuth, "updated", "survey", ABSOLUTE_MCP_AUDIT_URL);
+      expect(editV3SurveyBlocksResponse).toHaveBeenCalledWith({
+        surveyId,
+        body: { ops: [{ op: "remove", id: "blk_b" }], expectedUpdatedAt: "2026-04-21T10:00:00.000Z" },
+        authentication: apiKeyAuth,
+        requestId: "req_tool",
+        instance: "/api/mcp",
+        auditLog,
+        writeConfirmation: { confirmed: false },
+      });
+      expect(auditLog).toMatchObject({ status: "success" });
+      expect(queueV3AuditLog).toHaveBeenCalledWith(auditLog, "req_tool", expect.any(Object));
+      expect(result.structuredContent).toEqual({
+        data: {
+          id: surveyId,
+          updatedAt: "2026-04-21T10:00:00.000Z",
+          blockCount: 2,
+          applied: [{ op: "remove", id: "blk_b" }],
+        },
+        requestId: "req_tool",
+      });
+    });
+
+    test("reports the generated id of an inserted block, so the agent can reference it", async () => {
+      const { tools } = createToolServer();
+      vi.mocked(buildV3AuditLog).mockReturnValue({ status: "failure" } as any);
+      vi.mocked(editV3SurveyBlocksResponse).mockResolvedValue(
+        successResponse(fullResource, { requestId: "req_tool" })
+      );
+
+      const result = await tools
+        .get("edit_survey_blocks")!
+        .handler(
+          { surveyId, ops: [{ op: "insert", block: { name: "No id" }, position: { type: "end" } }] },
+          { http: { authInfo } }
+        );
+
+      expect((result.structuredContent as any).data.applied).toEqual([
+        { op: "insert", id: "generated_block_id" },
+      ]);
+      // and the operation receives the same minted id, not a second one
+      expect(vi.mocked(editV3SurveyBlocksResponse).mock.calls[0][0].body).toMatchObject({
+        ops: [{ block: { id: "generated_block_id" } }],
+      });
+    });
+
+    test("edit_survey_blocks returns the full resource when asked for detail", async () => {
+      const { tools } = createToolServer();
+      vi.mocked(buildV3AuditLog).mockReturnValue({ status: "failure" } as any);
+      vi.mocked(editV3SurveyBlocksResponse).mockResolvedValue(
+        successResponse(fullResource, { requestId: "req_tool" })
+      );
+
+      const result = await tools
+        .get("edit_survey_blocks")!
+        .handler(
+          { surveyId, ops: [{ op: "remove", id: "blk_b" }], response_format: "detailed" },
+          { http: { authInfo } }
+        );
+
+      expect(result.structuredContent).toEqual({ data: fullResource, requestId: "req_tool" });
+    });
+
+    test("a 409 reaches the agent with both timestamps intact", async () => {
+      const { tools } = createToolServer();
+      vi.mocked(buildV3AuditLog).mockReturnValue({ status: "failure" } as any);
+      vi.mocked(editV3SurveyBlocksResponse).mockResolvedValue(
+        problemConflict("req_conflict", "stale", "/api/mcp", {
+          details: {
+            expectedUpdatedAt: "2026-04-21T10:00:00.000Z",
+            currentUpdatedAt: "2026-04-21T11:30:00.000Z",
+          },
+        })
+      );
+
+      const result = await tools
+        .get("edit_survey_blocks")!
+        .handler({ surveyId, ops: [{ op: "remove", id: "blk_b" }] }, { http: { authInfo } });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent.error).toMatchObject({
+        status: 409,
+        details: {
+          expectedUpdatedAt: "2026-04-21T10:00:00.000Z",
+          currentUpdatedAt: "2026-04-21T11:30:00.000Z",
+        },
+      });
+    });
+
+    test("set_survey_block_order forwards the order and echoes it back concisely", async () => {
+      const { tools } = createToolServer();
+      vi.mocked(buildV3AuditLog).mockReturnValue({ status: "failure" } as any);
+      vi.mocked(setV3SurveyBlockOrderResponse).mockResolvedValue(
+        successResponse(fullResource, { requestId: "req_tool" })
+      );
+
+      const result = await tools
+        .get("set_survey_block_order")!
+        .handler({ surveyId, order: ["blk_b", "blk_a"] }, { http: { authInfo } });
+
+      expect(setV3SurveyBlockOrderResponse).toHaveBeenCalledWith(
+        expect.objectContaining({ surveyId, body: { order: ["blk_b", "blk_a"] } })
+      );
+      expect(result.structuredContent).toEqual({
+        data: {
+          id: surveyId,
+          updatedAt: "2026-04-21T10:00:00.000Z",
+          blockCount: 2,
+          order: ["blk_b", "blk_a"],
+        },
+        requestId: "req_tool",
+      });
+    });
+
+    test.each(["edit_survey_blocks", "set_survey_block_order"])(
+      "%s is denied to a read-only OAuth token",
+      async (toolName) => {
+        const { tools } = createToolServer();
+        const input =
+          toolName === "edit_survey_blocks"
+            ? { surveyId, ops: [{ op: "remove", id: "blk_b" }] }
+            : { surveyId, order: ["blk_a"] };
+
+        const result = await tools
+          .get(toolName)!
+          .handler(input, { http: { authInfo: readOnlyOAuthAuthInfo } });
+
+        expect(result.isError).toBe(true);
+        expect(editV3SurveyBlocksResponse).not.toHaveBeenCalled();
+        expect(setV3SurveyBlockOrderResponse).not.toHaveBeenCalled();
+      }
+    );
   });
 });

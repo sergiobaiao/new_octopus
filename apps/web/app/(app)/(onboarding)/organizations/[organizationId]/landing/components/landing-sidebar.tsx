@@ -10,7 +10,10 @@ import { TUser } from "@formbricks/types/user";
 import { getOrganizationsForSwitcherAction } from "@/app/(app)/workspaces/[workspaceId]/actions";
 import FBLogo from "@/images/formbricks-wordmark.svg";
 import { cn } from "@/lib/cn";
-import { SwitcherDropdownBody } from "@/modules/settings/components/switcher-dropdown-body";
+import {
+  SWITCHER_DROPDOWN_CONTENT_CLASS_NAME,
+  SwitcherDropdownBody,
+} from "@/modules/settings/components/switcher-dropdown-body";
 import { UserDropdown } from "@/modules/settings/components/user-dropdown";
 import { useSwitcherData } from "@/modules/settings/hooks/use-switcher-data";
 import {
@@ -21,15 +24,13 @@ import {
 
 interface LandingSidebarProps {
   user: TUser;
-  organization: TOrganization;
-  publicDomain: string;
+  organization: Pick<TOrganization, "id" | "name">;
   isFormbricksSurveysConfigured: boolean;
 }
 
 export const LandingSidebar = ({
   user,
   organization,
-  publicDomain,
   isFormbricksSurveysConfigured,
 }: Readonly<LandingSidebarProps>) => {
   const [isOrgDropdownOpen, setIsOrgDropdownOpen] = useState(false);
@@ -39,8 +40,10 @@ export const LandingSidebar = ({
   const { t } = useTranslation();
 
   const organizationSwitcher = useSwitcherData(
-    () => getOrganizationsForSwitcherAction({ organizationId: organization.id }),
-    t("common.failed_to_load_organizations")
+    () => getOrganizationsForSwitcherAction(),
+    t("common.failed_to_load_organizations"),
+    undefined,
+    organization.name
   );
   const { load: loadOrganizations } = organizationSwitcher;
 
@@ -86,7 +89,12 @@ export const LandingSidebar = ({
               <ChevronRightIcon className="size-4 shrink-0 text-slate-600" strokeWidth={1.5} />
             </button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent side="right" sideOffset={10} alignOffset={5} align="end">
+          <DropdownMenuContent
+            side="right"
+            sideOffset={10}
+            alignOffset={5}
+            align="end"
+            className={SWITCHER_DROPDOWN_CONTENT_CLASS_NAME}>
             <SwitcherDropdownBody
               type="organization"
               isLoading={organizationSwitcher.isLoading}
@@ -103,7 +111,6 @@ export const LandingSidebar = ({
         <UserDropdown
           user={user}
           organizationId={organization.id}
-          publicDomain={publicDomain}
           className="rounded-br-xl"
           isFormbricksSurveysConfigured={isFormbricksSurveysConfigured}
         />

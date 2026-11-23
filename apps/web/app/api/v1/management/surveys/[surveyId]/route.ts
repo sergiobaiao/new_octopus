@@ -1,10 +1,14 @@
 import { logger } from "@formbricks/logger";
 import { TAuthenticationApiKey } from "@formbricks/types/auth";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
-import { ZSurveyUpdateInput } from "@formbricks/types/surveys/types";
+import {
+  ZStoredSurveyVariables,
+  ZSurveyHiddenFields,
+  ZSurveyUpdateInput,
+} from "@formbricks/types/surveys/types";
 import { handleErrorResponse } from "@/app/api/v1/auth";
 import { deleteSurvey } from "@/app/api/v1/management/surveys/[surveyId]/lib/surveys";
-import { checkFeaturePermissions } from "@/app/api/v1/management/surveys/lib/utils";
+import { checkSurveyWritePermissions } from "@/app/api/v1/management/surveys/lib/utils";
 import {
   addLegacyProjectOverwrites,
   normaliseProjectOverwritesToWorkspace,
@@ -16,7 +20,7 @@ import {
 import { RequestBodyTooLargeError, parseJsonBodyWithLimit } from "@/app/lib/api/request-body";
 import { responses } from "@/app/lib/api/response";
 import {
-  transformQuestionsToBlocks,
+  transformQuestionsToBlocksWithoutCodeFill,
   validateSurveyInput,
   withDerivedQuestions,
   withoutInternalSurveyProjections,
@@ -25,14 +29,17 @@ import { transformErrorToDetails } from "@/app/lib/api/validator";
 import { THandlerParams, withV1ApiWrapper } from "@/app/lib/api/with-api-logging";
 import { can } from "@/lib/authorization";
 import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { getLegacyWriteEmbeddedFields } from "@/lib/embedded-data/reconcile";
 import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
 import { getSurvey, updateSurvey } from "@/lib/survey/service";
+import { resolveSurveyActorContext } from "@/lib/survey/visibility/actor-context";
+import { SURVEY_ACTION_FOR_METHOD, canApiKeyReachSurveyResource } from "@/lib/survey/visibility/api-key";
 import { resolveStorageUrlsInObject } from "@/modules/storage/utils";
 
 type TSurveyUpdateBody = Record<string, unknown> & {
   blocks?: Parameters<typeof validateSurveyInput>[0]["blocks"];
-  endings?: Parameters<typeof transformQuestionsToBlocks>[1];
-  questions?: Parameters<typeof transformQuestionsToBlocks>[0];
+  endings?: Parameters<typeof transformQuestionsToBlocksWithoutCodeFill>[1];
+  questions?: Parameters<typeof transformQuestionsToBlocksWithoutCodeFill>[0];
 };
 
 const fetchAndAuthorizeSurvey = async (
@@ -49,6 +56,15 @@ const fetchAndAuthorizeSurvey = async (
       { type: "apiKey", id: authentication.apiKeyId },
       getWorkspaceAuthorizationActionForMethod(requiredPermission),
       { type: "workspace", id: survey.workspaceId }
+    )) ||
+    // ENG-3282: an API key never reaches a restricted survey — the same answer as a foreign one.
+    !(await canApiKeyReachSurveyResource(
+      authentication.apiKeyId,
+      SURVEY_ACTION_FOR_METHOD[requiredPermission],
+      {
+        type: "survey",
+        id: survey.id,
+      }
     ))
   ) {
     return { error: responses.unauthorizedResponse() };
@@ -125,7 +141,7 @@ export const DELETE = withV1ApiWrapper({
         auditLog.oldObject = result.survey;
       }
 
-      deletedSurvey = await deleteSurvey(params.surveyId);
+      deletedSurvey = await deleteSurvey(params.surveyId, auditLog);
     } catch (error) {
       return handleErrorResponse(error);
     }
@@ -202,16 +218,26 @@ export const PUT = withV1ApiWrapper({
       const { hasQuestions } = validateResult.data;
 
       if (hasQuestions) {
-        surveyUpdate.blocks = transformQuestionsToBlocks(
+        // Codes are left to `updateSurveyInternal`: it keeps the stored code of an element by id before it
+        // fills what is still missing, which a positional fill here would defeat.
+        surveyUpdate.blocks = transformQuestionsToBlocksWithoutCodeFill(
           surveyUpdate.questions ?? [],
           surveyUpdate.endings || result.survey.endings
         );
         surveyUpdate.questions = [];
       }
 
+      const merged = { ...result.survey, ...surveyUpdate };
       const inputValidation = ZSurveyUpdateInput.safeParse({
-        ...result.survey,
-        ...surveyUpdate,
+        ...merged,
+        // Read by the validation and never output (ENG-6935): the rows this legacy write leaves the
+        // survey with, so logic resolves a computed date the legacy `variables` can't say. A body's
+        // own `embeddedFields` is neither validated against nor written.
+        // Malformed legacy keys count as absent here; the parse reports them at their own path.
+        embeddedFields: getLegacyWriteEmbeddedFields(result.survey.embeddedFields ?? [], {
+          variables: ZStoredSurveyVariables.safeParse(merged.variables).data,
+          hiddenFields: ZSurveyHiddenFields.safeParse(merged.hiddenFields).data,
+        }),
       });
 
       if (!inputValidation.success) {
@@ -223,9 +249,10 @@ export const PUT = withV1ApiWrapper({
         };
       }
 
-      const featureCheckResult = await checkFeaturePermissions(
-        surveyUpdate as Parameters<typeof checkFeaturePermissions>[0],
+      const featureCheckResult = await checkSurveyWritePermissions(
+        surveyUpdate as Parameters<typeof checkSurveyWritePermissions>[0],
         organization,
+        { apiKeyId: authentication.apiKeyId, workspaceId: result.survey.workspaceId },
         result.survey
       );
       if (featureCheckResult) {
@@ -235,7 +262,15 @@ export const PUT = withV1ApiWrapper({
       }
 
       try {
-        const updatedSurvey = await updateSurvey({ ...inputValidation.data, id: params.surveyId });
+        const updatedSurvey = await updateSurvey(
+          { ...inputValidation.data, id: params.surveyId },
+          {
+            targetingActor: await resolveSurveyActorContext(
+              { type: "apiKey", id: authentication.apiKeyId },
+              organization.id
+            ),
+          }
+        );
         if (auditLog) {
           auditLog.newObject = updatedSurvey;
         }

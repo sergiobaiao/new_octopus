@@ -16,6 +16,7 @@ export * as $Enums from "../generated/prisma/enums";
 export * from "../generated/prisma/enums";
 export type * from "../generated/prisma/models";
 export type {
+  AttachmentExport,
   Webhook,
   ContactAttribute,
   ContactAttributeKey,
@@ -63,6 +64,11 @@ export type {
   WorkflowVersion,
   WorkflowRun,
   WorkflowRunLog,
+  Creative,
+  CreativeTrigger,
+  CreativeLanguage,
+  CreativeDailyStat,
+  CreativeDailyPageStat,
 } from "../generated/prisma/client";
 // Reaches into the generator's `internal/` path because Prisma 7's
 // `prisma-client` provider does not re-export PrismaClientKnownRequestError
@@ -72,6 +78,12 @@ export { PrismaClientKnownRequestError } from "../generated/prisma/internal/pris
 export const Prisma = GeneratedPrisma;
 
 export namespace Prisma {
+  /**
+   * The tagged-template SQL fragment `Prisma.sql` returns. Derived from the runtime class rather than
+   * re-exported, because Prisma 7 declares it in `@prisma/client-runtime-utils` and the generated client
+   * does not surface the type — so a caller composing `$queryRaw` fragments has nothing to annotate with.
+   */
+  export type Sql = InstanceType<typeof GeneratedPrisma.Sql>;
   export type InputJsonValue = PrismaNamespaceTypes.InputJsonValue;
   export type JsonObject = PrismaNamespaceTypes.JsonObject;
   export type JsonValue = PrismaNamespaceTypes.JsonValue;
@@ -85,7 +97,14 @@ export namespace Prisma {
     GlobalOmitOptions = {},
   > = PrismaNamespaceTypes.TypeMap<ExtArgs, GlobalOmitOptions>;
   export type ActionClassSelect = PrismaModelTypes.ActionClassSelect;
+  export type AttachmentExportGetPayload<
+    S extends boolean | null | undefined | PrismaModelTypes.AttachmentExportDefaultArgs,
+  > = PrismaModelTypes.AttachmentExportGetPayload<S>;
+  export type AttachmentExportSelect = PrismaModelTypes.AttachmentExportSelect;
   export type ChartFindManyArgs = PrismaModelTypes.ChartFindManyArgs;
+  export type ChartGetPayload<S extends boolean | null | undefined | PrismaModelTypes.ChartDefaultArgs> =
+    PrismaModelTypes.ChartGetPayload<S>;
+  export type ChartSelect = PrismaModelTypes.ChartSelect;
   export type ContactAttributeKeyCreateInput = PrismaModelTypes.ContactAttributeKeyCreateInput;
   export type ContactAttributeKeyCreateWithoutWorkspaceInput =
     PrismaModelTypes.ContactAttributeKeyCreateWithoutWorkspaceInput;
@@ -97,10 +116,25 @@ export namespace Prisma {
   export type ContactInclude = PrismaModelTypes.ContactInclude;
   export type ContactSelect = PrismaModelTypes.ContactSelect;
   export type ContactWhereInput = PrismaModelTypes.ContactWhereInput;
+  export type CreativeGetPayload<
+    S extends boolean | null | undefined | PrismaModelTypes.CreativeDefaultArgs,
+  > = PrismaModelTypes.CreativeGetPayload<S>;
+  export type CreativeInclude = PrismaModelTypes.CreativeInclude;
+  export type CreativeSelect = PrismaModelTypes.CreativeSelect;
+  export type CreativeWhereInput = PrismaModelTypes.CreativeWhereInput;
   export type DashboardFindManyArgs = PrismaModelTypes.DashboardFindManyArgs;
+  export type DashboardGetPayload<
+    S extends boolean | null | undefined | PrismaModelTypes.DashboardDefaultArgs,
+  > = PrismaModelTypes.DashboardGetPayload<S>;
+  export type DashboardSelect = PrismaModelTypes.DashboardSelect;
+  export type DashboardWidgetGetPayload<
+    S extends boolean | null | undefined | PrismaModelTypes.DashboardWidgetDefaultArgs,
+  > = PrismaModelTypes.DashboardWidgetGetPayload<S>;
+  export type DashboardWidgetSelect = PrismaModelTypes.DashboardWidgetSelect;
   export type DateTimeFilter = PrismaModelTypes.DateTimeFilter;
   export type DateTimeNullableFilter = PrismaModelTypes.DateTimeNullableFilter;
   export type DisplaySelect = PrismaModelTypes.DisplaySelect;
+  export type EmbeddedDataSelect = PrismaModelTypes.EmbeddedDataSelect;
   export type FeedbackDirectoryUpdateInput = PrismaModelTypes.FeedbackDirectoryUpdateInput;
   export type FeedbackDirectoryWorkspaceUpdateManyWithoutFeedbackDirectoryNestedInput =
     PrismaModelTypes.FeedbackDirectoryWorkspaceUpdateManyWithoutFeedbackDirectoryNestedInput;

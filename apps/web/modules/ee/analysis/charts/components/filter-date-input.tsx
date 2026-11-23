@@ -6,6 +6,8 @@ import { formatLocalDay } from "@/lib/utils/datetime";
 import { DatePicker } from "@/modules/ui/components/date-picker";
 
 interface FilterDateInputProps {
+  /** The trigger's id, so a `<Label htmlFor>` names it. */
+  id?: string;
   value: string;
   onChange: (value: string | null) => void;
 }
@@ -15,7 +17,7 @@ interface FilterDateInputProps {
  * Stores the picked day as a `yyyy-MM-dd` string (the machine value Cube expects for time
  * filters) while the shared picker renders it locale-aware.
  */
-export function FilterDateInput({ value, onChange }: Readonly<FilterDateInputProps>) {
+export function FilterDateInput({ id, value, onChange }: Readonly<FilterDateInputProps>) {
   const { i18n } = useTranslation();
 
   const parsed = value ? parseISO(value) : null;
@@ -23,11 +25,12 @@ export function FilterDateInput({ value, onChange }: Readonly<FilterDateInputPro
 
   return (
     <DatePicker
+      id={id}
       value={selectedDate}
       locale={i18n.resolvedLanguage ?? i18n.language ?? "en-US"}
-      // The wrapper is the flex item in the filter row, so the sizing belongs there; the trigger
-      // only has to stop insisting on its own 280px.
-      className="min-w-0 flex-1 basis-36"
+      // Fills its cell in the conditions editor row; the trigger only has to stop insisting on its
+      // own 280px.
+      className="w-full min-w-0"
       triggerClassName="w-full"
       onChange={(date) => onChange(formatLocalDay(date))}
     />

@@ -9,6 +9,7 @@ import {
 } from "@formbricks/types/integration/notion";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
+import { useIntegration } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/hooks/use-integration";
 import { AddIntegrationModal } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/notion/components/AddIntegrationModal";
 import { ManageIntegration } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/notion/components/ManageIntegration";
 import notionLogo from "@/images/notion.png";
@@ -21,21 +22,24 @@ interface NotionWrapperProps {
   workspaceId: string;
   webAppUrl: string;
   surveys: TSurvey[];
+  surveyVisibilityEnabled: boolean;
   databasesArray: TIntegrationNotionDatabase[];
   locale: TUserLocale;
   contactAttributeKeys: TContactAttributeKey[];
 }
 
 export const NotionWrapper = ({
-  notionIntegration,
+  notionIntegration: initialNotionIntegration,
   enabled,
   workspaceId,
   webAppUrl,
   surveys,
+  surveyVisibilityEnabled,
   databasesArray,
   locale,
   contactAttributeKeys,
-}: NotionWrapperProps) => {
+}: Readonly<NotionWrapperProps>) => {
+  const notionIntegration = useIntegration(workspaceId, "notion", initialNotionIntegration);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isConnected, setIsConnected] = useState(
     notionIntegration ? !!notionIntegration.config.key?.bot_id : false
@@ -59,6 +63,7 @@ export const NotionWrapper = ({
           <AddIntegrationModal
             workspaceId={workspaceId}
             surveys={surveys}
+            surveyVisibilityEnabled={surveyVisibilityEnabled}
             open={isModalOpen}
             setOpen={setIsModalOpen}
             notionIntegration={notionIntegration}
@@ -68,6 +73,8 @@ export const NotionWrapper = ({
           />
           <ManageIntegration
             notionIntegration={notionIntegration}
+            surveys={surveys}
+            surveyVisibilityEnabled={surveyVisibilityEnabled}
             setOpenAddIntegrationModal={setIsModalOpen}
             setIsConnected={setIsConnected}
             setSelectedIntegration={setSelectedIntegration}

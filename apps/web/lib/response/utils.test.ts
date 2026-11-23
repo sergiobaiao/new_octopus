@@ -1,17 +1,21 @@
 import { describe, expect, test } from "vitest";
+import * as xlsx from "xlsx";
 import { Prisma } from "@formbricks/database/prisma";
+import { embeddedFieldsFromLegacyInput } from "@formbricks/types/embedded-data-mapping";
 import {
   type TEmbeddedValueResponse,
-  deriveLegacyEmbeddedData,
+  type TLinkedEmbeddedField,
 } from "@formbricks/types/embedded-data-resolver";
 import { InvalidInputError } from "@formbricks/types/errors";
 import { TResponse, TResponseFilterCriteria, ZResponseFilterCriteria } from "@formbricks/types/responses";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurvey } from "@formbricks/types/surveys/types";
+import { convertToCsv, convertToXlsxBuffer } from "@/lib/utils/file-conversion";
 import {
   calculateTtcTotal,
   extractChoiceIdsFromResponse,
   extractSurveyDetails,
+  getChoiceIdByValue,
   getReservedFilterEntries,
   getResponseContactAttributes,
   getResponseHiddenFields,
@@ -32,7 +36,13 @@ import { RESERVED_FILTER_LOCATORS, buildWhereClause } from "./where-clause";
 // generic: inferring the type parameter from those uses made TypeScript demand the whole survey
 // shape from fixtures that are partial on purpose.
 const asRead = (survey: Partial<TSurvey>): TSurvey =>
-  ({ ...survey, embeddedFields: deriveLegacyEmbeddedData(survey) }) as unknown as TSurvey;
+  ({ ...survey, embeddedFields: embeddedFieldsFromLegacyInput(survey) }) as unknown as TSurvey;
+
+/** One stored ingested row whose display name need not match the key its value lives under. */
+const ingestedRow = (name: string, storageKey: string): TLinkedEmbeddedField => ({
+  field: { name, key: null, source: "ingested", dataType: "string", defaultValue: null, locked: false },
+  link: { storageKey },
+});
 
 describe("Response Utils", () => {
   describe("calculateTtcTotal", () => {
@@ -50,6 +60,50 @@ describe("Response Utils", () => {
       const ttc = {};
       const result = calculateTtcTotal(ttc);
       expect(result._total).toBe(0);
+    });
+  });
+
+  describe("getChoiceIdByValue", () => {
+    const element = {
+      id: "q1",
+      type: "multipleChoiceSingle",
+      choices: [
+        { id: "alpha", label: { default: "Alpha", de: "Alpha-DE" } },
+        { id: "no", label: { default: "No", de: "Nein" } },
+        { id: "other", label: { default: "Other", de: "Andere" } },
+      ],
+    } as any;
+
+    test("matches the default label", () => {
+      expect(getChoiceIdByValue("No", element)).toBe("no");
+    });
+
+    test("matches a translated label for the response language", () => {
+      expect(getChoiceIdByValue("Alpha-DE", element, "de")).toBe("alpha");
+    });
+
+    test("prefers the response-language label over an earlier choice's default label", () => {
+      const clash = {
+        ...element,
+        choices: [
+          { id: "first", label: { default: "Nein", de: "Erste" } },
+          { id: "second", label: { default: "Second", de: "Nein" } },
+        ],
+      };
+      expect(getChoiceIdByValue("Nein", clash, "de")).toBe("second");
+    });
+
+    test("falls back to the default label when the choice has no translation", () => {
+      const untranslated = { ...element, choices: [{ id: "c", label: { default: "Maybe" } }] };
+      expect(getChoiceIdByValue("Maybe", untranslated, "de")).toBe("c");
+    });
+
+    test("does not match other languages' labels as free text", () => {
+      expect(getChoiceIdByValue("Nein", element)).toBe("other");
+    });
+
+    test("falls back to other for free text", () => {
+      expect(getChoiceIdByValue("something else", element, "de")).toBe("other");
     });
   });
 
@@ -72,6 +126,16 @@ describe("Response Utils", () => {
       const filterCriteria = { finished: true };
       const result = buildWhereClause(mockSurvey as TSurvey, filterCriteria);
       expect(result.AND).toContainEqual({ finished: true });
+    });
+
+    test("should build where clause with the Low quality outcome filter", () => {
+      const result = buildWhereClause(mockSurvey as TSurvey, { outcome: "lowQuality" });
+      expect(result.AND).toContainEqual({ outcome: "lowQuality" });
+    });
+
+    test("should not constrain the outcome unless asked to", () => {
+      const result = buildWhereClause(mockSurvey as TSurvey, { finished: true });
+      expect(result.AND).not.toContainEqual(expect.objectContaining({ outcome: expect.anything() }));
     });
 
     test("should build where clause with date range", () => {
@@ -99,6 +163,20 @@ describe("Response Utils", () => {
       };
       const result = buildWhereClause(mockSurvey as TSurvey, filterCriteria);
       expect(result.AND).toHaveLength(1);
+    });
+
+    test("tagged with any of: one clause that matches either tag, beside the must-have ones", () => {
+      const result = buildWhereClause(mockSurvey as TSurvey, {
+        tags: { applied: ["beta"], appliedAny: ["vip", "churn risk"] },
+      });
+      expect(result.AND).toEqual([
+        {
+          AND: [
+            { tags: { some: { tag: { name: "beta" } } } },
+            { tags: { some: { tag: { name: { in: ["vip", "churn risk"] } } } } },
+          ],
+        },
+      ]);
     });
 
     test("should build where clause with contact attributes", () => {
@@ -400,6 +478,28 @@ describe("Response Utils", () => {
       ]);
     });
 
+    test("matrix rules on several rows all apply", () => {
+      const res = buildWhereClause(
+        {
+          id: "s4",
+          blocks: [],
+          questions: [],
+          hiddenFields: { enabled: false, fieldIds: [] },
+        } as unknown as TSurvey,
+        {
+          data: { qM: { op: "matrix", value: { R1: "foo", R2: "bar" } } },
+        }
+      );
+      expect(res.AND).toEqual([
+        {
+          AND: [
+            { data: { path: ["qM", "R1"], equals: "foo" } },
+            { data: { path: ["qM", "R2"], equals: "bar" } },
+          ],
+        },
+      ]);
+    });
+
     test("includesOne: multiple choice multi with other choice selected", () => {
       const choiceSurvey: Partial<TSurvey> = {
         id: "s4",
@@ -541,6 +641,71 @@ describe("Response Utils", () => {
         expect(ZResponseFilterCriteria.safeParse(withKeys(field, 500)).success).toBe(true);
         expect(ZResponseFilterCriteria.safeParse(withKeys(field, 501)).success).toBe(false);
       });
+    });
+
+    test("dataAnd conditions apply alongside data on the same key", () => {
+      const survey = {
+        id: "s6",
+        blocks: [],
+        questions: [],
+        hiddenFields: { enabled: false, fieldIds: [] },
+      } as unknown as TSurvey;
+      const result = buildWhereClause(survey, {
+        data: { qRating: { op: "lessThan", value: 5 } },
+        dataAnd: [{ key: "qRating", condition: { op: "greaterThan", value: 1 } }],
+      });
+      expect(result.AND).toEqual([
+        {
+          AND: [{ data: { path: ["qRating"], lt: 5 } }, { data: { path: ["qRating"], gt: 1 } }],
+        },
+      ]);
+    });
+
+    test("includesAll with Other needs the picked choices and a write-in", () => {
+      const survey = {
+        id: "s5",
+        blocks: [
+          {
+            id: "b1",
+            name: "Block 1",
+            elements: [
+              {
+                id: "qMulti",
+                type: TSurveyElementTypeEnum.MultipleChoiceMulti,
+                headline: { default: "Pick many" },
+                required: false,
+                choices: [
+                  { id: "a", label: { default: "A" } },
+                  { id: "other", label: { default: "Other" } },
+                ],
+                shuffleOption: "none",
+              },
+            ],
+          },
+        ],
+        questions: [],
+        hiddenFields: { enabled: false, fieldIds: [] },
+      } as unknown as TSurvey;
+
+      const result = buildWhereClause(survey, {
+        data: { qMulti: { op: "includesAll", value: ["A", "Other"] } },
+      });
+
+      expect(result.AND).toEqual([
+        {
+          AND: [
+            { data: { path: ["qMulti"], array_contains: ["A"] } },
+            {
+              OR: Array.from({ length: 10 }, (_unused, index) => ({
+                AND: [
+                  { data: { path: ["qMulti", String(index)], not: Prisma.DbNull } },
+                  { data: { path: ["qMulti", String(index)], not: "A" } },
+                ],
+              })),
+            },
+          ],
+        },
+      ]);
     });
 
     describe("includesOne: 'Other' clause budget (ENG-3161)", () => {
@@ -1270,9 +1435,9 @@ describe("Response Utils", () => {
 
     /**
      * ENG-1837: the export columns are built from the survey's Embedded Data definitions rather than
-     * `variables` / `hiddenFields`. Both the grouping (variables labelled by name, hidden fields by
-     * storage key) and the order inside each group are user-visible CSV/XLSX header order, so they
-     * are asserted exactly, not by membership.
+     * `variables` / `hiddenFields`. Both the grouping (both groups labelled by name since ENG-3233)
+     * and the order inside each group are user-visible CSV/XLSX header order, so they are asserted
+     * exactly, not by membership.
      */
     describe("Embedded Data columns", () => {
       // Legacy columns populated, join absent — `embeddedFields` is cleared explicitly because
@@ -1339,6 +1504,57 @@ describe("Response Utils", () => {
         expect(result.variables).toEqual(["renamed_tier", "score"]);
         expect(result.hiddenFields).toEqual(["utm_source"]);
       });
+
+      /**
+       * ENG-3233. A shared library field's name differs from the key its value is stored under, and
+       * so does any renamed local one; the header is the name either way. Red on main, which
+       * exported `utm_campaign`.
+       */
+      test("an ingested column is headed by the field's name, not its storage key", () => {
+        const renamed = {
+          ...legacySurvey,
+          embeddedFields: [ingestedRow("Campaign", "utm_campaign")],
+        } as TSurvey;
+
+        expect(extractSurveyDetails(renamed, mockResponses as TResponse[]).hiddenFields).toEqual([
+          "Campaign",
+        ]);
+      });
+
+      test("two ingested fields sharing a name keep distinct headers", () => {
+        // Names carry no uniqueness constraint, and the rows below are keyed by header — two equal
+        // headers would drop a column's values into the other's.
+        const colliding = {
+          ...legacySurvey,
+          embeddedFields: [ingestedRow("Channel", "utm_channel"), ingestedRow("Channel", "partner_ref")],
+        } as TSurvey;
+
+        expect(extractSurveyDetails(colliding, mockResponses as TResponse[]).hiddenFields).toEqual([
+          "Channel",
+          "Channel (partner_ref)",
+        ]);
+      });
+
+      /**
+       * The other half of the same rule, and the one a name-only allocation misses: the row object
+       * is keyed by header across the *whole* schema, not just this group, so a display name equal
+       * to a column the export already writes would overwrite that column rather than add one. A
+       * storage key never could — it is a safe identifier — but a library field's name is free text.
+       */
+      test.each([
+        ["a fixed column", "Response ID", "resp_id", "Response ID (resp_id)"],
+        // `formatFieldNameToTitleCase` heads the reserved `source` entry exactly this way.
+        ["a reserved column", "Source", "utm_source", "Source (utm_source)"],
+      ])("an ingested field named like %s does not take it", (_case, name, storageKey, expected) => {
+        const shadowing = {
+          ...legacySurvey,
+          embeddedFields: [ingestedRow(name, storageKey)],
+        } as TSurvey;
+
+        expect(extractSurveyDetails(shadowing, mockResponses as TResponse[]).hiddenFields).toEqual([
+          expected,
+        ]);
+      });
     });
   });
 
@@ -1393,19 +1609,121 @@ describe("Response Utils", () => {
     test("should generate correct JSON data", () => {
       const questionsHeadlines = [["1. Question 1"]];
       const userAttributes = ["email"];
-      const hiddenFields: string[] = [];
       const result = getResponsesJson(
         mockSurvey as TSurvey,
         mockResponses as TResponse[],
         questionsHeadlines,
         userAttributes,
-        hiddenFields,
         false
       );
       expect(result[0]["Response ID"]).toBe("response1");
       expect(result[0]["Browser"]).toBe("Chrome");
       expect(result[0]["1. Question 1"]).toBe("answer1");
       expect(result[0]["person.email"]).toBe("test@example.com");
+    });
+
+    describe("matrix rows in two languages (ENG-6779)", () => {
+      const matrixSurvey = asRead({
+        id: "survey1",
+        languages: [
+          { default: true, enabled: true, language: { code: "en" } },
+          { default: false, enabled: true, language: { code: "ar" } },
+        ],
+        blocks: [
+          {
+            id: "block1",
+            name: "Block 1",
+            elements: [
+              {
+                id: "qm",
+                type: TSurveyElementTypeEnum.Matrix,
+                headline: { default: "Rate us" },
+                required: false,
+                rows: [
+                  { id: "r1", label: { default: "Speed", ar: "السرعة" } },
+                  { id: "r2", label: { default: "Quality", ar: "الجودة" } },
+                ],
+                columns: [{ id: "c1", label: { default: "Good", ar: "جيد" } }],
+              },
+            ],
+          },
+        ],
+        hiddenFields: { enabled: false, fieldIds: [] },
+      } as unknown as Partial<TSurvey>);
+      const headlines = [["1. Rate us - Speed", "1. Rate us - Quality"]];
+      const exportRow = (language: string | null, data: Record<string, string>) =>
+        getResponsesJson(
+          matrixSurvey,
+          [
+            {
+              id: "r",
+              surveyId: "survey1",
+              data: { qm: data },
+              language,
+              meta: {},
+              contactAttributes: {},
+              variables: {},
+              finished: true,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+              tags: [],
+            } as unknown as TResponse,
+          ],
+          headlines,
+          []
+        )[0];
+
+      test("reads rows by the default label for a default-language response", () => {
+        const row = exportRow("default", { Speed: "Good", Quality: "Good" });
+        expect(row["1. Rate us - Speed"]).toBe("Good");
+        expect(row["1. Rate us - Quality"]).toBe("Good");
+      });
+
+      test("reads rows by the respondent-language label for an Arabic response", () => {
+        const row = exportRow("ar", { السرعة: "جيد", الجودة: "جيد" });
+        expect(row["1. Rate us - Speed"]).toBe("جيد");
+        expect(row["1. Rate us - Quality"]).toBe("جيد");
+      });
+
+      test("still reads default-label keys for a response in another language", () => {
+        const row = exportRow("ar", { Speed: "Good" });
+        expect(row["1. Rate us - Speed"]).toBe("Good");
+        expect(row["1. Rate us - Quality"]).toBe("");
+      });
+    });
+
+    test("a computed field named `__proto__` keeps its value, and reaches both writers", async () => {
+      // `ZEmbeddedDataName` is a non-blank string, so `__proto__` is a legal variable name. On an
+      // ordinary row object, assigning that key runs Object.prototype's inherited setter instead of
+      // creating an own property, and the cell is silently lost. Asserted through the writers too,
+      // because that is where the loss shows: `{}` in CSV, no cell in XLSX.
+      //
+      // Question headlines cannot reach this — they are exported as "1. <headline>" — and neither can
+      // `person.<attribute>` or the reserved catalog. A display name used verbatim as a key is the
+      // whole exposure.
+      const protoSurvey = asRead({
+        ...mockSurvey,
+        blocks: [],
+        variables: [{ id: "v1", name: "__proto__", type: "text", value: "" }],
+      }) as TSurvey;
+      const protoResponse = { ...mockResponses[0], variables: { v1: "kept" } } as TResponse;
+
+      const result = getResponsesJson(protoSurvey, [protoResponse], [], [], false);
+
+      expect(Object.keys(result[0])).toContain("__proto__");
+      expect(result[0]["__proto__"]).toBe("kept");
+
+      const headers = ["Response ID", "__proto__"];
+      const csv = await convertToCsv(headers, result);
+      expect(csv).toContain("kept");
+      expect(csv).not.toContain("{}");
+
+      // Read the cell rather than `sheet_to_json`, whose rows are ordinary objects and so cannot hold
+      // a `__proto__` key either — that would test the assertion helper, not the writer.
+      const sheet = xlsx.read(convertToXlsxBuffer(headers, result), { type: "buffer" });
+      const cells = sheet.Sheets[sheet.SheetNames[0]];
+      expect(cells.B1.v).toBe("__proto__");
+      expect(cells.B2.v).toBe("kept");
     });
 
     test("reserved values are typed and projected: duration numeric, finishedAt ISO, url query redacted, absent empty", () => {
@@ -1424,7 +1742,6 @@ describe("Response Utils", () => {
         mockSurvey as TSurvey,
         [richResponse] as TResponse[],
         [["1. Question 1"]],
-        [],
         [],
         false
       );
@@ -1454,7 +1771,6 @@ describe("Response Utils", () => {
         [olderResponse, anonymizedResponse],
         [["1. Question 1"]],
         [],
-        [],
         false
       );
 
@@ -1474,9 +1790,48 @@ describe("Response Utils", () => {
         data: { ...mockResponses[0].data, seats: 12 },
       } as unknown as TResponse;
 
-      const result = getResponsesJson(surveyWithNumberField, [response], [], [], ["seats"], false);
+      const result = getResponsesJson(surveyWithNumberField, [response], [], [], false);
 
       expect(result[0]["seats"]).toBe(12);
+    });
+
+    test("an ingested cell is written under the field's name and read from its storage key", () => {
+      // ENG-3233: the column header and the cell key are the same string, so this moves with
+      // `extractSurveyDetails` or the row lands under a header the sheet does not have. Red on main,
+      // which keyed the cell by `utm_campaign`.
+      const renamed = {
+        ...(mockSurvey as TSurvey),
+        embeddedFields: [ingestedRow("Campaign", "utm_campaign")],
+      } as TSurvey;
+      const response = {
+        ...mockResponses[0],
+        data: { ...mockResponses[0].data, utm_campaign: "spring_sale" },
+      } as unknown as TResponse;
+
+      const result = getResponsesJson(renamed, [response], [], [], false);
+
+      expect(result[0]["Campaign"]).toBe("spring_sale");
+      expect(result[0]).not.toHaveProperty("utm_campaign");
+    });
+
+    test("an ingested field named like a fixed column does not take that column's cell", () => {
+      // The `extractSurveyDetails` counterpart of this pins the header row; this pins the cells.
+      // Both call sites need the same seed and neither guards the other: a row is one flat object
+      // keyed by label, so an unseeded `Response ID` here would write the field's value over the
+      // response's own id — under a header the sheet still has, holding the wrong value.
+      const shadowing = {
+        ...(mockSurvey as TSurvey),
+        embeddedFields: [ingestedRow("Response ID", "resp_id")],
+      } as TSurvey;
+      const response = {
+        ...mockResponses[0],
+        data: { ...mockResponses[0].data, resp_id: "spring_sale" },
+      } as unknown as TResponse;
+
+      const result = getResponsesJson(shadowing, [response], [], [], false);
+
+      expect(result[0]["Response ID"]).toBe("response1");
+      expect(result[0]["Response ID (resp_id)"]).toBe("spring_sale");
     });
 
     test("a computed field the response never captured leaves an empty cell", () => {
@@ -1491,7 +1846,6 @@ describe("Response Utils", () => {
         surveyWithVariables,
         [{ ...mockResponses[0], variables: {} }] as TResponse[],
         [["1. Question 1"]],
-        [],
         [],
         false
       );
@@ -1511,7 +1865,6 @@ describe("Response Utils", () => {
         [{ ...mockResponses[0], variables: { clx0000000000000000000v1: 12 } }] as TResponse[],
         [["1. Question 1"]],
         [],
-        [],
         false
       );
 
@@ -1528,7 +1881,6 @@ describe("Response Utils", () => {
         responsesWithContact,
         [["1. Question 1"]],
         ["plan", "email"],
-        [],
         false
       );
       expect(result[0]["person.plan"]).toBe("pro");
@@ -1544,7 +1896,6 @@ describe("Response Utils", () => {
         responsesWithFixedDate,
         [["1. Question 1"]],
         [],
-        [],
         false
       );
       expect(result[0]["Timestamp"]).toBe("2026-01-01 20:00:00 UTC");
@@ -1558,7 +1909,6 @@ describe("Response Utils", () => {
         mockSurvey as TSurvey,
         responsesWithFixedDate,
         [["1. Question 1"]],
-        [],
         [],
         false,
         "Asia/Manila"
@@ -1760,6 +2110,22 @@ describe("Response Utils", () => {
         hidden1: [],
         hidden2: [],
       });
+    });
+
+    test("a number field offers its stored values to the filter (ENG-3266)", () => {
+      // These are the filter's value options. Under the old `typeof === "string"` gate a `number`
+      // field collected nothing, so it appeared in the filter with an empty dropdown — filterable in
+      // name only. `boolean` never reaches here: `surveys.ts` hardcodes its two options.
+      const responses = [
+        { contactAttributes: {}, data: { hidden1: 42, hidden2: "value2" }, meta: {} },
+        { contactAttributes: {}, data: { hidden1: 0, hidden2: "value4" }, meta: {} },
+      ];
+      const result = getResponseHiddenFields(
+        mockSurvey as TSurvey,
+        responses as unknown as Pick<TResponse, "contactAttributes" | "data" | "meta">[]
+      );
+      expect(result.hidden1).toContain("42");
+      expect(result.hidden1).toContain("0");
     });
   });
 });

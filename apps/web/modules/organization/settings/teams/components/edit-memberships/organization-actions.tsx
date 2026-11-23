@@ -9,7 +9,7 @@ import { TOrganizationRole } from "@formbricks/types/memberships";
 import { TOrganization } from "@formbricks/types/organizations";
 import { FORMBRICKS_ENVIRONMENT_ID_LS } from "@/lib/localStorage";
 import { getAccessFlags } from "@/lib/membership/utils";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { TOrganizationTeam } from "@/modules/ee/teams/team-list/types/team";
 import {
   bulkInviteUsersAction,
@@ -34,20 +34,23 @@ import {
 } from "@/modules/ui/components/dialog";
 
 interface OrganizationActionsProps {
-  role: TOrganizationRole;
-  membershipRole?: TOrganizationRole;
-  isLeaveOrganizationDisabled: boolean;
-  organization: TOrganization;
-  teams: TOrganizationTeam[];
-  isInviteDisabled: boolean;
-  isAccessControlAllowed: boolean;
-  isFormbricksCloud: boolean;
-  isMultiOrgEnabled: boolean;
-  isUserManagementDisabledFromUi: boolean;
-  isTeamAdmin: boolean;
-  userAdminTeamIds?: string[];
-  enterpriseLicenseRequestFormUrl: string;
-  isBulkInviteAllowed: boolean;
+  readonly role: TOrganizationRole;
+  readonly membershipRole?: TOrganizationRole;
+  readonly isLeaveOrganizationDisabled: boolean;
+  readonly organization: TOrganization;
+  readonly teams: TOrganizationTeam[];
+  readonly isInviteDisabled: boolean;
+  readonly isAccessControlAllowed: boolean;
+  readonly isFormbricksCloud: boolean;
+  readonly isDashboardViewerRoleEnabled: boolean;
+  readonly isMultiOrgEnabled: boolean;
+  readonly isUserManagementDisabledFromUi: boolean;
+  /** `organization.manage_access`: owners and managers above the user-management floor (ENG-6812). */
+  readonly canManageUsers: boolean;
+  readonly isTeamAdmin: boolean;
+  readonly userAdminTeamIds?: string[];
+  readonly enterpriseLicenseRequestFormUrl: string;
+  readonly isBulkInviteAllowed: boolean;
 }
 
 export const OrganizationActions = ({
@@ -59,8 +62,10 @@ export const OrganizationActions = ({
   isInviteDisabled,
   isAccessControlAllowed,
   isFormbricksCloud,
+  isDashboardViewerRoleEnabled,
   isMultiOrgEnabled,
   isUserManagementDisabledFromUi,
+  canManageUsers,
   isTeamAdmin,
   userAdminTeamIds,
   enterpriseLicenseRequestFormUrl,
@@ -75,7 +80,9 @@ export const OrganizationActions = ({
   const { isOwner, isManager } = getAccessFlags(membershipRole);
   const isOwnerOrManager = isOwner || isManager;
 
-  const canInvite = isOwnerOrManager || (isAccessControlAllowed && isTeamAdmin);
+  // Owners and managers invite as the organization, which the role floor decides; a team admin who is
+  // neither invites into their own teams, which it doesn't (the server takes the same two paths).
+  const canInvite = isOwnerOrManager ? canManageUsers : isAccessControlAllowed && isTeamAdmin;
 
   const handleLeaveOrganization = async () => {
     setLoading(true);
@@ -198,6 +205,7 @@ export const OrganizationActions = ({
         organizationId={organization.id}
         isAccessControlAllowed={isAccessControlAllowed}
         isFormbricksCloud={isFormbricksCloud}
+        isDashboardViewerRoleEnabled={isDashboardViewerRoleEnabled}
         teams={teams}
         isOwnerOrManager={isOwnerOrManager}
         isTeamAdmin={isTeamAdmin}

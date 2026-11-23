@@ -1,6 +1,8 @@
 import { logger } from "@formbricks/logger";
 import { can } from "@/lib/authorization";
 import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { resolveSurveyActorContext } from "@/lib/survey/visibility/actor-context";
+import { canApiKeyReachSurveyResource } from "@/lib/survey/visibility/api-key";
 import { getOrganizationIdFromSurveyId } from "@/lib/utils/helper";
 import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
 import { responses } from "@/modules/api/v2/lib/response";
@@ -50,7 +52,12 @@ export const GET = async (
           { type: "apiKey", id: authentication.apiKeyId },
           getWorkspaceAuthorizationActionForMethod("GET"),
           { type: "workspace", id: workspaceId }
-        ))
+        )) ||
+        // ENG-3282: a personal link to a restricted survey is out of an API key's reach.
+        !(await canApiKeyReachSurveyResource(authentication.apiKeyId, "survey.read", {
+          type: "survey",
+          id: params.surveyId,
+        }))
       ) {
         return handleApiError(request, {
           type: "unauthorized",
@@ -72,6 +79,7 @@ export const GET = async (
       const contactsResult = await getContactsInSegment(
         params.surveyId,
         params.segmentId,
+        await resolveSurveyActorContext({ type: "apiKey", id: authentication.apiKeyId }, organizationId),
         query?.limit || 10,
         query?.skip || 0,
         query?.attributeKeys

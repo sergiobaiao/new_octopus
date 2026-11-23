@@ -4,7 +4,6 @@ import { PictureSelect, type PictureSelectOption } from "@formbricks/survey-ui";
 import { type TResponseData, type TResponseTtc } from "@formbricks/types/responses";
 import type { TSurveyPictureSelectionElement } from "@formbricks/types/surveys/elements";
 import { getLocalizedValue } from "@/lib/i18n";
-import { getImageAltFromUrl } from "@/lib/storage";
 import { getUpdatedTtc, useTtc } from "@/lib/ttc";
 
 interface PictureSelectionProps {
@@ -40,7 +39,11 @@ export function PictureSelectionElement({
   const options: PictureSelectOption[] = element.choices.map((choice, index) => ({
     id: choice.id,
     imageUrl: choice.imageUrl,
-    alt: getImageAltFromUrl(choice.imageUrl) || t("common.option_number", { number: index + 1 }),
+    // The creator's alt text when set; otherwise numbered, never derived from the file name: an uploaded
+    // file's name can carry personal data.
+    alt:
+      getLocalizedValue(choice.imageAltText, languageCode).trim() ||
+      t("common.option_number", { number: index + 1 }),
   }));
 
   // Convert value from string[] to string | string[] based on allowMulti
@@ -88,6 +91,7 @@ export function PictureSelectionElement({
         dir={dir}
         errorMessage={errorMessage}
         imageUrl={element.imageUrl}
+        imageAltText={getLocalizedValue(element.imageAltText, languageCode)}
         videoUrl={element.videoUrl}
       />
     </form>

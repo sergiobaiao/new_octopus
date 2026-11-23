@@ -1,0 +1,388 @@
+import { beforeEach, describe, expect, test } from "vitest";
+import { prisma } from "@formbricks/database";
+import { InvalidInputError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { resetDb } from "@/integration/reset-db";
+import { buildVisibleSurveyWhere } from "@/lib/survey/visibility/predicate";
+import {
+  createSharedEmbeddedData,
+  deleteSharedEmbeddedData,
+  getEmbeddedDataUsage,
+  getSharedEmbeddedData,
+  promoteEmbeddedDataToShared,
+  updateSharedEmbeddedData,
+} from "@/modules/embedded-data/lib/library";
+import { EmbeddedDataInUseError, EmbeddedDataKeyConflictError } from "@/modules/embedded-data/types";
+
+/**
+ * The shared Embedded Data library against real Postgres (ENG-3229).
+ *
+ * Everything the service guards is a claim about database state that the unit suite — which mocks
+ * `@formbricks/database` — cannot make: that `@@unique([workspaceId, key])` is what rejects a second
+ * field under the same name, that promote moves the ownership columns and nothing else (the survey's
+ * link row and its `storageKey` survive it untouched), that the cascade from `SurveyEmbeddedData` is
+ * what makes an in-use delete dangerous, and that a workspace-scoped `where` really does hide another
+ * tenant's row rather than merely intending to.
+ */
+
+/** Two workspaces under one organization, the first with a survey. */
+const seed = async (): Promise<{ workspaceA: string; workspaceB: string; surveyId: string }> => {
+  const organization = await prisma.organization.create({ data: { name: "Library Org" } });
+  const [workspaceA, workspaceB] = await Promise.all([
+    prisma.workspace.create({ data: { name: "Workspace A", organizationId: organization.id } }),
+    prisma.workspace.create({ data: { name: "Workspace B", organizationId: organization.id } }),
+  ]);
+  const survey = await prisma.survey.create({ data: { name: "Onboarding", workspaceId: workspaceA.id } });
+
+  return { workspaceA: workspaceA.id, workspaceB: workspaceB.id, surveyId: survey.id };
+};
+
+/** A survey's own field, plus the link addressing it — what promote has to leave alone. */
+const seedLocalField = async (
+  workspaceId: string,
+  surveyId: string,
+  storageKey = "plan_tier"
+): Promise<{ fieldId: string; linkId: string }> => {
+  const field = await prisma.embeddedData.create({
+    data: { name: "Plan tier", source: "ingested", workspaceId, surveyId },
+  });
+  const link = await prisma.surveyEmbeddedData.create({
+    data: { workspaceId, surveyId, embeddedDataId: field.id, storageKey, order: 0 },
+  });
+
+  return { fieldId: field.id, linkId: link.id };
+};
+
+const linkSharedField = (workspaceId: string, surveyId: string, embeddedDataId: string, storageKey: string) =>
+  prisma.surveyEmbeddedData.create({
+    data: { workspaceId, surveyId, embeddedDataId, storageKey, order: 0 },
+  });
+
+/** An administrator's survey visibility: every survey. */
+const seesEverything = async () => ({});
+
+/** A plain member's survey visibility, built by the real predicate rather than restated here. */
+const memberVisibility = (userId: string) => async () =>
+  buildVisibleSurveyWhere({ enforced: true, isOrganizationAdmin: false, kind: "user", userId });
+
+beforeEach(async () => {
+  await resetDb();
+});
+
+describe("creating library fields (real Postgres)", () => {
+  test("a second field under the same key is refused by the unique index", async () => {
+    const { workspaceA } = await seed();
+    const input = { key: "plan_tier", name: "Plan tier", source: "ingested" as const };
+
+    await createSharedEmbeddedData(workspaceA, input);
+    const error = await createSharedEmbeddedData(workspaceA, input).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(EmbeddedDataKeyConflictError);
+    expect((error as EmbeddedDataKeyConflictError).message).toBe("Embedded data key already exists");
+  });
+
+  test("the same key in another workspace is a different field, since the index is per workspace", async () => {
+    const { workspaceA, workspaceB } = await seed();
+    const input = { key: "plan_tier", name: "Plan tier", source: "ingested" as const };
+
+    await createSharedEmbeddedData(workspaceA, input);
+
+    await expect(createSharedEmbeddedData(workspaceB, input)).resolves.toMatchObject({ key: "plan_tier" });
+  });
+
+  test("the library lists only shared rows, never a survey's own", async () => {
+    const { workspaceA, surveyId } = await seed();
+    await seedLocalField(workspaceA, surveyId);
+    await createSharedEmbeddedData(workspaceA, {
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested",
+    });
+
+    const library = await getSharedEmbeddedData(workspaceA);
+
+    expect(library).toHaveLength(1);
+    expect(library[0]).toMatchObject({ key: "plan_tier", surveyId: null, surveyCount: 0 });
+  });
+});
+
+describe("promoting a local field (real Postgres)", () => {
+  test("flips surveyId and key while the link and its storage key stay exactly where they were", async () => {
+    const { workspaceA, surveyId } = await seed();
+    const { fieldId, linkId } = await seedLocalField(workspaceA, surveyId);
+
+    const promoted = await promoteEmbeddedDataToShared(fieldId, workspaceA, { key: "plan_tier" });
+
+    expect(promoted).toMatchObject({ id: fieldId, key: "plan_tier", surveyId: null });
+    // The survey keeps the field: same link row, same address, so its stored responses still resolve.
+    const link = await prisma.surveyEmbeddedData.findUnique({ where: { id: linkId } });
+    expect(link).toMatchObject({ id: linkId, surveyId, embeddedDataId: fieldId, storageKey: "plan_tier" });
+    // And the promoted field now shows up in the library, counted against that survey.
+    expect(await getSharedEmbeddedData(workspaceA)).toEqual([
+      expect.objectContaining({ id: fieldId, surveyCount: 1 }),
+    ]);
+  });
+
+  test("a calculated field cannot take a key a passed-in field or a question in its survey already uses", async () => {
+    // Promoted under either, the derived `variables` would share a name with that field or question,
+    // and v3 refuses such a stored survey on every PATCH.
+    const { workspaceA, surveyId } = await seed();
+    await prisma.survey.update({
+      where: { id: surveyId },
+      data: {
+        blocks: [{ id: "clbk1234567890123456789012", name: "Block", elements: [{ id: "satisfaction" }] }],
+      },
+    });
+    await seedLocalField(workspaceA, surveyId, "plan");
+    const score = await prisma.embeddedData.create({
+      data: { name: "score", source: "computed", dataType: "number", workspaceId: workspaceA, surveyId },
+    });
+    await prisma.surveyEmbeddedData.create({
+      data: { workspaceId: workspaceA, surveyId, embeddedDataId: score.id, storageKey: score.id, order: 1 },
+    });
+
+    for (const key of ["plan", "satisfaction"]) {
+      await expect(promoteEmbeddedDataToShared(score.id, workspaceA, { key })).rejects.toThrow(
+        InvalidInputError
+      );
+    }
+    expect(await prisma.embeddedData.findUnique({ where: { id: score.id } })).toMatchObject({
+      key: null,
+      surveyId,
+    });
+
+    await expect(promoteEmbeddedDataToShared(score.id, workspaceA, { key: "score" })).resolves.toMatchObject({
+      key: "score",
+    });
+  });
+
+  test("promoting onto a taken key answers with the id of the library row holding it", async () => {
+    const { workspaceA, surveyId } = await seed();
+    const existing = await createSharedEmbeddedData(workspaceA, {
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested",
+    });
+    const { fieldId } = await seedLocalField(workspaceA, surveyId);
+
+    const error = await promoteEmbeddedDataToShared(fieldId, workspaceA, { key: "plan_tier" }).catch(
+      (e: unknown) => e
+    );
+
+    expect(error).toBeInstanceOf(EmbeddedDataKeyConflictError);
+    expect((error as EmbeddedDataKeyConflictError).existingId).toBe(existing.id);
+    // The local field is untouched, so the editor can still offer to swap it for the library one.
+    const unchanged = await prisma.embeddedData.findUnique({ where: { id: fieldId } });
+    expect(unchanged).toMatchObject({ key: null, surveyId });
+  });
+
+  test("a field that is already shared cannot be promoted again", async () => {
+    const { workspaceA } = await seed();
+    const shared = await createSharedEmbeddedData(workspaceA, {
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested",
+    });
+
+    await expect(promoteEmbeddedDataToShared(shared.id, workspaceA, { key: "tier" })).rejects.toThrow(
+      ResourceNotFoundError
+    );
+  });
+});
+
+describe("deleting a library field (real Postgres)", () => {
+  test("refused while a survey links it, allowed once unlinked", async () => {
+    const { workspaceA, surveyId } = await seed();
+    const shared = await createSharedEmbeddedData(workspaceA, {
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested",
+    });
+    const link = await linkSharedField(workspaceA, surveyId, shared.id, "plan_tier");
+
+    const error = await deleteSharedEmbeddedData(shared.id, workspaceA, seesEverything).catch(
+      (e: unknown) => e
+    );
+    expect(error).toBeInstanceOf(EmbeddedDataInUseError);
+    expect((error as EmbeddedDataInUseError).usage).toEqual({
+      surveys: [{ id: surveyId, name: "Onboarding", status: "draft" }],
+      hiddenSurveyCount: 0,
+    });
+    // The refusal is what stands between the survey and a silent cascade, so the row must still exist.
+    expect(await prisma.embeddedData.findUnique({ where: { id: shared.id } })).not.toBeNull();
+
+    await prisma.surveyEmbeddedData.delete({ where: { id: link.id } });
+
+    await expect(deleteSharedEmbeddedData(shared.id, workspaceA, seesEverything)).resolves.toMatchObject({
+      id: shared.id,
+    });
+    expect(await prisma.embeddedData.findUnique({ where: { id: shared.id } })).toBeNull();
+  });
+});
+
+describe("changing a field's data type (real Postgres)", () => {
+  const seedLinkedFieldWithResponse = async () => {
+    const { workspaceA, surveyId } = await seed();
+    const shared = await createSharedEmbeddedData(workspaceA, {
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested",
+    });
+    await linkSharedField(workspaceA, surveyId, shared.id, "plan_tier");
+    await prisma.response.create({ data: { surveyId, data: { plan_tier: "pro" } } });
+
+    return { workspaceA, surveyId, sharedId: shared.id };
+  };
+
+  test("refused while a linked survey holds a response, and names that survey", async () => {
+    const { workspaceA, surveyId, sharedId } = await seedLinkedFieldWithResponse();
+
+    const error = await updateSharedEmbeddedData(
+      sharedId,
+      workspaceA,
+      { dataType: "number" },
+      { resolveVisibleSurveyWhere: seesEverything }
+    ).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(EmbeddedDataInUseError);
+    expect((error as EmbeddedDataInUseError).usage).toEqual({
+      surveys: [{ id: surveyId, name: "Onboarding", status: "draft" }],
+      hiddenSurveyCount: 0,
+    });
+    expect(await prisma.embeddedData.findUnique({ where: { id: sharedId } })).toMatchObject({
+      dataType: "string",
+    });
+  });
+
+  test("allowed once the caller has acknowledged those responses", async () => {
+    const { workspaceA, sharedId } = await seedLinkedFieldWithResponse();
+
+    await expect(
+      updateSharedEmbeddedData(
+        sharedId,
+        workspaceA,
+        { dataType: "number" },
+        { resolveVisibleSurveyWhere: seesEverything, acknowledgeExistingResponses: true }
+      )
+    ).resolves.toMatchObject({ dataType: "number" });
+  });
+
+  test("a rename is never blocked by responses, only a type change is", async () => {
+    const { workspaceA, sharedId } = await seedLinkedFieldWithResponse();
+
+    await expect(
+      updateSharedEmbeddedData(
+        sharedId,
+        workspaceA,
+        { name: "Tier" },
+        { resolveVisibleSurveyWhere: seesEverything }
+      )
+    ).resolves.toMatchObject({
+      name: "Tier",
+    });
+  });
+});
+
+describe("workspace scoping (real Postgres)", () => {
+  test("another workspace's field is simply not there, for every write", async () => {
+    const { workspaceA, workspaceB, surveyId } = await seed();
+    const shared = await createSharedEmbeddedData(workspaceA, {
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested",
+    });
+    const { fieldId: localId } = await seedLocalField(workspaceA, surveyId);
+
+    await expect(
+      updateSharedEmbeddedData(
+        shared.id,
+        workspaceB,
+        { name: "Tier" },
+        { resolveVisibleSurveyWhere: seesEverything }
+      )
+    ).rejects.toThrow(ResourceNotFoundError);
+    await expect(deleteSharedEmbeddedData(shared.id, workspaceB, seesEverything)).rejects.toThrow(
+      ResourceNotFoundError
+    );
+    await expect(promoteEmbeddedDataToShared(localId, workspaceB, { key: "tier" })).rejects.toThrow(
+      ResourceNotFoundError
+    );
+    expect(await getSharedEmbeddedData(workspaceB)).toEqual([]);
+    expect(await getEmbeddedDataUsage(shared.id, workspaceB, await seesEverything())).toEqual({
+      surveys: [],
+      hiddenSurveyCount: 0,
+    });
+  });
+});
+
+// ENG-6811: the usage list named every linked survey, Restricted ones included.
+describe("usage as a member who cannot see every survey (real Postgres)", () => {
+  const seedRestrictedUsage = async () => {
+    const { workspaceA, surveyId } = await seed();
+    const member = await prisma.user.create({ data: { name: "Member", email: "member@example.com" } });
+    const restricted = await prisma.survey.create({
+      data: { name: "Secret pricing study", workspaceId: workspaceA, visibility: "restricted" },
+    });
+    const shared = await createSharedEmbeddedData(workspaceA, {
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested",
+    });
+    await linkSharedField(workspaceA, surveyId, shared.id, "plan_tier");
+    await linkSharedField(workspaceA, restricted.id, shared.id, "plan_tier");
+
+    return {
+      workspaceA,
+      surveyId,
+      restrictedId: restricted.id,
+      sharedId: shared.id,
+      resolveVisibleSurveyWhere: memberVisibility(member.id),
+    };
+  };
+
+  test("names the surveys the member can see and only counts the Restricted one", async () => {
+    const { workspaceA, surveyId, sharedId, resolveVisibleSurveyWhere } = await seedRestrictedUsage();
+
+    await expect(
+      getEmbeddedDataUsage(sharedId, workspaceA, await resolveVisibleSurveyWhere())
+    ).resolves.toEqual({
+      surveys: [{ id: surveyId, name: "Onboarding", status: "draft" }],
+      hiddenSurveyCount: 1,
+    });
+    // The library list's count is the same total the usage adds up to.
+    expect(await getSharedEmbeddedData(workspaceA)).toEqual([
+      expect.objectContaining({ id: sharedId, surveyCount: 2 }),
+    ]);
+  });
+
+  test("still refuses the delete when only a Restricted survey links the field, without naming it", async () => {
+    const { workspaceA, surveyId, sharedId, resolveVisibleSurveyWhere } = await seedRestrictedUsage();
+    await prisma.surveyEmbeddedData.deleteMany({ where: { surveyId } });
+
+    const error = await deleteSharedEmbeddedData(sharedId, workspaceA, resolveVisibleSurveyWhere).catch(
+      (e: unknown) => e
+    );
+
+    expect(error).toBeInstanceOf(EmbeddedDataInUseError);
+    expect((error as EmbeddedDataInUseError).usage).toEqual({ surveys: [], hiddenSurveyCount: 1 });
+    expect(await prisma.embeddedData.findUnique({ where: { id: sharedId } })).not.toBeNull();
+  });
+
+  test("refuses a type change over a Restricted survey's responses without naming it", async () => {
+    const { workspaceA, surveyId, restrictedId, sharedId, resolveVisibleSurveyWhere } =
+      await seedRestrictedUsage();
+    await prisma.response.create({ data: { surveyId: restrictedId, data: { plan_tier: "pro" } } });
+
+    const error = await updateSharedEmbeddedData(
+      sharedId,
+      workspaceA,
+      { dataType: "number" },
+      { resolveVisibleSurveyWhere }
+    ).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(EmbeddedDataInUseError);
+    expect((error as EmbeddedDataInUseError).usage).toEqual({
+      surveys: [{ id: surveyId, name: "Onboarding", status: "draft" }],
+      hiddenSurveyCount: 1,
+    });
+  });
+});

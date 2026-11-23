@@ -2,8 +2,12 @@ import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { z } from "zod";
 import { ResourceNotFoundError, TooManyRequestsError } from "@formbricks/types/errors";
+import { reportApiError } from "@/app/lib/api/api-error-reporter";
+import { ConcurrencyLimiter } from "@/app/lib/api/concurrency-limiter";
 import { DEFAULT_REQUEST_BODY_LIMIT_BYTES } from "@/app/lib/api/request-body";
-import { withV3ApiWrapper } from "./api-wrapper";
+import { formatZodIssues, withV3ApiWrapper } from "./api-wrapper";
+import { V3_REQUEST_ARRAY_MAX_ITEMS, V3_REQUEST_MAX_DEPTH } from "./array-budget";
+import { V3_INVALID_PARAMS_MAX } from "./invalid-params";
 
 const { mockAuthenticateRequest, mockGetSession } = vi.hoisted(() => ({
   mockAuthenticateRequest: vi.fn(),
@@ -51,6 +55,7 @@ vi.mock("@/app/lib/api/with-api-logging", () => ({
   buildAuditLogBaseObject: mockBuildAuditLogBaseObject,
 }));
 
+vi.mock("@/app/lib/api/api-error-reporter", () => ({ reportApiError: vi.fn() }));
 vi.mock("@formbricks/logger", () => ({
   logger: {
     withContext: vi.fn(() => ({
@@ -368,7 +373,8 @@ describe("withV3ApiWrapper", () => {
       expect.objectContaining({
         statusCode: 400,
         detail: "Invalid query parameters",
-        invalidParams: expect.arrayContaining([expect.objectContaining({ name: "limit" })]),
+        invalidParamCount: 1,
+        invalidParamNames: ["limit"],
       }),
       "V3 API request validation failed"
     );
@@ -460,19 +466,17 @@ describe("withV3ApiWrapper", () => {
         reason: "Malformed JSON input, please check your request body",
       },
     ]);
+    // The count and names, never the entries: the array is as long as the caller made it (ENG-3384).
     expect(mockLoggerWarn).toHaveBeenCalledWith(
       expect.objectContaining({
         statusCode: 400,
         detail: "Invalid request body",
-        invalidParams: [
-          {
-            name: "body",
-            reason: "Malformed JSON input, please check your request body",
-          },
-        ],
+        invalidParamCount: 1,
+        invalidParamNames: ["body"],
       }),
       "V3 API request validation failed"
     );
+    expect(mockLoggerWarn.mock.calls.at(-1)?.[0]).not.toHaveProperty("invalidParams");
   });
 
   test("returns 413 problem response for oversized JSON input", async () => {
@@ -716,5 +720,961 @@ describe("withV3ApiWrapper", () => {
     expect(mockQueueAuditEvent).toHaveBeenCalledWith(
       expect.objectContaining({ status: "failure", eventId: "req-audit" })
     );
+  });
+});
+
+/**
+ * There was no error reporting under `app/api/v3` before this. The tests matter more than usual
+ * because the reporting is invisible in every response: nothing about a 500's body tells you whether
+ * it reached Sentry, so a regression here is silent by construction.
+ */
+describe("5xx reporting", () => {
+  const reported = () => vi.mocked(reportApiError).mock.calls.map(([c]) => c);
+
+  beforeEach(() => {
+    vi.mocked(reportApiError).mockClear();
+    mockGetSession.mockResolvedValue({ user: { id: "user_1" }, expires: "2026-01-01" });
+  });
+
+  /**
+   * The path that would otherwise be missed. A v3 operation returns its problem response rather than
+   * throwing — it must, because the MCP server calls it directly with no wrapper — so a `catch`-only
+   * hook would see almost no real failure.
+   */
+  test("reports a 500 the handler returned rather than threw", async () => {
+    const route = withV3ApiWrapper({
+      auth: "session",
+      handler: async () => Response.json({ title: "Internal Server Error" }, { status: 500 }),
+    });
+
+    const response = await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(reported()).toHaveLength(1);
+    expect(reported()[0]).toMatchObject({ status: 500, apiVersion: "v3" });
+    // Reporting must be a pure observation: the caller's body reaches them untouched. Without this
+    // the test passes even if the reporter consumed or replaced the response.
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({ title: "Internal Server Error" });
+  });
+
+  /** The thrown path carries the original error, which is what gives Sentry a stack. */
+  test("reports a thrown error, passing the error itself", async () => {
+    const boom = new Error("kaboom");
+    const route = withV3ApiWrapper({
+      auth: "session",
+      handler: async () => {
+        throw boom;
+      },
+    });
+
+    const response = await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(response.status).toBe(500);
+    expect(reported()).toHaveLength(1);
+    expect(reported()[0]).toMatchObject({ status: 500, apiVersion: "v3", error: boom });
+  });
+
+  /**
+   * 503 sits in this list rather than with the 5xx above because in v3 it is not a fault: it means the
+   * capability is not enabled on this deployment, and a transient outage is a 502. Without this row a
+   * self-hoster running without Hub or AI configured raises a Sentry error on every such request.
+   */
+  test.each([
+    ["a success", 200],
+    ["a client error", 400],
+    ["a forbidden", 403],
+    ["a not-configured 503", 503],
+  ])("stays silent on %s — Sentry is for 5xx only", async (_label, status) => {
+    const route = withV3ApiWrapper({
+      auth: "session",
+      handler: async () => new Response(null, { status }),
+    });
+
+    await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(reported()).toHaveLength(0);
+  });
+
+  /**
+   * The other half of skipping 503: a transient upstream failure is a 502 in v3, and that still has to
+   * reach Sentry. Without this the 503 exclusion could quietly widen to every dependency problem.
+   */
+  test("still reports a 502 — an outage is a fault, unlike a 503", async () => {
+    const route = withV3ApiWrapper({
+      auth: "session",
+      handler: async () => Response.json({ title: "Bad Gateway" }, { status: 502 }),
+    });
+
+    await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(reported()).toHaveLength(1);
+    expect(reported()[0]).toMatchObject({ status: 502, apiVersion: "v3" });
+  });
+
+  /** Observability must never change what the caller gets back. */
+  test("a reporter failure does not affect the response", async () => {
+    vi.mocked(reportApiError).mockImplementationOnce(() => {
+      throw new Error("sentry is down");
+    });
+    const route = withV3ApiWrapper({
+      auth: "session",
+      // Deliberately 502, not 503: a 503 never reaches the reporter now, so this would assert nothing.
+      handler: async () => Response.json({ x: 1 }, { status: 502 }),
+    });
+
+    const response = await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({ x: 1 });
+  });
+});
+
+/**
+ * `formatZodIssues` changed every v3 400 — an unsupported key is now named instead of the body — and
+ * nothing exercised it. The one "Unsupported field" case in this file builds a `custom` issue through
+ * `superRefine`, which never reaches the expansion, so reverting the function to Zod's base `map`
+ * kept the suite green.
+ *
+ * Driven through a real `.strict()` parse rather than a hand-built issue: the expansion reads
+ * `issue.keys`, which Zod populates and a fixture would only assert the shape of.
+ */
+describe("formatZodIssues — the unknown-key expansion", () => {
+  const strictBody = z.object({ kept: z.string() }).strict();
+
+  const issuesFor = (value: Record<string, unknown>) => {
+    const parsed = strictBody.safeParse(value);
+    if (parsed.success) throw new Error("expected the strict parse to reject");
+    return formatZodIssues(parsed.error, "body");
+  };
+
+  test("names each unknown key instead of the body", () => {
+    const params = issuesFor({ kept: "x", extra: 1, alsoExtra: 2 });
+
+    expect(params).toEqual([
+      { name: "extra", reason: "Unsupported field 'extra'", code: "unsupported_field" },
+      { name: "alsoExtra", reason: "Unsupported field 'alsoExtra'", code: "unsupported_field" },
+    ]);
+  });
+
+  test("stops at 20 keys and says how many it did not list", () => {
+    const value: Record<string, unknown> = { kept: "x" };
+    for (let i = 0; i < 25; i += 1) value[`extra${i}`] = i;
+
+    const params = issuesFor(value);
+
+    // 20 named, plus one summary — the list is caller-controlled and reaches both the body and the log.
+    expect(params).toHaveLength(21);
+    expect(params.at(-1)).toEqual({
+      name: "body",
+      reason: "5 further unsupported fields were not listed",
+      code: "unsupported_field",
+    });
+  });
+
+  test("a nested object's keys are reported under their path", () => {
+    const nested = z.object({ meta: z.object({ kept: z.string() }).strict() }).strict();
+    const parsed = nested.safeParse({ meta: { kept: "x", extra: 1 } });
+    if (parsed.success) throw new Error("expected the strict parse to reject");
+
+    expect(formatZodIssues(parsed.error, "body")).toEqual([
+      { name: "meta.extra", reason: "Unsupported field 'extra'", code: "unsupported_field" },
+    ]);
+  });
+
+  test("an issue carrying no key list still produces a param", () => {
+    // The fallback exists so an empty list cannot leave a 400 with no `invalid_params` at all.
+    const params = formatZodIssues(
+      { issues: [{ code: "unrecognized_keys", path: [], message: "Unrecognized key" }] } as never,
+      "body"
+    );
+
+    expect(params).toEqual([{ name: "body", reason: "Unrecognized key", code: "unsupported_field" }]);
+  });
+
+  test("lists at most 50 problems and counts the rest (ENG-3384)", () => {
+    // One Zod issue per bad element: the shape a junk array produces once it is under the array cap.
+    const parsed = z
+      .array(z.number())
+      .safeParse(Array.from({ length: V3_INVALID_PARAMS_MAX + 10 }, () => "x"));
+    if (parsed.success) throw new Error("expected the parse to reject");
+
+    const params = formatZodIssues(parsed.error, "body");
+
+    // The limit counts the summary: 49 problems listed, the 50th entry counts the other eleven.
+    expect(params).toHaveLength(V3_INVALID_PARAMS_MAX);
+    expect(params[0]).toMatchObject({ name: "0" });
+    expect(params.at(-1)).toEqual({
+      name: "body",
+      reason: "11 further problems with this request were not reported; fix the ones above and retry",
+    });
+  });
+});
+
+describe("request array budget (ENG-3384)", () => {
+  test("refuses an oversized array with one invalid_param before the body schema runs", async () => {
+    let schemaRan = false;
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "none",
+      schemas: {
+        body: z.unknown().superRefine(() => {
+          schemaRan = true;
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-request-id": "req-budget" },
+        body: JSON.stringify({
+          blocks: [{ elements: Array.from({ length: V3_REQUEST_ARRAY_MAX_ITEMS + 1 }, () => 0) }],
+        }),
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+    expect(schemaRan).toBe(false);
+    await expect(response.json()).resolves.toMatchObject({
+      requestId: "req-budget",
+      invalid_params: [
+        {
+          name: "blocks.0.elements",
+          reason: `Too big: expected array to have <=${V3_REQUEST_ARRAY_MAX_ITEMS} items`,
+        },
+      ],
+    });
+    expect(mockLoggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        statusCode: 400,
+        invalidParamCount: 1,
+        invalidParamNames: ["blocks.0.elements"],
+      }),
+      "V3 API request validation failed"
+    );
+  });
+
+  test("refuses a body nested past the cap before JSON.parse builds it", async () => {
+    // Parsing is what a hostile body costs (15.5 MiB of `[[[…]]]` is ~470 MB parsed), so the budget
+    // has to hold on the raw text.
+    const deep = `{"a":${"[".repeat(V3_REQUEST_MAX_DEPTH)}0${"]".repeat(V3_REQUEST_MAX_DEPTH)}}`;
+    const parse = vi.spyOn(JSON, "parse");
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await withV3ApiWrapper({ auth: "none", schemas: { body: z.unknown() }, handler })(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: deep,
+      }),
+      {} as never
+    );
+    const parsedTheBody = parse.mock.calls.some(([text]) => text === deep);
+    parse.mockRestore();
+
+    expect(response.status).toBe(400);
+    expect(parsedTheBody).toBe(false);
+    expect(handler).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      invalid_params: [
+        {
+          name: "a.0.0.0.0.0.0.0.0.0.…",
+          reason: `Too deep: expected the request to nest <=${V3_REQUEST_MAX_DEPTH} levels`,
+        },
+      ],
+    });
+  });
+
+  // The workflows routes declare no body schema and hand `req` to a handler that reads it itself, so
+  // the wrapper checks a clone and leaves the handler's stream intact.
+  describe("a route without a body schema", () => {
+    test("still refuses an oversized array before the handler reads the body", async () => {
+      const handler = vi.fn(async () => Response.json({ ok: true }));
+
+      const response = await withV3ApiWrapper({ auth: "none", handler })(
+        new NextRequest("http://localhost/api/v3/workflows", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            definition: { nodes: Array.from({ length: V3_REQUEST_ARRAY_MAX_ITEMS + 1 }, () => 0) },
+          }),
+        }),
+        {} as never
+      );
+
+      expect(response.status).toBe(400);
+      expect(handler).not.toHaveBeenCalled();
+      await expect(response.json()).resolves.toMatchObject({
+        invalid_params: [expect.objectContaining({ name: "definition.nodes" })],
+      });
+    });
+
+    test("answers 413 to a body without content-length that exceeds the limit", async () => {
+      const handler = vi.fn(async () => Response.json({ ok: true }));
+      const oversized = new TextEncoder().encode(`{"a":"${"x".repeat(DEFAULT_REQUEST_BODY_LIMIT_BYTES)}"}`);
+
+      const response = await withV3ApiWrapper({ auth: "none", handler })(
+        new NextRequest("http://localhost/api/v3/workflows", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(oversized);
+              controller.close();
+            },
+          }),
+          duplex: "half",
+        } as ConstructorParameters<typeof NextRequest>[1]),
+        {} as never
+      );
+
+      expect(response.status).toBe(413);
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    test("hands an acceptable body to the handler unread", async () => {
+      const handler = vi.fn(async ({ req }: { req: NextRequest }) => Response.json(await req.json()));
+
+      const response = await withV3ApiWrapper({ auth: "none", handler })(
+        new NextRequest("http://localhost/api/v3/workflows", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: "Nudge", definition: { nodes: [{ id: "n1" }] } }),
+        }),
+        {} as never
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        name: "Nudge",
+        definition: { nodes: [{ id: "n1" }] },
+      });
+    });
+
+    test("leaves a body that is not JSON to the handler", async () => {
+      const handler = vi.fn(async ({ req }: { req: NextRequest }) => new Response(await req.text()));
+
+      const response = await withV3ApiWrapper({ auth: "none", handler })(
+        new NextRequest("http://localhost/api/v3/workflows", { method: "POST", body: "not json" }),
+        {} as never
+      );
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      await expect(response.text()).resolves.toBe("not json");
+    });
+  });
+});
+
+describe("per-route body limit (bodyLimitBytes)", () => {
+  const ROUTE_LIMIT = DEFAULT_REQUEST_BODY_LIMIT_BYTES * 2;
+
+  /** A JSON body of exactly `bytes` bytes, as `{"a":"xxx…"}`. */
+  const jsonBodyOfSize = (bytes: number) => `{"a":"${"x".repeat(bytes - 8)}"}`;
+
+  /** No Content-Length: the limit has to be enforced while reading, not from the header. */
+  const streamedPost = (body: string) =>
+    new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(body));
+          controller.close();
+        },
+      }),
+      duplex: "half",
+    } as ConstructorParameters<typeof NextRequest>[1]);
+
+  const declaredBodyRoute = (handler: Parameters<typeof withV3ApiWrapper>[0]["handler"], limit?: number) =>
+    withV3ApiWrapper({
+      auth: "none",
+      schemas: { body: z.object({ a: z.string() }) },
+      ...(limit === undefined ? {} : { bodyLimitBytes: limit }),
+      handler,
+    });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  test("a route without bodyLimitBytes still caps a streamed body at the 2 MB default", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await declaredBodyRoute(handler)(
+      streamedPost(jsonBodyOfSize(DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1)),
+      {} as never
+    );
+
+    expect(response.status).toBe(413);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  test("accepts a body above the default when the route allows it", async () => {
+    const handler = vi.fn(async ({ parsedInput }) => Response.json({ length: parsedInput.body.a.length }));
+    const body = jsonBodyOfSize(DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1024);
+
+    const response = await declaredBodyRoute(handler, ROUTE_LIMIT)(streamedPost(body), {} as never);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ length: body.length - 8 });
+  });
+
+  test("refuses a streamed body one byte over the route's limit, naming that limit", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await declaredBodyRoute(handler, ROUTE_LIMIT)(
+      streamedPost(jsonBodyOfSize(ROUTE_LIMIT + 1)),
+      {} as never
+    );
+
+    expect(response.status).toBe(413);
+    expect(handler).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      code: "payload_too_large",
+      detail: `Request body must not exceed ${ROUTE_LIMIT} bytes`,
+    });
+  });
+
+  test("refuses from the Content-Length header before reading the body", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await declaredBodyRoute(handler, ROUTE_LIMIT)(
+      new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+        method: "POST",
+        body: "{}",
+        headers: { "Content-Type": "application/json", "Content-Length": String(ROUTE_LIMIT + 1) },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(413);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  test("applies to a route without a body schema too", async () => {
+    const handler = vi.fn(async ({ req }: { req: NextRequest }) =>
+      Response.json({ size: (await req.text()).length })
+    );
+    const body = jsonBodyOfSize(DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1024);
+    const route = withV3ApiWrapper({ auth: "none", bodyLimitBytes: ROUTE_LIMIT, handler });
+
+    const accepted = await route(streamedPost(body), {} as never);
+    const refused = await route(streamedPost(jsonBodyOfSize(ROUTE_LIMIT + 1)), {} as never);
+
+    expect(accepted.status).toBe(200);
+    await expect(accepted.json()).resolves.toEqual({ size: body.length });
+    expect(refused.status).toBe(413);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses to build a route with bodyLimitBytes %s",
+    (bodyLimitBytes) => {
+      expect(() =>
+        withV3ApiWrapper({ auth: "none", bodyLimitBytes, handler: async () => new Response(null) })
+      ).toThrow(/bodyLimitBytes must be a positive integer/);
+    }
+  );
+});
+
+describe("per-route concurrency limit", () => {
+  const sessionUser = { user: { id: "user_1" }, expires: "2099-01-01" };
+
+  const postJson = (body: string) =>
+    new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+
+  const limitedRoute = (
+    limiter: ConcurrencyLimiter,
+    handler: Parameters<typeof withV3ApiWrapper>[0]["handler"]
+  ) =>
+    withV3ApiWrapper({
+      auth: "session",
+      schemas: { body: z.object({ a: z.string() }) },
+      concurrency: { limiter, retryAfterSeconds: 7 },
+      handler,
+    });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockGetSession.mockResolvedValue(sessionUser);
+  });
+
+  test("answers 503 capacity_reached with Retry-After when every slot is taken, once the body is read", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const held = limiter.tryAcquire("someone_else");
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    // The body is read before admission, so a slot bounds the work and never a client's upload: a
+    // malformed body is a 400 whatever the slots, and only a valid one meets the limit.
+    const malformed = await limitedRoute(limiter, handler)(postJson("not json"), {} as never);
+    expect(malformed.status).toBe(400);
+
+    const response = await limitedRoute(limiter, handler)(postJson('{"a":"x"}'), {} as never);
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("7");
+    expect(handler).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({ code: "capacity_reached", status: 503 });
+    if (held.ok) held.release();
+  });
+
+  test("answers 429 with Retry-After when the caller already holds its share, while others still get in", async () => {
+    const limiter = new ConcurrencyLimiter(3, { maxPerKey: 1 });
+    const mine = limiter.tryAcquire("user_1");
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await limitedRoute(limiter, handler)(postJson('{"a":"x"}'), {} as never);
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("7");
+    // Its own code, not the rate limit's: the caller waits for its own request rather than slowing down.
+    await expect(response.json()).resolves.toMatchObject({ code: "concurrency_limit_reached" });
+    expect(handler).not.toHaveBeenCalled();
+    expect(limiter.tryAcquire("user_2").ok).toBe(true);
+    if (mine.ok) mine.release();
+  });
+
+  test("takes no slot, and is never refused for one, when appliesTo says the request is cheap", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const held = limiter.tryAcquire("someone_else");
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const route = withV3ApiWrapper({
+      auth: "session",
+      schemas: { body: z.object({ a: z.string() }) },
+      concurrency: {
+        limiter,
+        retryAfterSeconds: 7,
+        appliesTo: (req) => req.nextUrl.searchParams.get("cheap") !== "true",
+      },
+      handler,
+    });
+    const post = (query: string) =>
+      new NextRequest(`http://localhost/api/internal/surveys/import/stream${query}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"a":"x"}',
+      });
+
+    expect((await route(post("?cheap=true"), {} as never)).status).toBe(200);
+    expect(limiter.inFlight).toBe(1);
+    expect((await route(post(""), {} as never)).status).toBe(503);
+    if (held.ok) held.release();
+  });
+
+  test("does not take a slot for an unauthenticated or rate-limited request", async () => {
+    const { applyRateLimit } = await import("@/modules/core/rate-limit/helpers");
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(limiter, async () => Response.json({ ok: true }));
+
+    mockGetSession.mockResolvedValueOnce(null);
+    expect((await route(postJson('{"a":"x"}'), {} as never)).status).toBe(401);
+
+    vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("slow down", 60));
+    expect((await route(postJson('{"a":"x"}'), {} as never)).status).toBe(429);
+
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("refuses a rate-limited caller for its rate limit even when every slot is taken", async () => {
+    // The rate limit answers first: a caller over it hears 429 and when to retry, not that the server
+    // is busy, and never takes a slot it was not going to use.
+    const { applyRateLimit } = await import("@/modules/core/rate-limit/helpers");
+    const limiter = new ConcurrencyLimiter(1);
+    const held = limiter.tryAcquire("someone_else");
+    vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("slow down", 60));
+
+    const response = await limitedRoute(limiter, async () => Response.json({ ok: true }))(
+      postJson('{"a":"x"}'),
+      {} as never
+    );
+
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toMatchObject({ code: "too_many_requests" });
+    if (held.ok) held.release();
+  });
+
+  test("frees the slot after a plain response, and after a request that fails validation", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(limiter, async () => Response.json({ ok: true }));
+
+    const ok = await route(postJson('{"a":"x"}'), {} as never);
+    await ok.text();
+    const invalid = await route(postJson('{"b":1}'), {} as never);
+
+    expect(ok.status).toBe(200);
+    expect(invalid.status).toBe(400);
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("frees the slot when the handler throws", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(limiter, async () => {
+      throw new Error("boom");
+    });
+
+    const response = await route(postJson('{"a":"x"}'), {} as never);
+
+    expect(response.status).toBe(500);
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("keeps the slot while a streamed body is still being sent, and frees it at the end", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    let finish: (() => void) | undefined;
+    const route = limitedRoute(
+      limiter,
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"type":"start"}\n'));
+              finish = () => controller.close();
+            },
+          })
+        )
+    );
+
+    const streaming = await route(postJson('{"a":"x"}'), {} as never);
+    const whileStreaming = await route(postJson('{"a":"x"}'), {} as never);
+    const read = streaming.text();
+    finish?.();
+    await read;
+
+    expect(whileStreaming.status).toBe(503);
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("frees the slot when the client cancels the stream", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(
+      limiter,
+      async () => new Response(new ReadableStream<Uint8Array>({ pull() {} }))
+    );
+
+    const streaming = await route(postJson('{"a":"x"}'), {} as never);
+    expect(limiter.inFlight).toBe(1);
+    await streaming.body?.cancel();
+
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("frees the slot when the client disconnects, even though nobody reads or cancels the body", async () => {
+    // Next returns early from piping a body to a response the client already closed: it neither reads
+    // nor cancels it. The request signal is the only thing that fires.
+    const limiter = new ConcurrencyLimiter(1);
+    const client = new AbortController();
+    const route = limitedRoute(
+      limiter,
+      async () => new Response(new ReadableStream<Uint8Array>({ pull() {} }))
+    );
+
+    const response = await route(
+      new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"a":"x"}',
+        signal: client.signal,
+      }),
+      {} as never
+    );
+    expect(response.status).toBe(200);
+    expect(limiter.inFlight).toBe(1);
+
+    client.abort();
+
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("a client that hangs up early keeps its slot until the handler is done with the request", async () => {
+    // Freeing the slot on the abort itself would let a client open a request, hang up straight away and
+    // open the next, each leaving a body parse and handler running past the limit.
+    const limiter = new ConcurrencyLimiter(1);
+    const client = new AbortController();
+    let finishHandler: (() => void) | undefined;
+    let handlerStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      handlerStarted = resolve;
+    });
+    const route = limitedRoute(limiter, async () => {
+      handlerStarted?.();
+      await new Promise<void>((resolve) => {
+        finishHandler = resolve;
+      });
+      return new Response(new ReadableStream<Uint8Array>({ pull() {} }));
+    });
+
+    const pending = route(
+      new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"a":"x"}',
+        signal: client.signal,
+      }),
+      {} as never
+    );
+    await started;
+    client.abort();
+
+    expect(limiter.inFlight).toBe(1);
+    expect((await route(postJson('{"a":"x"}'), {} as never)).status).toBe(503);
+
+    finishHandler?.();
+    await pending;
+
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("frees the slot when the response cannot be handed to its body", async () => {
+    // A locked body cannot be wrapped. Rare, but the slot would otherwise stay taken until a restart.
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(limiter, async () => {
+      const locked = new Response(new ReadableStream<Uint8Array>({ pull() {} }), {
+        headers: { "X-Request-Id": "req_locked" },
+      });
+      locked.body?.getReader();
+      return locked;
+    });
+
+    const response = await route(postJson('{"a":"x"}'), {} as never);
+
+    expect(response.status).toBe(500);
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("a disconnect after the body settled releases nothing twice", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const client = new AbortController();
+    const route = limitedRoute(limiter, async () => Response.json({ ok: true }));
+
+    const response = await route(
+      new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"a":"x"}',
+        signal: client.signal,
+      }),
+      {} as never
+    );
+    await response.text();
+    const other = limiter.tryAcquire("someone_else");
+    client.abort();
+
+    expect(limiter.inFlight).toBe(1);
+    if (other.ok) other.release();
+  });
+
+  test.each([0, -3, 1.5])("refuses to build a route with retryAfterSeconds %s", (retryAfterSeconds) => {
+    expect(() =>
+      withV3ApiWrapper({
+        auth: "session",
+        concurrency: { limiter: new ConcurrencyLimiter(1), retryAfterSeconds },
+        handler: async () => new Response(null),
+      })
+    ).toThrow(/retryAfterSeconds must be a positive integer/);
+  });
+});
+
+describe("multipart form bodies (schemas.formData)", () => {
+  const ROUTE_LIMIT = 64 * 1024;
+  const URL_PATH = "http://localhost/api/internal/surveys/import/stream";
+
+  const ZUpload = z.strictObject({ workspaceId: z.string().min(1), file: z.instanceof(File) });
+
+  const uploadRoute = (handler: Parameters<typeof withV3ApiWrapper>[0]["handler"]) =>
+    withV3ApiWrapper({ auth: "none", bodyLimitBytes: ROUTE_LIMIT, schemas: { formData: ZUpload }, handler });
+
+  /** The bytes and `Content-Type` (with its boundary) a browser sends for `form`. */
+  const encodeForm = async (form: FormData) => {
+    const request = new Request(URL_PATH, { method: "POST", body: form });
+    return {
+      bytes: new Uint8Array(await request.arrayBuffer()),
+      contentType: request.headers.get("content-type") as string,
+    };
+  };
+
+  /** No Content-Length, like a chunked upload: any limit has to hold while the body streams in. */
+  const streamedPost = (bytes: Uint8Array, headers: Record<string, string>) =>
+    new NextRequest(URL_PATH, {
+      method: "POST",
+      headers,
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      duplex: "half",
+    } as ConstructorParameters<typeof NextRequest>[1]);
+
+  const form = (fields: [string, string | File][]) => {
+    const data = new FormData();
+    for (const [name, value] of fields) data.append(name, value);
+    return data;
+  };
+
+  const file = (content: string, name = "survey.qsf") => new File([content], name, { type: "text/plain" });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  test("parses a multipart body with one file and hands its fields to the handler", async () => {
+    const handler = vi.fn(async ({ parsedInput }) =>
+      Response.json({
+        workspaceId: parsedInput.formData.workspaceId,
+        name: parsedInput.formData.file.name,
+        content: await parsedInput.formData.file.text(),
+      })
+    );
+    const { bytes, contentType } = await encodeForm(
+      form([
+        ["workspaceId", "ws_1"],
+        ["file", file('{"SurveyEntry":{}}')],
+      ])
+    );
+
+    // Streamed without a Content-Length: the route never asks for one (no 411).
+    const response = await uploadRoute(handler)(
+      streamedPost(bytes, { "Content-Type": contentType }),
+      {} as never
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      workspaceId: "ws_1",
+      name: "survey.qsf",
+      content: '{"SurveyEntry":{}}',
+    });
+  });
+
+  test.each([
+    ["a JSON body", "application/json"],
+    ["a urlencoded form", "application/x-www-form-urlencoded"],
+    ["no Content-Type", null],
+  ])("answers 415 for %s, saying what it takes", async (_label, contentType) => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await uploadRoute(handler)(
+      new NextRequest(URL_PATH, {
+        method: "POST",
+        body: '{"workspaceId":"ws_1"}',
+        headers: contentType ? { "Content-Type": contentType } : {},
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(415);
+    expect(response.headers.get("Content-Type")).toBe("application/problem+json");
+    expect(response.headers.get("Accept-Post")).toBe("multipart/form-data");
+    await expect(response.json()).resolves.toMatchObject({ code: "unsupported_media_type" });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  test.each<[string, [string, string | File][], string]>([
+    ["no file", [["workspaceId", "ws_1"]], "file"],
+    [
+      "two file parts",
+      [
+        ["workspaceId", "ws_1"],
+        ["file", file("a")],
+        ["file", file("b")],
+      ],
+      "file",
+    ],
+    [
+      "a field it does not take",
+      [
+        ["workspaceId", "ws_1"],
+        ["file", file("a")],
+        ["fileName", "other.qsf"],
+      ],
+      "fileName",
+    ],
+    [
+      "a file where text belongs",
+      [
+        ["workspaceId", file("ws_1")],
+        ["file", file("a")],
+      ],
+      "workspaceId",
+    ],
+  ])("answers 400 for %s, naming the field", async (_label, fields, name) => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const { bytes, contentType } = await encodeForm(form(fields));
+
+    const response = await uploadRoute(handler)(
+      streamedPost(bytes, { "Content-Type": contentType }),
+      {} as never
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Content-Type")).toBe("application/problem+json");
+    await expect(response.json()).resolves.toMatchObject({
+      invalid_params: [expect.objectContaining({ name })],
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  test("answers 400 for a multipart body that does not parse", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await uploadRoute(handler)(
+      streamedPost(new TextEncoder().encode("--other\r\nnot a part\r\n"), {
+        "Content-Type": "multipart/form-data; boundary=expected",
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  test("refuses from Content-Length before reading, and while streaming past the limit without one", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const { bytes, contentType } = await encodeForm(
+      form([
+        ["workspaceId", "ws_1"],
+        ["file", file("x".repeat(ROUTE_LIMIT))],
+      ])
+    );
+
+    const declared = await uploadRoute(handler)(
+      new NextRequest(URL_PATH, {
+        method: "POST",
+        body: "--x--",
+        headers: { "Content-Type": contentType, "Content-Length": String(ROUTE_LIMIT + 1) },
+      }),
+      {} as never
+    );
+    const streamed = await uploadRoute(handler)(
+      streamedPost(bytes, { "Content-Type": contentType }),
+      {} as never
+    );
+
+    for (const response of [declared, streamed]) {
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "payload_too_large",
+        detail: `Request body must not exceed ${ROUTE_LIMIT} bytes`,
+      });
+    }
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  test("refuses to build a route that declares both a JSON body and a form", () => {
+    expect(() =>
+      withV3ApiWrapper({
+        auth: "none",
+        schemas: { body: z.object({}), formData: ZUpload },
+        handler: async () => new Response(null),
+      })
+    ).toThrow(/either a body or a formData schema/);
   });
 });

@@ -7,6 +7,11 @@ name: Build Community Testing Images
 on:
   workflow_dispatch:
     inputs:
+      blacksmith_trial:
+        description: "Benchmark and smoke-test Blacksmith on both architectures without publishing release images"
+        required: false
+        type: boolean
+        default: false
       version_override:
         description: "Override version (SemVer only, e.g., 1.2.3-beta). Leave empty for auto-generated experimental version."
         required: false
@@ -18,37 +23,72 @@ permissions:
   id-token: write
 
 jobs:
-  build-community-testing:
-    name: Build Community Testing Image
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  blacksmith-trial:
+    if: inputs.blacksmith_trial
+    uses: ./.github/workflows/blacksmith-docker-trial.yml
+    permissions:
+      contents: read
 
+  build-community-testing:
+    if: ${{ !inputs.blacksmith_trial }}
+    name: Build community testing candidate
+    uses: ./.github/workflows/build-docker-candidate.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      registry_type: ghcr
+      ghcr_image_name: ${{ format('{0}-experimental', github.repository) }}
+      experimental_mode: true
+      version: ${{ inputs.version_override || '' }}
+    secrets: inherit
+
+  validate:
+    name: Image smoke (${{ matrix.platform }})
+    needs: build-community-testing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
     steps:
-      - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+      - name: Harden runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
-
-      - name: Checkout repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/test-release-image
         with:
-          fetch-depth: 0
-
-      - name: Build and push community testing image
-        uses: ./.github/actions/build-and-push-docker
-        with:
+          image_ref: ${{ needs.build-community-testing.outputs.IMAGE_REF }}
+          build_identity: ${{ needs.build-community-testing.outputs.BUILD_IDENTITY }}
           registry_type: "ghcr"
-          ghcr_image_name: "${{ github.repository }}-experimental"
-          experimental_mode: "true"
-          version: ${{ inputs.version_override }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEPOT_PROJECT_TOKEN: ${{ secrets.DEPOT_PROJECT_TOKEN }}
-          DUMMY_DATABASE_URL: ${{ secrets.DUMMY_DATABASE_URL }}
-          DUMMY_ENCRYPTION_KEY: ${{ secrets.DUMMY_ENCRYPTION_KEY }}
-          DUMMY_REDIS_URL: ${{ secrets.DUMMY_REDIS_URL }}
-          DUMMY_HUB_API_URL: ${{ secrets.DUMMY_HUB_API_URL }}
-          DUMMY_HUB_API_KEY: ${{ secrets.DUMMY_HUB_API_KEY }}
-          DUMMY_CUBEJS_API_URL: ${{ secrets.DUMMY_CUBEJS_API_URL }}
-          DUMMY_CUBEJS_API_SECRET: ${{ secrets.DUMMY_CUBEJS_API_SECRET }}
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          platform: ${{ matrix.platform }}
+
+  promote:
+    name: Promote verified image
+    needs: [build-community-testing, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/promote-verified-image
+        with:
+          image_ref: ${{ needs.build-community-testing.outputs.IMAGE_REF }}
+          registry_type: "ghcr"
+          release_tags: ${{ needs.build-community-testing.outputs.TAGS }}

@@ -1,16 +1,19 @@
 import { TOrganizationRole } from "@formbricks/types/memberships";
 import { TOrganization } from "@formbricks/types/organizations";
 import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
+import { getAccessFlags } from "@/lib/membership/utils";
 import { MembersInfo } from "@/modules/organization/settings/teams/components/edit-memberships/members-info";
 import { getInvitesByOrganizationId } from "@/modules/organization/settings/teams/lib/invite";
 import { getMembershipByOrganizationId } from "@/modules/organization/settings/teams/lib/membership";
 
 interface EditMembershipsProps {
-  organization: TOrganization;
-  currentUserId: string;
-  role: TOrganizationRole;
-  isAccessControlAllowed: boolean;
-  isUserManagementDisabledFromUi: boolean;
+  readonly organization: TOrganization;
+  readonly currentUserId: string;
+  readonly role: TOrganizationRole;
+  readonly isAccessControlAllowed: boolean;
+  readonly isDashboardViewerRoleEnabled: boolean;
+  readonly isUserManagementDisabledFromUi: boolean;
+  readonly canManageUsers: boolean;
 }
 
 /**
@@ -23,23 +26,35 @@ export const EditMemberships = async ({
   currentUserId,
   role,
   isAccessControlAllowed,
+  isDashboardViewerRoleEnabled,
   isUserManagementDisabledFromUi,
+  canManageUsers,
 }: EditMembershipsProps) => {
-  const members = await getMembershipByOrganizationId(organization.id);
-  const invites = await getInvitesByOrganizationId(organization.id);
+  const [members, invites] = await Promise.all([
+    getMembershipByOrganizationId(organization.id),
+    getInvitesByOrganizationId(organization.id),
+  ]);
 
   if (!role) return null;
+
+  // Last sign-in is for Owners and Managers only (ENG-3317). Strip it here rather than hiding a column, so
+  // it never reaches anyone else's page payload.
+  const { isOwner, isManager } = getAccessFlags(role);
+  const visibleMembers =
+    isOwner || isManager ? members : members.map((member) => ({ ...member, lastLoginAt: undefined }));
 
   return (
     <MembersInfo
       organization={organization}
       currentUserId={currentUserId}
       invites={invites ?? []}
-      members={members ?? []}
+      members={visibleMembers}
       currentUserRole={role}
       isAccessControlAllowed={isAccessControlAllowed}
       isFormbricksCloud={IS_FORMBRICKS_CLOUD}
+      isDashboardViewerRoleEnabled={isDashboardViewerRoleEnabled}
       isUserManagementDisabledFromUi={isUserManagementDisabledFromUi}
+      canManageUsers={canManageUsers}
     />
   );
 };

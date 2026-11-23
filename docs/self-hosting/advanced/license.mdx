@@ -4,7 +4,7 @@ description: "License for Formbricks"
 icon: "file-certificate"
 ---
 
-The Formbricks core source code is licensed under AGPLv3 and available on GitHub. Additionally, we offer features for bigger organisations & enterprises under a separate, paid Enterprise License. This assures the long-term sustainability of the open-source codebase. All free features are listed [below](#what-features-are-free%3F).
+The Formbricks core source code is licensed under AGPLv3 and available on GitHub. Additionally, we offer features for bigger organisations & enterprises under a separate, paid Enterprise License. This assures the long-term sustainability of the open-source codebase. All free features are listed [below](#what-features-are-free).
 
 <Note>
   Want to get your hands on the Enterprise Edition? [Request a free Enterprise Edition
@@ -27,8 +27,8 @@ Additional to the AGPLv3 licensed Formbricks core, the Formbricks repository con
 | Unlimited surveys                                             | ✅                | ✅  |
 | Unlimited users                                               | ✅                | ✅  |
 | Workspaces                                                    | 1                 | Pay per workspace  |
-| Use all [free features](#what-features-are-free%3F) | ✅                | ✅  |
-| Use [paid features](#what-features-are-free%3F)       | ❌                | Pay per feature                 |
+| Use all [free features](#what-features-are-free) | ✅                | ✅  |
+| Use [paid features](#what-features-are-free)       | ❌                | Pay per feature                 |
 
 ## Open Core Licensing
 
@@ -91,6 +91,7 @@ The Enterprise Edition allows us to fund the development of Formbricks sustainab
 | Unify Feedback Inbox                           | ❌                | ✅                 |
 | Feedback Datasets                               | ❌                | ✅                 |
 | Insights Dashboards                            | ❌                | ✅                 |
+| Creatives (feedback buttons and banners)       | ❌                | ✅                 |
 | Audit Logs                                     | ❌                | ✅                 |
 | OIDC SSO (AzureAD, Google, OpenID)            | ❌                | ✅                 |
 | SAML SSO                                       | ❌                | ✅                 |
@@ -101,3 +102,27 @@ The Enterprise Edition allows us to fund the development of Formbricks sustainab
 | Support SLAs                                   | ❌                | ✅                 |
 
 Questions? [Send us an email](mailto:johannes@formbricks.com) or [book a call with us.](https://cal.com/johannes/license)
+
+## Configure Enterprise capabilities
+
+[Activate your license](/self-hosting/advanced/license-activation), then use the relevant guide.
+
+- [Hide branding](/platform/features/styling-theme#hide-formbricks-branding)
+- [White-label email](/platform/features/email-customization)
+- [Teams and access roles](/platform/features/user-management)
+- [Contacts and segments](/platform/features/contacts)
+- [OpenID Connect](/self-hosting/configuration/auth-sso/open-id-connect)
+- [SAML SSO](/self-hosting/configuration/auth-sso/saml-sso)
+- [Unify Feedback](/unify-feedback/overview)
+- [Dashboards](/unify-feedback/dashboards-charts)
+- [AI features](/self-hosting/configuration/ai-features)
+- [Workflows](/workflows/overview)
+- [Creatives](/surveys/creatives/overview) (requires the `creatives` entitlement)
+
+SAML additionally requires the `saml` license entitlement. AI stays off until you connect a model.
+White-label respondent emails do not remove Formbricks branding from coworker invitations.
+Contact identity and segments support targeting; use [attribute-based targeting](/surveys/website-app-surveys/attribute-based-targeting).
+Community Edition members have the Owner role and full organization control. Enterprise adds differentiated
+roles and team permissions; see [user management](/platform/features/user-management).
+
+[Audit logging](/self-hosting/advanced/enterprise-features/audit-logging) has its own operational setup.

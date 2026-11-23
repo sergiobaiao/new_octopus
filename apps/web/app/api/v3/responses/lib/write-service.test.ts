@@ -1,0 +1,1069 @@
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { ResourceNotFoundError } from "@formbricks/types/errors";
+import { ZResponse } from "@formbricks/types/responses";
+import {
+  INLINE_DRAIN_WAIT_MS,
+  type TV3CreateResponsePersist,
+  type TV3WriteReadbackRow,
+  type TV3WriteSurveyRow,
+  createScopedResponse,
+  dispatchV3ResponsePipeline,
+  getSurveyForV3Write,
+  listScopedResponseSurveyRefs,
+  readbackV3Response,
+  setScopedResponsesOutcome,
+  toV3PipelineResponse,
+  updateScopedResponse,
+} from "./write-service";
+
+vi.mock("server-only", () => ({}));
+
+const {
+  mockTransaction,
+  mockSendToPipeline,
+  mockEvaluateQuotas,
+  mockLoggerError,
+  mockResponseFindFirst,
+  mockResponseFindMany,
+  mockSurveyFindUnique,
+  mockLoadQuotaContext,
+  mockEnqueueReplacedSignatures,
+  mockEnqueueOutcomeCleanups,
+  mockDrainCleanups,
+} = vi.hoisted(() => ({
+  mockTransaction: vi.fn(),
+  mockSendToPipeline: vi.fn(),
+  mockEvaluateQuotas: vi.fn(),
+  mockLoggerError: vi.fn(),
+  mockResponseFindFirst: vi.fn(),
+  mockResponseFindMany: vi.fn(),
+  mockSurveyFindUnique: vi.fn(),
+  mockLoadQuotaContext: vi.fn(),
+  mockEnqueueReplacedSignatures: vi.fn(),
+  mockEnqueueOutcomeCleanups: vi.fn(),
+  mockDrainCleanups: vi.fn(),
+}));
+
+vi.mock("@formbricks/database", () => ({
+  prisma: {
+    $transaction: mockTransaction,
+    response: { findFirst: mockResponseFindFirst, findMany: mockResponseFindMany },
+    survey: { findUnique: mockSurveyFindUnique },
+  },
+}));
+vi.mock("@formbricks/database/prisma", () => ({
+  Prisma: {
+    JsonNull: "JsonNull",
+    PrismaClientKnownRequestError: class extends Error {
+      code: string;
+      meta?: Record<string, unknown>;
+      constructor(message: string, code: string, meta?: Record<string, unknown>) {
+        super(message);
+        this.code = code;
+        this.meta = meta;
+      }
+    },
+  },
+}));
+vi.mock("@formbricks/logger", () => ({ logger: { error: mockLoggerError, warn: vi.fn() } }));
+vi.mock("@/app/lib/pipelines", () => ({ sendToPipeline: mockSendToPipeline }));
+vi.mock("@/modules/deletion-cleanup/lib/enqueue", () => ({
+  enqueueResponseOutcomeCleanups: mockEnqueueOutcomeCleanups,
+}));
+vi.mock("@/modules/deletion-cleanup/lib/drain", () => ({ drainDeletionCleanups: mockDrainCleanups }));
+vi.mock("@/modules/ee/quotas/lib/evaluation-service", () => ({
+  evaluateResponseQuotas: mockEvaluateQuotas,
+  loadQuotaEvaluationContext: mockLoadQuotaContext,
+}));
+vi.mock("@/modules/storage/lib/replaced-signature-files", () => ({
+  enqueueReplacedSignatureFileCleanup: mockEnqueueReplacedSignatures,
+}));
+vi.mock("@/lib/embedded-data/survey-fields", () => ({
+  inlineSurveyEmbeddedFields: () => [],
+  selectSurveyEmbeddedDataLinks: {},
+}));
+
+const { Prisma } = await import("@formbricks/database/prisma");
+
+/**
+ * The mocked constructor takes `(message, code, meta)`; the real one takes `(message, params)`, and
+ * `vi.mock` replaces the value without replacing the type. Cast at the one place that builds one
+ * rather than spreading `as never` through every assertion below.
+ */
+const knownRequestError = (message: string, code: string, meta?: Record<string, unknown>) =>
+  new (Prisma.PrismaClientKnownRequestError as unknown as new (
+    message: string,
+    code: string,
+    meta?: Record<string, unknown>
+  ) => Error)(message, code, meta);
+
+/**
+ * A P2002 in the shape THIS repo actually produces.
+ *
+ * Prisma 7 + `@prisma/adapter-pg` leaves `meta.target` absent and puts the columns at
+ * `meta.driverAdapterError.cause.constraint.fields`, still quoted exactly as Postgres emitted them
+ * — the adapter scrapes them out of the error DETAIL and never unquotes. A handler written against
+ * `meta.target` matches nothing here, which is a 500 on every real race.
+ */
+const adapterUniqueError = (...fields: string[]) =>
+  knownRequestError("Unique constraint failed", "P2002", {
+    driverAdapterError: { cause: { constraint: { fields } } },
+  });
+
+/** The library/legacy engine shape, which the shared helper still accepts. */
+const legacyUniqueError = (...fields: string[]) =>
+  knownRequestError("Unique constraint failed", "P2002", { target: fields });
+
+const survey = {
+  id: "clsv000000000000000000001",
+  workspaceId: "clws000000000000000000001",
+} as unknown as TV3WriteSurveyRow;
+
+/** A read-back row in the exact shape `v3WriteReadbackSelect` produces — join rows and all. */
+const readbackRow = (over: Record<string, unknown> = {}): TV3WriteReadbackRow =>
+  ({
+    id: "clrs000000000000000000001",
+    surveyId: survey.id,
+    createdAt: new Date("2026-09-11T10:00:00.000Z"),
+    updatedAt: new Date("2026-09-11T10:05:00.000Z"),
+    finished: true,
+    endingId: null,
+    language: "de",
+    data: { q1: "hi" },
+    variables: {},
+    ttc: { q1: 1200, _total: 1200 },
+    meta: { source: "smoke" },
+    displayId: null,
+    singleUseId: null,
+    outcome: null,
+    contactAttributes: { userId: "user-42" },
+    contact: { id: "clct000000000000000000001", attributes: [{ value: "user-42" }] },
+    tags: [
+      {
+        tag: {
+          id: "cltg000000000000000000001",
+          createdAt: new Date("2026-09-01T10:00:00.000Z"),
+          updatedAt: new Date("2026-09-01T10:00:00.000Z"),
+          name: "tag-a",
+          workspaceId: survey.workspaceId,
+        },
+      },
+    ],
+    ...over,
+  }) as unknown as TV3WriteReadbackRow;
+
+/**
+ * A transaction client stub, so the callback the service passes to `$transaction` actually runs.
+ * Mocking `$transaction` to resolve or reject skips the body entirely — which is where the scoped
+ * `where` clauses, the tag join shape and the reference checks all live.
+ */
+const txStub = (over: Record<string, unknown> = {}) => ({
+  contact: { findFirst: vi.fn().mockResolvedValue({ id: "clct000000000000000000001", attributes: [] }) },
+  display: { findFirst: vi.fn().mockResolvedValue({ id: "cldp1", response: null }) },
+  tag: { findMany: vi.fn().mockResolvedValue([]) },
+  workspace: { findUniqueOrThrow: vi.fn().mockResolvedValue({ organizationId: "clorg" }) },
+  response: {
+    findFirst: vi.fn().mockResolvedValue(null),
+    create: vi.fn().mockResolvedValue({ id: "clrs1", finished: false, data: {}, variables: {} }),
+    update: vi
+      .fn()
+      .mockResolvedValue({ id: "clrs1", finished: false, data: {}, variables: {}, language: null }),
+  },
+  ...over,
+});
+
+const runTx = (tx: ReturnType<typeof txStub>) => {
+  mockTransaction.mockImplementationOnce(async (fn: (client: unknown) => Promise<unknown>) => fn(tx));
+  return tx;
+};
+
+const createInput = (over: Partial<TV3CreateResponsePersist> = {}): TV3CreateResponsePersist => ({
+  workspaceId: survey.workspaceId,
+  survey,
+  finished: false,
+  data: { q1: "hi" },
+  variables: {},
+  ttc: {},
+  meta: undefined,
+  tagIds: [],
+  endingId: null,
+  language: null,
+  contactId: undefined,
+  displayId: undefined,
+  singleUseId: undefined,
+  ...over,
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockEvaluateQuotas.mockResolvedValue({ shouldEndSurvey: false });
+  mockLoadQuotaContext.mockResolvedValue(null);
+  mockEnqueueOutcomeCleanups.mockResolvedValue({ drainNowIds: [] });
+  mockDrainCleanups.mockResolvedValue({ done: 0, again: 0, failed: 0 });
+});
+
+describe("unique-constraint races", () => {
+  /**
+   * `POST` and `PATCH` document no 409, so a race lost to a concurrent write has to land on the same
+   * 422 the pre-check would have produced — otherwise losing the race is distinguishable from losing
+   * the check, and the endpoint answers a status its own contract does not list.
+   */
+  test("a singleUseId collision becomes the same 422 issue the pre-check raises", async () => {
+    mockTransaction.mockRejectedValueOnce(adapterUniqueError('"surveyId"', '"singleUseId"'));
+
+    const outcome = await createScopedResponse({
+      workspaceId: survey.workspaceId,
+      survey,
+      finished: true,
+      data: {},
+      variables: {},
+      ttc: {},
+      meta: undefined,
+      tagIds: [],
+      endingId: null,
+      language: null,
+      contactId: undefined,
+      displayId: undefined,
+      singleUseId: "su-1",
+    });
+
+    expect(outcome).toEqual({
+      ok: false,
+      issues: [expect.objectContaining({ name: "singleUseId", code: "duplicate_identifier" })],
+    });
+  });
+
+  /**
+   * The index name is internal, and the Postgres DETAIL behind it carries the offending VALUES —
+   * `Key ("surveyId", "singleUseId")=(…, …) already exists`, i.e. the single-use token itself.
+   * Neither may reach the body, which is why only the structured column list is read.
+   */
+  test("neither the constraint name nor the offending value reaches the issue", async () => {
+    mockTransaction.mockRejectedValueOnce(
+      knownRequestError("Unique constraint failed on the constraint: `Response_singleUseId_key`", "P2002", {
+        driverAdapterError: {
+          cause: {
+            constraint: { fields: ['"surveyId"', '"singleUseId"'] },
+            originalMessage: 'Key ("surveyId", "singleUseId")=(clsv1, secret-token-abc) already exists',
+          },
+        },
+      })
+    );
+
+    const outcome = await updateScopedResponse({
+      responseId: "clrs000000000000000000001",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { finished: true },
+    });
+
+    expect(JSON.stringify(outcome)).not.toContain("Response_singleUseId_key");
+    expect(JSON.stringify(outcome)).not.toContain("Unique constraint");
+    expect(JSON.stringify(outcome)).not.toContain("secret-token-abc");
+  });
+
+  /**
+   * The same violation in the library-engine shape. Both are accepted because the shared helper
+   * reads both, and a test that only covered this one is exactly how the adapter shape got missed.
+   */
+  test("the legacy meta.target shape maps to the same issue", async () => {
+    mockTransaction.mockRejectedValueOnce(legacyUniqueError("surveyId", "singleUseId"));
+
+    const outcome = await createScopedResponse(createInput({ singleUseId: "su-1" }));
+
+    expect(outcome).toEqual({
+      ok: false,
+      issues: [expect.objectContaining({ name: "singleUseId", code: "duplicate_identifier" })],
+    });
+  });
+
+  test("a displayId collision names displayId, not singleUseId", async () => {
+    mockTransaction.mockRejectedValueOnce(adapterUniqueError('"displayId"'));
+
+    const outcome = await createScopedResponse(createInput({ displayId: "cldp1" }));
+
+    expect(outcome).toEqual({
+      ok: false,
+      issues: [expect.objectContaining({ name: "displayId", code: "duplicate_identifier" })],
+    });
+  });
+
+  /**
+   * The scoped `where` carries `survey: { workspaceId }`, so P2025 means the row is gone or was never
+   * this caller's — the same fact a pre-flight rejection establishes, and it has to answer the same
+   * 403. `mapV3ThrownError` does not map raw Prisma errors, so without this translation the caller
+   * got a 500 instead of the 403 the scoped update's own comment promises.
+   */
+  test("P2025 from the scoped update becomes the not-found the 403 is rendered from", async () => {
+    mockTransaction.mockRejectedValueOnce(knownRequestError("gone", "P2025"));
+
+    await expect(
+      updateScopedResponse({
+        responseId: "clrs000000000000000000001",
+        workspaceId: survey.workspaceId,
+        survey,
+        patch: { finished: true },
+      })
+    ).rejects.toThrow(ResourceNotFoundError);
+  });
+
+  test("the same translation applies to a create that loses its survey", async () => {
+    mockTransaction.mockRejectedValueOnce(knownRequestError("gone", "P2025"));
+
+    await expect(createScopedResponse(createInput())).rejects.toThrow(ResourceNotFoundError);
+  });
+
+  /** Anything that is neither a recognised race nor a scoped miss is still a real failure. */
+  test("an unrelated Prisma error is rethrown rather than reported as a caller mistake", async () => {
+    mockTransaction.mockRejectedValueOnce(knownRequestError("fk violated", "P2003"));
+
+    await expect(
+      updateScopedResponse({
+        responseId: "clrs000000000000000000001",
+        workspaceId: survey.workspaceId,
+        survey,
+        patch: { finished: true },
+      })
+    ).rejects.toThrow("fk violated");
+  });
+
+  /** Duplicates in a patch are redundant, not an error — the join table's PK says otherwise. */
+  test("a repeated tag id is deduplicated before the join rows are written", async () => {
+    const tx = runTx(txStub({ tag: { findMany: vi.fn().mockResolvedValue([{ id: "cltg1" }]) } }));
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { tagIds: ["cltg1", "cltg1", "cltg1"] },
+    });
+
+    expect(tx.response.update.mock.calls[0][0].data.tags).toEqual({
+      deleteMany: {},
+      create: [{ tag: { connect: { id: "cltg1", workspaceId: survey.workspaceId } } }],
+    });
+  });
+});
+
+describe("dispatchV3ResponsePipeline", () => {
+  /**
+   * The row is already committed. A 500 here tells a caller its write failed when it did not, and the
+   * retry that follows creates a second response — a missed webhook is recoverable, a duplicated
+   * submission is not. `sendToPipeline` rethrows, so this has to be caught somewhere.
+   */
+  test("a queueing failure does not fail the request", async () => {
+    mockSendToPipeline.mockRejectedValue(new Error("redis down"));
+
+    await expect(
+      dispatchV3ResponsePipeline({
+        event: "responseCreated",
+        workspaceId: "clws000000000000000000001",
+        surveyId: survey.id,
+        response: readbackRow(),
+        alsoFinished: false,
+      })
+    ).resolves.toBeUndefined();
+
+    expect(mockLoggerError).toHaveBeenCalled();
+  });
+
+  test("a failed first event does not stop the finish event", async () => {
+    mockSendToPipeline.mockRejectedValueOnce(new Error("redis down")).mockResolvedValueOnce(undefined);
+
+    await dispatchV3ResponsePipeline({
+      event: "responseCreated",
+      workspaceId: "clws000000000000000000001",
+      surveyId: survey.id,
+      response: readbackRow(),
+      alsoFinished: true,
+    });
+
+    expect(mockSendToPipeline).toHaveBeenCalledTimes(2);
+    expect(mockSendToPipeline.mock.calls[1][0].event).toBe("responseFinished");
+  });
+
+  test("a partial response emits one event", async () => {
+    mockSendToPipeline.mockResolvedValue(undefined);
+
+    await dispatchV3ResponsePipeline({
+      event: "responseUpdated",
+      workspaceId: "clws000000000000000000001",
+      surveyId: survey.id,
+      response: readbackRow(),
+      alsoFinished: false,
+    });
+
+    expect(mockSendToPipeline).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("toV3PipelineResponse", () => {
+  /**
+   * The guard for the defect a live create exposed. `enqueueResponsePipeline` parses its payload
+   * against `ZResponse` in-request, and the stored row's `tags` are join rows while `contact` carries
+   * an attribute row. Handing the raw row over throws inside `sendToPipeline` — and because dispatch
+   * is deliberately non-fatal, the create still answered 201 while no webhook, integration,
+   * follow-up or Hub ingestion ran, with nothing in the reply to say so.
+   */
+  test("the payload parses against the schema the queue validates with", () => {
+    const parsed = ZResponse.safeParse(toV3PipelineResponse(readbackRow()));
+
+    expect(parsed.error?.issues).toBeUndefined();
+    expect(parsed.success).toBe(true);
+  });
+
+  test.each([null, "lowQuality"] as const)("the outcome %s is carried, never dropped", (outcome) => {
+    const payload = toV3PipelineResponse(readbackRow({ outcome }));
+
+    expect(payload.outcome).toBe(outcome);
+    expect(ZResponse.parse(payload).outcome).toBe(outcome);
+  });
+
+  test("join rows are flattened to the tag itself", () => {
+    expect(toV3PipelineResponse(readbackRow()).tags).toEqual([
+      expect.objectContaining({ id: "cltg000000000000000000001", name: "tag-a" }),
+    ]);
+  });
+
+  test("the contact carries its userId from the snapshot taken at create time", () => {
+    expect(toV3PipelineResponse(readbackRow()).contact).toEqual({
+      id: "clct000000000000000000001",
+      userId: "user-42",
+    });
+  });
+
+  test("an anonymous response still parses", () => {
+    const row = readbackRow({ contact: null, contactAttributes: null, tags: [] });
+
+    expect(ZResponse.safeParse(toV3PipelineResponse(row)).success).toBe(true);
+  });
+});
+
+describe("createScopedResponse — what actually reaches Prisma", () => {
+  test("tags are written as join rows in the same transaction", async () => {
+    const tx = runTx(txStub({ tag: { findMany: vi.fn().mockResolvedValue([{ id: "cltg1" }]) } }));
+
+    const outcome = await createScopedResponse(createInput({ tagIds: ["cltg1"] }));
+
+    expect(outcome).toEqual({ ok: true, responseId: "clrs1" });
+    expect(tx.response.create.mock.calls[0][0].data.tags).toEqual({
+      create: [{ tag: { connect: { id: "cltg1", workspaceId: survey.workspaceId } } }],
+    });
+  });
+
+  /**
+   * Every reference is connected by scope, not by id alone (ENG-2861). The pre-flight checks already
+   * refuse a foreign reference with a 422, so these assertions are about the second layer: the write
+   * itself re-states the tenant predicate, so a reference that stops matching between check and write
+   * cannot attach, and the guarantee survives someone moving or dropping the checks. Verified against
+   * a real database separately — a foreign scope raises P2025 and leaves no row.
+   *
+   * `display` is scoped by survey and by `response: null`, not by workspace: Display carries no
+   * `workspaceId`, and workspace-only scoping loses the cross-survey check ENG-825 was about and the
+   * reuse check behind ENG-827 / ENG-1923.
+   */
+  test("the contact connect carries the workspace, not just the id", async () => {
+    const tx = runTx(
+      txStub({ contact: { findFirst: vi.fn().mockResolvedValue({ id: "clct1", attributes: [] }) } })
+    );
+
+    await createScopedResponse(createInput({ contactId: "clct1" }));
+
+    expect(tx.response.create.mock.calls[0][0].data.contact).toEqual({
+      connect: { id: "clct1", workspaceId: survey.workspaceId },
+    });
+  });
+
+  test("the display connect carries the survey and refuses one already claimed", async () => {
+    const tx = runTx(
+      txStub({ display: { findFirst: vi.fn().mockResolvedValue({ id: "cldp1", responseId: null }) } })
+    );
+
+    await createScopedResponse(createInput({ displayId: "cldp1" }));
+
+    expect(tx.response.create.mock.calls[0][0].data.display).toEqual({
+      connect: { id: "cldp1", surveyId: survey.id, response: null },
+    });
+  });
+
+  test("no tags means no tags key at all, rather than an empty create", async () => {
+    const tx = runTx(txStub());
+
+    await createScopedResponse(createInput());
+
+    expect(tx.response.create.mock.calls[0][0].data.tags).toBeUndefined();
+  });
+
+  /** The reference checks run inside the transaction, against the snapshot the write will use. */
+  test("a contact outside the workspace stops the write before it happens", async () => {
+    const tx = runTx(txStub({ contact: { findFirst: vi.fn().mockResolvedValue(null) } }));
+
+    const outcome = await createScopedResponse(createInput({ contactId: "clct000000000000000000009" }));
+
+    expect(outcome).toEqual({
+      ok: false,
+      issues: [expect.objectContaining({ name: "contactId", code: "invalid_reference" })],
+    });
+    expect(tx.response.create).not.toHaveBeenCalled();
+  });
+
+  test("a display already backing another response is refused", async () => {
+    const tx = runTx(
+      txStub({
+        display: { findFirst: vi.fn().mockResolvedValue({ id: "cldp1", response: { id: "other" } }) },
+      })
+    );
+
+    const outcome = await createScopedResponse(createInput({ displayId: "cldp1" }));
+
+    expect(outcome.ok).toBe(false);
+    expect(tx.response.create).not.toHaveBeenCalled();
+  });
+
+  test("a single-use id already used on this survey is refused", async () => {
+    const tx = txStub();
+    tx.response.findFirst.mockResolvedValueOnce({ id: "clrs-existing" });
+    runTx(tx);
+
+    const outcome = await createScopedResponse(createInput({ singleUseId: "su-1" }));
+
+    expect(outcome).toEqual({
+      ok: false,
+      issues: [expect.objectContaining({ name: "singleUseId", code: "duplicate_identifier" })],
+    });
+  });
+
+  test("every unresolvable tag id is reported, not just the first", async () => {
+    runTx(txStub({ tag: { findMany: vi.fn().mockResolvedValue([{ id: "cltg1" }]) } }));
+
+    const outcome = await createScopedResponse(createInput({ tagIds: ["cltg1", "cltg2", "cltg3"] }));
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok === false && outcome.issues.map((i) => i.identifier)).toEqual(["cltg2", "cltg3"]);
+  });
+
+  /** Quotas resolve `reserved` operands off the persisted row, so they run after it exists. */
+  test("quota definitions are read before the transaction opens and handed to the evaluator (ENG-3285)", async () => {
+    const quotaContext = { quotas: [], survey: { id: survey.id } };
+    mockLoadQuotaContext.mockResolvedValueOnce(quotaContext);
+    runTx(txStub());
+
+    await createScopedResponse(createInput());
+
+    expect(mockLoadQuotaContext).toHaveBeenCalledWith(survey.id);
+    expect(mockLoadQuotaContext.mock.invocationCallOrder[0]).toBeLessThan(
+      mockTransaction.mock.invocationCallOrder[0]
+    );
+    expect(mockEvaluateQuotas).toHaveBeenCalledWith(expect.objectContaining({ quotaContext }));
+  });
+
+  test("quota evaluation gets the row as persisted, not the request body", async () => {
+    const tx = txStub();
+    tx.response.create.mockResolvedValueOnce({
+      id: "clrs1",
+      finished: true,
+      data: { q1: "x" },
+      variables: {},
+    });
+    runTx(tx);
+
+    await createScopedResponse(createInput({ finished: false }));
+
+    expect(mockEvaluateQuotas).toHaveBeenCalledWith(
+      expect.objectContaining({ responseFinished: true, responseId: "clrs1" })
+    );
+  });
+
+  /**
+   * The select's shape was guarded; passing it on was not. Dropping the `response:` argument from
+   * both call sites left the suite green, because `response` is optional on the evaluator — and with
+   * it absent every `reserved` operand resolves unset, which is the exact failure the wide select
+   * exists to prevent. Assert the row arrives, not just that it was selected.
+   */
+  test("the persisted row is handed to the evaluator, not just selected", async () => {
+    const tx = txStub();
+    tx.response.create.mockResolvedValueOnce({
+      id: "clrs1",
+      surveyId: "clsv1",
+      finished: true,
+      data: { q1: "x" },
+      variables: {},
+      meta: { country: "PT" },
+      ttc: { _total: 1200 },
+    });
+    runTx(tx);
+
+    await createScopedResponse(createInput({ finished: false }));
+
+    const [call] = mockEvaluateQuotas.mock.calls.at(-1) ?? [];
+    expect(call?.response).toEqual(
+      expect.objectContaining({ id: "clrs1", meta: { country: "PT" }, ttc: { _total: 1200 } })
+    );
+  });
+
+  /**
+   * The columns are the behaviour here, not an implementation detail: `reserved` operands resolve
+   * through accessors that read `meta.*`, `ttc` and the timestamps off this row, and each one is
+   * wrapped in a `try`/`catch` answering `undefined`. Selected down to four columns the write does
+   * not fail — every reserved operand just reads as unset, so a quota on `country` or `browser`
+   * silently counts nothing on the v3 path while it still counts on v1 and v2.
+   */
+  test("the written row is selected with the columns reserved quota operands read", async () => {
+    const tx = txStub();
+    runTx(tx);
+
+    await createScopedResponse(createInput({}));
+
+    const select = tx.response.create.mock.calls[0][0].select;
+    for (const column of ["meta", "ttc", "createdAt", "updatedAt", "language", "surveyId"]) {
+      expect(select).toHaveProperty(column, true);
+    }
+  });
+});
+
+describe("updateScopedResponse — replaced Signature images (ENG-6810)", () => {
+  const oldImage = "/storage/ws/private/surveys/svy/elements/sig/signature--fid--old.png";
+
+  test("queues the cleanup in the transaction, after the write, from the stored to the written data", async () => {
+    const tx = runTx(
+      txStub({
+        response: {
+          findFirst: vi.fn().mockResolvedValue({ data: { sig: oldImage } }),
+          update: vi
+            .fn()
+            .mockResolvedValue({ id: "clrs1", finished: false, data: { sig: "" }, variables: {} }),
+        },
+      })
+    );
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { data: { sig: "" } },
+    });
+
+    // Read scoped by workspace, never by id alone.
+    expect(tx.response.findFirst).toHaveBeenCalledWith({
+      where: { id: "clrs1", survey: { workspaceId: survey.workspaceId } },
+      select: { data: true },
+    });
+    expect(mockEnqueueReplacedSignatures).toHaveBeenCalledExactlyOnceWith(
+      tx,
+      { surveyId: survey.id, previousData: { sig: oldImage }, nextData: { sig: "" } },
+      { bestEffort: false }
+    );
+    expect(tx.response.update.mock.invocationCallOrder[0]).toBeLessThan(
+      mockEnqueueReplacedSignatures.mock.invocationCallOrder[0]
+    );
+  });
+
+  test("queues nothing when the update fails", async () => {
+    runTx(
+      txStub({
+        response: {
+          findFirst: vi.fn().mockResolvedValue({ data: { sig: oldImage } }),
+          update: vi.fn().mockRejectedValue(knownRequestError("gone", "P2025")),
+        },
+      })
+    );
+
+    await expect(
+      updateScopedResponse({
+        responseId: "clrs1",
+        workspaceId: survey.workspaceId,
+        survey,
+        patch: { data: { sig: "" } },
+      })
+    ).rejects.toThrow(ResourceNotFoundError);
+
+    expect(mockEnqueueReplacedSignatures).not.toHaveBeenCalled();
+  });
+
+  test("neither reads the stored data nor queues anything for a patch with no data", async () => {
+    const tx = runTx(txStub());
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { finished: true },
+    });
+
+    expect(tx.response.findFirst).not.toHaveBeenCalled();
+    expect(mockEnqueueReplacedSignatures).not.toHaveBeenCalled();
+  });
+});
+
+describe("updateScopedResponse — what actually reaches Prisma", () => {
+  test("quota definitions are read before the transaction opens and handed to the evaluator (ENG-3285)", async () => {
+    const quotaContext = { quotas: [], survey: { id: survey.id } };
+    mockLoadQuotaContext.mockResolvedValueOnce(quotaContext);
+    runTx(txStub());
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { finished: true },
+    });
+
+    expect(mockLoadQuotaContext).toHaveBeenCalledWith(survey.id);
+    expect(mockLoadQuotaContext.mock.invocationCallOrder[0]).toBeLessThan(
+      mockTransaction.mock.invocationCallOrder[0]
+    );
+    expect(mockEvaluateQuotas).toHaveBeenCalledWith(expect.objectContaining({ quotaContext }));
+  });
+
+  /** A bare id is how a caller reaches another tenant's response; the scope goes in the `where`. */
+  test("the update is scoped by workspace, never by id alone", async () => {
+    const tx = runTx(txStub());
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { finished: true },
+    });
+
+    expect(tx.response.update.mock.calls[0][0].where).toEqual({
+      id: "clrs1",
+      survey: { workspaceId: survey.workspaceId },
+    });
+  });
+
+  /**
+   * Spreading an absent key as `undefined` is the difference between "leave it" and "null it" for a
+   * nullable column, and `endingId` and `language` are both nullable.
+   */
+  test("a key the payload omits does not appear in the update at all", async () => {
+    const tx = runTx(txStub());
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { finished: true },
+    });
+
+    expect(Object.keys(tx.response.update.mock.calls[0][0].data)).toEqual(["finished"]);
+  });
+
+  test("an explicit null does reach the update", async () => {
+    const tx = runTx(txStub());
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { endingId: null },
+    });
+
+    expect(tx.response.update.mock.calls[0][0].data).toEqual({ endingId: null });
+  });
+
+  test.each(["lowQuality", null] as const)("outcome %s reaches the update", async (outcome) => {
+    const tx = runTx(txStub());
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { outcome },
+    });
+
+    expect(tx.response.update.mock.calls[0][0].data).toEqual({ outcome });
+  });
+
+  /** `tags` is the complete set, so the join rows are cleared and rewritten rather than added to. */
+  test("patching tags replaces the set", async () => {
+    const tx = runTx(txStub({ tag: { findMany: vi.fn().mockResolvedValue([{ id: "cltg1" }]) } }));
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { tagIds: ["cltg1"] },
+    });
+
+    expect(tx.response.update.mock.calls[0][0].data.tags).toEqual({
+      deleteMany: {},
+      create: [{ tag: { connect: { id: "cltg1", workspaceId: survey.workspaceId } } }],
+    });
+  });
+
+  /**
+   * Not only on a patch that finishes the response: for a quota with `countPartialSubmissions: false`
+   * the link row is written once the response is finished, so a create-only evaluation under-counts.
+   */
+  test("quotas are evaluated on every patch", async () => {
+    runTx(txStub());
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { data: { q1: "typo fixed" } },
+    });
+
+    expect(mockEvaluateQuotas).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("scoped reads", () => {
+  test("a survey read for a write carries its inlined embedded fields", async () => {
+    mockSurveyFindUnique.mockResolvedValueOnce({ id: survey.id, workspaceId: survey.workspaceId });
+
+    await expect(getSurveyForV3Write(survey.id)).resolves.toMatchObject({ embeddedFields: [] });
+  });
+
+  test("a survey that does not exist resolves to null rather than throwing", async () => {
+    mockSurveyFindUnique.mockResolvedValueOnce(null);
+
+    await expect(getSurveyForV3Write(survey.id)).resolves.toBeNull();
+  });
+
+  test("the read-back is scoped by workspace", async () => {
+    mockResponseFindFirst.mockResolvedValueOnce(readbackRow());
+
+    await readbackV3Response("clrs1", { workspaceId: survey.workspaceId });
+
+    expect(mockResponseFindFirst.mock.calls[0][0].where).toEqual({
+      id: "clrs1",
+      survey: { workspaceId: survey.workspaceId },
+    });
+  });
+});
+
+describe("the batch outcome write", () => {
+  const WORKSPACE_ID = survey.workspaceId;
+  const IDS = ["clrs000000000000000000001", "clrs000000000000000000002", "clrs000000000000000000003"];
+  const batchTx = (rows: { id: string; surveyId: string; outcome: string | null }[]) => {
+    const tx = {
+      response: { findMany: vi.fn().mockResolvedValue(rows), updateMany: vi.fn() },
+      workspace: { findUniqueOrThrow: vi.fn().mockResolvedValue({ organizationId: "clorg" }) },
+    };
+    mockTransaction.mockImplementationOnce(async (fn: (client: unknown) => Promise<unknown>) => fn(tx));
+    return tx;
+  };
+
+  test("the ids in scope are listed with their survey, filtered by workspace and visibility", async () => {
+    mockResponseFindMany.mockResolvedValueOnce([{ id: IDS[0], surveyId: survey.id }]);
+
+    const refs = await listScopedResponseSurveyRefs(IDS, {
+      workspaceId: WORKSPACE_ID,
+      visibleSurveyWhere: { id: "visible" },
+    });
+
+    expect(refs).toEqual([{ id: IDS[0], surveyId: survey.id }]);
+    expect(mockResponseFindMany.mock.calls[0][0].where).toEqual({
+      id: { in: IDS },
+      survey: { workspaceId: WORKSPACE_ID, AND: [{ id: "visible" }] },
+    });
+  });
+
+  test("only the responses whose outcome differs are written, scoped by workspace", async () => {
+    const tx = batchTx([
+      { id: IDS[0], surveyId: survey.id, outcome: null },
+      { id: IDS[1], surveyId: survey.id, outcome: "lowQuality" },
+    ]);
+    mockResponseFindMany.mockResolvedValueOnce([readbackRow({ id: IDS[0] })]);
+
+    const result = await setScopedResponsesOutcome(IDS, "lowQuality", { workspaceId: WORKSPACE_ID });
+
+    expect(tx.response.updateMany).toHaveBeenCalledTimes(1);
+    const { where, data } = tx.response.updateMany.mock.calls[0][0];
+    expect(data).toEqual({ outcome: "lowQuality" });
+    expect(where.id).toEqual({ in: [IDS[0]] });
+    expect(JSON.stringify(where.survey)).toContain(WORKSPACE_ID);
+    // Matched counts everything in scope, including what already carried the outcome: a retry of the
+    // same batch reports the same number.
+    expect(result.matched).toBe(2);
+    expect(result.changes).toEqual([{ id: IDS[0], surveyId: survey.id, previous: null }]);
+    expect(result.rows).toHaveLength(1);
+  });
+
+  test("a restore clears the outcome and remembers what it was", async () => {
+    const tx = batchTx([{ id: IDS[0], surveyId: survey.id, outcome: "lowQuality" }]);
+    mockResponseFindMany.mockResolvedValueOnce([readbackRow({ id: IDS[0] })]);
+
+    const result = await setScopedResponsesOutcome(IDS, null, { workspaceId: WORKSPACE_ID });
+
+    expect(tx.response.updateMany.mock.calls[0][0].data).toEqual({ outcome: null });
+    expect(result.changes).toEqual([{ id: IDS[0], surveyId: survey.id, previous: "lowQuality" }]);
+  });
+
+  test("nothing in scope, or nothing to change, writes and reads back nothing", async () => {
+    const tx = batchTx([{ id: IDS[0], surveyId: survey.id, outcome: "lowQuality" }]);
+
+    const result = await setScopedResponsesOutcome(IDS, "lowQuality", { workspaceId: WORKSPACE_ID });
+
+    expect(tx.response.updateMany).not.toHaveBeenCalled();
+    expect(mockResponseFindMany).not.toHaveBeenCalled();
+    expect(result).toEqual({ matched: 1, changes: [], rows: [] });
+  });
+  describe("the Feedback Record cleanup (ENG-6785)", () => {
+    test("is queued in the same transaction, for the changed responses only, and drained after commit", async () => {
+      const tx = batchTx([
+        { id: IDS[0], surveyId: survey.id, outcome: null },
+        { id: IDS[1], surveyId: survey.id, outcome: "lowQuality" },
+      ]);
+      mockResponseFindMany.mockResolvedValueOnce([readbackRow({ id: IDS[0] })]);
+      mockEnqueueOutcomeCleanups.mockResolvedValueOnce({ drainNowIds: ["cln-1"] });
+
+      await setScopedResponsesOutcome(IDS, "lowQuality", { workspaceId: WORKSPACE_ID });
+
+      expect(mockEnqueueOutcomeCleanups).toHaveBeenCalledTimes(1);
+      expect(mockEnqueueOutcomeCleanups).toHaveBeenCalledWith(tx, {
+        organizationId: "clorg",
+        workspaceId: WORKSPACE_ID,
+        changes: [{ id: IDS[0], surveyId: survey.id }],
+      });
+      expect(tx.response.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+        mockEnqueueOutcomeCleanups.mock.invocationCallOrder[0]
+      );
+      // After the transaction callback returned, i.e. after the commit.
+      expect(mockDrainCleanups).toHaveBeenCalledWith({ ids: ["cln-1"] });
+      expect(mockDrainCleanups.mock.invocationCallOrder[0]).toBeGreaterThan(
+        mockTransaction.mock.invocationCallOrder[0]
+      );
+    });
+
+    test("a restore queues it the same way", async () => {
+      batchTx([{ id: IDS[0], surveyId: survey.id, outcome: "lowQuality" }]);
+      mockResponseFindMany.mockResolvedValueOnce([readbackRow({ id: IDS[0] })]);
+
+      await setScopedResponsesOutcome(IDS, null, { workspaceId: WORKSPACE_ID });
+
+      expect(mockEnqueueOutcomeCleanups).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ changes: [{ id: IDS[0], surveyId: survey.id }] })
+      );
+    });
+
+    test("nothing to change queues and drains nothing", async () => {
+      batchTx([{ id: IDS[0], surveyId: survey.id, outcome: "lowQuality" }]);
+
+      await setScopedResponsesOutcome(IDS, "lowQuality", { workspaceId: WORKSPACE_ID });
+
+      expect(mockEnqueueOutcomeCleanups).not.toHaveBeenCalled();
+      expect(mockDrainCleanups).not.toHaveBeenCalled();
+    });
+
+    test("a Hub outage only delays the cleanup: a drain that throws never fails the marking", async () => {
+      batchTx([{ id: IDS[0], surveyId: survey.id, outcome: null }]);
+      mockResponseFindMany.mockResolvedValueOnce([readbackRow({ id: IDS[0] })]);
+      mockEnqueueOutcomeCleanups.mockResolvedValueOnce({ drainNowIds: ["cln-1"] });
+      mockDrainCleanups.mockRejectedValueOnce(new Error("hub down"));
+
+      const result = await setScopedResponsesOutcome(IDS, "lowQuality", { workspaceId: WORKSPACE_ID });
+
+      expect(result.changes).toHaveLength(1);
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.objectContaining({ workspaceId: WORKSPACE_ID }),
+        expect.stringContaining("drain job")
+      );
+    });
+
+    test("a transaction that rolls back queues nothing to drain", async () => {
+      mockTransaction.mockImplementationOnce(async () => {
+        throw new Error("rolled back");
+      });
+
+      await expect(
+        setScopedResponsesOutcome(IDS, "lowQuality", { workspaceId: WORKSPACE_ID })
+      ).rejects.toThrow();
+
+      expect(mockDrainCleanups).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("updateScopedResponse — the Feedback Record cleanup on an outcome change (ENG-6785)", () => {
+  const patchOutcome = (outcome: "lowQuality" | null) =>
+    updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { outcome },
+    });
+  const outcomeTx = (previous: "lowQuality" | null) => {
+    const tx = txStub({
+      workspace: { findUniqueOrThrow: vi.fn().mockResolvedValue({ organizationId: "clorg" }) },
+    });
+    tx.response.findFirst.mockResolvedValue({ outcome: previous } as never);
+    return runTx(tx);
+  };
+
+  test.each([
+    ["marking", null, "lowQuality"],
+    ["restoring", "lowQuality", null],
+  ] as const)("%s queues it in the transaction and drains it after commit", async (_name, previous, next) => {
+    const tx = outcomeTx(previous);
+    mockEnqueueOutcomeCleanups.mockResolvedValueOnce({ drainNowIds: ["cln-1"] });
+
+    await patchOutcome(next);
+
+    expect(tx.response.findFirst.mock.calls[0][0].where).toEqual({
+      id: "clrs1",
+      survey: { workspaceId: survey.workspaceId },
+    });
+    expect(mockEnqueueOutcomeCleanups).toHaveBeenCalledWith(tx, {
+      organizationId: "clorg",
+      workspaceId: survey.workspaceId,
+      changes: [{ id: "clrs1", surveyId: survey.id }],
+    });
+    expect(mockDrainCleanups).toHaveBeenCalledWith({ ids: ["cln-1"] });
+  });
+
+  test("an outcome the response already has queues nothing", async () => {
+    outcomeTx("lowQuality");
+
+    await patchOutcome("lowQuality");
+
+    expect(mockEnqueueOutcomeCleanups).not.toHaveBeenCalled();
+    expect(mockDrainCleanups).not.toHaveBeenCalled();
+  });
+
+  test("a patch that does not carry the outcome neither reads nor queues anything", async () => {
+    const tx = runTx(txStub());
+
+    await updateScopedResponse({
+      responseId: "clrs1",
+      workspaceId: survey.workspaceId,
+      survey,
+      patch: { finished: true },
+    });
+
+    expect(tx.response.findFirst).not.toHaveBeenCalled();
+    expect(mockEnqueueOutcomeCleanups).not.toHaveBeenCalled();
+  });
+
+  test("a drain that throws never fails the patch", async () => {
+    outcomeTx(null);
+    mockEnqueueOutcomeCleanups.mockResolvedValueOnce({ drainNowIds: ["cln-1"] });
+    mockDrainCleanups.mockRejectedValueOnce(new Error("hub down"));
+
+    await expect(patchOutcome("lowQuality")).resolves.toEqual({ ok: true, responseId: "clrs1" });
+  });
+
+  // Against the real Hub: a Hub that accepts the connection and never answers held the request for the
+  // SDK's 60 s attempt timeout, although the outcome was long committed.
+  test("a Hub that never answers does not hold the patch past the inline drain's wait", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      outcomeTx(null);
+      mockEnqueueOutcomeCleanups.mockResolvedValueOnce({ drainNowIds: ["cln-1"] });
+      mockDrainCleanups.mockReturnValueOnce(new Promise(() => {}));
+
+      const settled = vi.fn();
+      const pending = patchOutcome("lowQuality").then(settled);
+      await vi.advanceTimersByTimeAsync(INLINE_DRAIN_WAIT_MS);
+      await pending;
+
+      expect(settled).toHaveBeenCalledWith({ ok: true, responseId: "clrs1" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

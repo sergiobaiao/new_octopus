@@ -1,5 +1,13 @@
 import { describe, expect, test } from "vitest";
-import { isCapitalized, sanitizeString, startsWithVowel, truncate, truncateText } from "./strings";
+import {
+  isCapitalized,
+  isStringMatch,
+  sanitizeString,
+  startsWithVowel,
+  toLogText,
+  truncate,
+  truncateText,
+} from "./strings";
 
 describe("String Utilities", () => {
   describe("truncate", () => {
@@ -99,6 +107,57 @@ describe("String Utilities", () => {
 
     test("handles exact limit match correctly", () => {
       expect(truncateText("hello", 5)).toBe("hello");
+    });
+  });
+});
+
+describe("isStringMatch", () => {
+  test("returns true for exact matches", () => {
+    expect(isStringMatch("test", "test")).toBe(true);
+  });
+
+  test("returns true for case-insensitive matches", () => {
+    expect(isStringMatch("TEST", "test")).toBe(true);
+    expect(isStringMatch("test", "TEST")).toBe(true);
+  });
+
+  test("returns true for matches with spaces", () => {
+    expect(isStringMatch("test case", "testcase")).toBe(true);
+    expect(isStringMatch("testcase", "test case")).toBe(true);
+  });
+
+  test("returns true for matches with underscores", () => {
+    expect(isStringMatch("test_case", "testcase")).toBe(true);
+    expect(isStringMatch("testcase", "test_case")).toBe(true);
+  });
+
+  test("returns true for matches with dashes", () => {
+    expect(isStringMatch("test-case", "testcase")).toBe(true);
+    expect(isStringMatch("testcase", "test-case")).toBe(true);
+  });
+
+  test("returns true for partial matches", () => {
+    expect(isStringMatch("test", "testing")).toBe(true);
+  });
+
+  test("returns false for non-matches", () => {
+    expect(isStringMatch("test", "other")).toBe(false);
+  });
+
+  describe("toLogText", () => {
+    test("replaces control and bidi-override characters, which could fake a log line", () => {
+      expect(toLogText("a\nb\r\u0000c\u0085d\u202ee\u2066f", 100)).toBe("a?b??c?d?e?f");
+      // Line and paragraph separators, which JSON.stringify leaves raw, and the bidi marks.
+      expect(toLogText("a\u2028b\u2029c\u200ed\u200fe\u061cf", 100)).toBe("a?b?c?d?e?f");
+    });
+
+    test("caps the text at the limit", () => {
+      expect(toLogText("x".repeat(10), 4)).toBe("xxxx...");
+    });
+
+    test("leaves out anything that is not a string", () => {
+      expect(toLogText(undefined, 10)).toBeUndefined();
+      expect(toLogText({ toString: () => "x" }, 10)).toBeUndefined();
     });
   });
 });

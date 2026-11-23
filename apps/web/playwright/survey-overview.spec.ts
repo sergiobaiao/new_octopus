@@ -1,6 +1,7 @@
 import { expect } from "@playwright/test";
 import { prisma } from "@formbricks/database";
 import { test } from "./lib/fixtures";
+import { clearAllFilters, setTableSort, tableRow, toggleQuickFilter } from "./utils/table-toolbar";
 
 const getUserIdForEmail = async (email: string) => {
   const user = await prisma.user.findUnique({
@@ -145,19 +146,15 @@ test.describe("Survey overview", () => {
     await page.reload();
     await expect(page.getByText(mixedSurveyName, { exact: true })).toBeVisible({ timeout: 10000 });
 
-    const listHeader = page.getByTestId("survey-list-header");
+    const listHeader = page.getByTestId("survey-list-table").locator("thead");
     await expect(listHeader.getByText("Completed", { exact: true })).toBeVisible();
     await expect(listHeader.getByText("Responses", { exact: true })).toHaveCount(0);
 
-    const mixedRow = page.locator("div.relative.block", {
-      has: page.getByText(mixedSurveyName, { exact: true }),
-    });
+    const mixedRow = tableRow(page, "survey-list-table", mixedSurveyName);
     await expect(mixedRow.getByText("5", { exact: true })).toBeVisible();
     await expect(mixedRow.getByText("11", { exact: true })).toHaveCount(0);
 
-    const partialsRow = page.locator("div.relative.block", {
-      has: page.getByText(partialsSurveyName, { exact: true }),
-    });
+    const partialsRow = tableRow(page, "survey-list-table", partialsSurveyName);
     await expect(partialsRow.getByText("0", { exact: true })).toBeVisible();
 
     // Regression guard: the caution dialog is driven by the total, so it must still appear for a
@@ -166,7 +163,7 @@ test.describe("Survey overview", () => {
     // Edit is a Link, not a button; its onClick preventDefaults and opens the caution dialog instead
     // of navigating, precisely because the survey has responses.
     await page.getByRole("link", { name: "Edit", exact: true }).click();
-    await expect(page.getByText("Edit a published survey?")).toBeVisible();
+    await expect(page.getByText("Edit an active survey?")).toBeVisible();
   });
 
   test("loads surveys, applies filters and sort, and paginates with load more", async ({ page, users }) => {
@@ -223,40 +220,46 @@ test.describe("Survey overview", () => {
     }
 
     await page.reload();
-    await expect(page.locator(".surveyFilterDropdown").filter({ hasText: "Created by" })).toHaveCount(0);
     await expect(page.getByText(targetSurveyName, { exact: true })).toBeVisible({ timeout: 10000 });
     await expect(page.getByText(pausedSurveyName, { exact: true })).toBeVisible();
     await expect(page.getByText(appSurveyName, { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Load more" })).toBeVisible();
+    await expect(page.getByTestId("table-match-count")).toHaveText("14 results");
 
-    await page.getByPlaceholder("Search by survey name").fill(targetSurveyName);
-    await expect(page.getByText(targetSurveyName, { exact: true })).toBeVisible();
-    await expect(page.getByText(pausedSurveyName, { exact: true })).toHaveCount(0);
-    await expect(page.getByText(appSurveyName, { exact: true })).toHaveCount(0);
+    await test.step("search narrows the list and survives a reload", async () => {
+      await page.getByPlaceholder("Search by survey name").fill(targetSurveyName);
+      await expect(page.getByText(pausedSurveyName, { exact: true })).toHaveCount(0);
+      await expect(page.getByText(targetSurveyName, { exact: true })).toBeVisible();
+      await expect(page).toHaveURL(/search=/);
+      await page.reload();
+      await expect(page.getByPlaceholder("Search by survey name")).toHaveValue(targetSurveyName);
+      await expect(page.getByText(appSurveyName, { exact: true })).toHaveCount(0);
+      await page.getByRole("button", { name: "Clear search" }).click();
+      await expect(page.getByText(pausedSurveyName, { exact: true })).toBeVisible();
+    });
 
-    await page.getByRole("button", { name: "Clear filters" }).click();
-    await expect(page.getByText(pausedSurveyName, { exact: true })).toBeVisible();
+    await test.step("quick filters show as chips, narrow the list and survive a reload", async () => {
+      await toggleQuickFilter(page, "Status", "Draft");
+      await expect(page.getByText(targetSurveyName, { exact: true })).toBeVisible();
+      await expect(page.getByText(pausedSurveyName, { exact: true })).toHaveCount(0);
 
-    await page.locator(".surveyFilterDropdown").filter({ hasText: "Status" }).click();
-    await page.getByRole("menuitem", { name: "Draft" }).click();
-    await page.keyboard.press("Escape");
-    await expect(page.getByText(targetSurveyName, { exact: true })).toBeVisible();
-    await expect(page.getByText(pausedSurveyName, { exact: true })).toHaveCount(0);
+      await toggleQuickFilter(page, "Type", "Link");
+      await expect(page.getByText(appSurveyName, { exact: true })).toHaveCount(0);
+      await expect(page).toHaveURL(/filter%5Bstatus%5D%5Bin%5D=draft/);
 
-    await page.locator(".surveyFilterDropdown").filter({ hasText: "Type" }).click();
-    await page.getByRole("menuitem", { name: "Link" }).click();
-    await page.keyboard.press("Escape");
-    await expect(page.getByText(appSurveyName, { exact: true })).toHaveCount(0);
+      await page.reload();
+      await expect(page.getByText(appSurveyName, { exact: true })).toHaveCount(0);
+      await expect(page.getByText(pausedSurveyName, { exact: true })).toHaveCount(0);
+    });
 
-    await page.locator(".surveyFilterDropdown").filter({ hasText: "Sort by" }).click();
-    await page.getByRole("menuitem", { name: "Created at" }).click();
-    await expect(
-      page.locator(".surveyFilterDropdown").filter({ hasText: "Sort by: Created at" })
-    ).toBeVisible();
+    await test.step("sort comes from the gear and Clear all brings everything back", async () => {
+      await setTableSort(page, "Created at");
+      await expect(page).toHaveURL(/sortBy=createdAt/);
 
-    await page.getByRole("button", { name: "Clear filters" }).click();
-    await expect(page.getByText(appSurveyName, { exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Load more" })).toBeVisible();
+      await clearAllFilters(page);
+      await expect(page.getByText(appSurveyName, { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Load more" })).toBeVisible();
+    });
 
     await page.getByRole("button", { name: "Load more" }).click();
     await expect(page.getByText(paginatedSurveyName, { exact: true })).toBeVisible();
@@ -335,6 +338,48 @@ test.describe("Survey overview", () => {
     await expect(page.getByText("Survey deleted successfully", { exact: true })).toBeVisible();
   });
 
+  test("duplicating a survey from the list keeps its PIN", async ({ page, users }) => {
+    const timestamp = Date.now();
+    const email = `overview-duplicate-${timestamp}@example.com`;
+    const name = `overview-duplicate-${timestamp}`;
+    const surveyName = `Protected Survey ${timestamp}`;
+
+    const user = await users.create({ email, name, workspaceName: "Duplicate Settings Workspace" });
+    const userId = await getUserIdForEmail(email);
+
+    await user.login();
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
+    const workspaceId =
+      /\/workspaces\/([^/]+)\/surveys/.exec(page.url())?.[1] ??
+      (() => {
+        throw new Error("Unable to determine workspace id from surveys URL");
+      })();
+
+    // The field-by-field copy policy is unit-tested. This proves the list's Duplicate action reaches
+    // the database with a setting intact — the PIN, whose loss mattered most (ENG-2144).
+    await prisma.survey.create({
+      data: { workspaceId, createdBy: userId, name: surveyName, status: "draft", type: "link", pin: "1234" },
+    });
+
+    await page.reload();
+    await expect(page.getByText(surveyName, { exact: true })).toBeVisible({ timeout: 10000 });
+
+    // Scoped to this survey's own actions menu — the workspace is seeded with another survey.
+    const surveyActions = page.locator(`#${surveyName.toLowerCase().split(" ").join("-")}-survey-actions`);
+    await surveyActions.getByTestId("survey-dropdown-trigger").click();
+    await page.getByTestId("duplicate-survey").click();
+    await expect(page.getByText("Survey duplicated successfully", { exact: true })).toBeVisible({
+      timeout: 15000,
+    });
+    await expect(page.getByText(`${surveyName} (copy)`, { exact: true })).toBeVisible();
+
+    const copy = await prisma.survey.findFirst({
+      where: { workspaceId, name: `${surveyName} (copy)` },
+      select: { pin: true },
+    });
+    expect(copy?.pin).toBe("1234");
+  });
+
   test("restores the survey when delete fails", async ({ page, users }) => {
     const timestamp = Date.now();
     const email = `overview-delete-failure-${timestamp}@example.com`;
@@ -398,7 +443,7 @@ test.describe("Survey overview", () => {
     await expect(page.getByText("Delete failed", { exact: true })).toBeVisible();
   });
 
-  test("shows preview and copy link for published link surveys and hides the dropdown when no actions are available", async ({
+  test("shows preview and copy link for published link surveys and only Export for a read-only app survey", async ({
     page,
     users,
   }) => {
@@ -471,16 +516,18 @@ test.describe("Survey overview", () => {
     });
 
     await page.reload();
-    const linkRow = page.locator("div.relative.block", {
-      has: page.getByText(linkSurveyName, { exact: true }),
-    });
+    const linkRow = tableRow(page, "survey-list-table", linkSurveyName);
     await linkRow.locator("[data-testid='survey-dropdown-trigger']").click();
     await expect(page.getByRole("button", { name: "Preview", exact: true })).toBeVisible();
     await expect(page.getByTestId("copy-link")).toBeVisible();
 
-    const appRow = page.locator("div.relative.block", {
-      has: page.getByText(appSurveyName, { exact: true }),
-    });
-    await expect(appRow.locator("[data-testid='survey-dropdown-trigger']")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+
+    // Anyone who can see a survey can export it, so a read-only member's app survey row now has a menu
+    // holding only Export.
+    const appRow = tableRow(page, "survey-list-table", appSurveyName);
+    await appRow.locator("[data-testid='survey-dropdown-trigger']").click();
+    await expect(page.getByTestId("survey-export-submenu")).toBeVisible();
+    await expect(page.getByTestId("copy-link")).toHaveCount(0);
   });
 });

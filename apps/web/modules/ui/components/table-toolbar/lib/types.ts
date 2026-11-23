@@ -1,0 +1,178 @@
+import type { QueryKey } from "@tanstack/react-query";
+import type { LucideIcon } from "lucide-react";
+import type { TDateRangePreset } from "@/lib/date-ranges";
+
+/**
+ * The one operator list every table filters with (ADR 0015). A table offers a subset per filter
+ * property; its adapter maps each one onto its backend.
+ *
+ * - `in`: a quick filter. The row matches any of the ticked values.
+ * - `preset` / `between`: a date quick filter. `between` holds two calendar days (`yyyy-MM-dd`); the URL
+ *   writes them as `gte` / `lte`.
+ * - The rest are Advanced filter rules. `includesOneOf` / `includesAllOf` hold a list of values (a
+ *   multi-select question's choices), and so do `equals` / `notEquals` on a property with
+ *   `multiValueEquals` (the row's one value is, or is not, any of the picked values), and `contains` /
+ *   `doesNotContain` on a property with `multiValueContains` (the row's value contains any, or none, of
+ *   the picked values); every other rule holds one value or none.
+ */
+export const TABLE_FILTER_OPERATORS = [
+  "in",
+  "preset",
+  "between",
+  "equals",
+  "notEquals",
+  "contains",
+  "doesNotContain",
+  "startsWith",
+  "doesNotStartWith",
+  "endsWith",
+  "doesNotEndWith",
+  "greaterThan",
+  "greaterEqual",
+  "lessThan",
+  "lessEqual",
+  "isBefore",
+  "isAfter",
+  "isSet",
+  "isNotSet",
+  "includesOneOf",
+  "includesAllOf",
+] as const;
+
+export type TTableFilterOperator = (typeof TABLE_FILTER_OPERATORS)[number];
+
+/** Operators produced by quick filters (ticked values, a date preset or a date range). */
+export type TQuickFilterOperator = Extract<TTableFilterOperator, "in" | "preset" | "between">;
+
+/** Operators an Advanced filter rule can use. */
+export type TRuleOperator = Exclude<TTableFilterOperator, TQuickFilterOperator>;
+
+/** One active filter: one filter chip. Every active filter on a table must match (AND). */
+export type TTableFilter = {
+  property: string;
+  operator: TTableFilterOperator;
+  /** Empty for `isSet` / `isNotSet`; one for most rules; any number for `in`; two for `between`. */
+  values: string[];
+};
+
+export type TFilterValueType = "string" | "number" | "date" | "enum";
+
+export type TFilterOption = {
+  label: string;
+  value: string;
+};
+
+/** The first values of a longer list: `hasMore` when the search matched more than `options` holds. */
+export type TFilterOptionsPage = {
+  options: TFilterOption[];
+  hasMore: boolean;
+};
+
+/**
+ * Something a table can be filtered by (GLOSSARY: Filter property). A table publishes a list of these;
+ * a filter on a property that is not in the list is dropped when the URL is read.
+ */
+export type TFilterProperty = {
+  id: string;
+  label: string;
+  valueType: TFilterValueType;
+  /** Shown in the Filter menu as a quick filter: an enum with a value list, or a date with presets. */
+  quick?: boolean;
+  /** Fixed values for an enum quick filter. */
+  options?: TFilterOption[];
+  /**
+   * Values worth offering while a free-text rule is typed (values already seen). Unlike `options`
+   * they never limit what the rule may hold.
+   */
+  suggestions?: readonly string[];
+  /**
+   * Values loaded on demand, for value lists too long or too dynamic to ship with the page. A loader
+   * that returns only the first values of a longer list says so with `hasMore`, and the list asks for
+   * a search. `signal` aborts when the search is superseded.
+   */
+  loadOptions?: (search: string, signal?: AbortSignal) => Promise<TFilterOptionsPage>;
+  /**
+   * Where one search of `loadOptions` is cached. Absent: a key of the property's id. A property whose
+   * values follow other data gives its own, under that data's keys, so invalidating the data
+   * refreshes the list too.
+   */
+  queryKey?: (search: string) => QueryKey;
+  /**
+   * The values `loadOptions` lists are ids shown by a label of their own (an answer's option, a survey):
+   * a chip or picker naming a picked value looks its label up in the list (`useLabelledProperty`), so the
+   * label shows after a reload too, not only once the list has been opened.
+   */
+  labelledValues?: boolean;
+  /** Labels of picked values looked up for `labelledValues`, by value. Set by `useLabelledProperty`. */
+  valueLabels?: Readonly<Record<string, string>>;
+  /** Shown in an empty typed value, as a hint of what the property takes (a range, a format). */
+  placeholder?: string;
+  /** Shown before the label in Advanced filter's picker, so kinds of property read apart at a glance. */
+  icon?: LucideIcon;
+  /**
+   * Help Advanced filter shows under the rules while one uses this property: what its values mean,
+   * when that is not obvious from the label.
+   */
+  description?: string;
+  /** Heading the property sits under in Advanced filter's picker. Absent: the table's one list. */
+  group?: string;
+  /** Operators offered in Advanced filter. Empty or absent: the property is not offered there. */
+  ruleOperators?: TRuleOperator[];
+  /**
+   * `equals` / `notEquals` hold several values, picked from the property's values: the row's one value
+   * is, or is not, any of them. The chip reads "is any of" / "is none of" once more than one is picked.
+   * Absent: they hold one value.
+   */
+  multiValueEquals?: boolean;
+  /**
+   * `contains` / `doesNotContain` hold several values, picked from the property's fixed options: the row's
+   * value contains any of them, or none of them. Offered as "contains any of" / "contains none of".
+   * Absent: they hold one typed value.
+   */
+  multiValueContains?: boolean;
+  /**
+   * Which of the property's values occur, looked up when it is listed: values that do not show greyed
+   * and cannot be picked, and a property with none at all is listed disabled with `emptyHint`.
+   */
+  availableValues?: TAvailableValues;
+  /** Date quick filters only: the presets offered, in order. */
+  datePresets?: readonly TDateRangePreset[];
+  /**
+   * A view switch kept in the URL like any filter (Show archived), set from the gear rather than the
+   * Filter menu: it never shows as a chip and does not count towards `Filter (n)`.
+   */
+  hidden?: boolean;
+};
+
+export type TAvailableValues = {
+  queryKey: QueryKey;
+  /**
+   * The values that occur; an empty list means the property has none to filter by. With none, `emptyHint`
+   * may say why better than the property's own, when the lookup can tell.
+   */
+  load: (signal?: AbortSignal) => Promise<TAvailableValuesResult>;
+  /** Why the property cannot be filtered by while it has no values, unless the lookup says otherwise. */
+  emptyHint: string;
+};
+
+export type TAvailableValuesResult = Readonly<{ values: readonly string[]; emptyHint?: string }>;
+
+export type TSortOption = {
+  value: string;
+  label: string;
+};
+
+/**
+ * Filters set for everyone, such as a dashboard's locked filters: shown before a person's own, with a lock,
+ * and never edited from the toolbar. `onRemove` is given to whoever may take one off.
+ */
+export type TLockedFilters = {
+  filters: readonly TTableFilter[];
+  /** Each filter's own name, for a property the toolbar does not list (one this person cannot add). */
+  labels?: readonly string[];
+  /** Why the chips are locked, shown on hover. */
+  hint: string;
+  /** Why a locked value cannot be ticked in the Filter menu, shown on hover. Absent: `hint`. */
+  valueHint?: string;
+  onRemove?: (index: number) => void;
+};

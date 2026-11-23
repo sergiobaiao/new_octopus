@@ -1,15 +1,19 @@
 import "server-only";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import type { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { DatabaseError, InvalidInputError, ResourceNotFoundError } from "@formbricks/types/errors";
-import { TSurveyStatus } from "@formbricks/types/surveys/types";
+import { TSurveyStatus, TSurveyType } from "@formbricks/types/surveys/types";
+import { andVisibleSurveys } from "@/lib/survey/visibility/predicate";
 import { isPrismaKnownRequestError, isUniqueConstraintError } from "@/lib/utils/prisma-error";
 
 export interface TSurveyBySlug {
   id: string;
   workspaceId: string;
-  status: string;
+  type: TSurveyType;
+  status: TSurveyStatus;
+  archivedAt: Date | null;
 }
 
 export interface TSurveyWithSlug {
@@ -30,7 +34,7 @@ export const getSurveyBySlug = reactCache(async (slug: string): Promise<TSurveyB
   try {
     const survey = await prisma.survey.findUnique({
       where: { slug },
-      select: { id: true, workspaceId: true, status: true },
+      select: { id: true, workspaceId: true, type: true, status: true, archivedAt: true },
     });
     return survey;
   } catch (error) {
@@ -72,12 +76,17 @@ export const updateSurveySlug = async (
 
 // Get all surveys with slugs for an organization (for Domain settings page)
 export const getSurveysWithSlugsByOrganizationId = reactCache(
-  async (organizationId: string): Promise<TSurveyWithSlug[]> => {
+  async (
+    organizationId: string,
+    /** ENG-3282: the viewer's survey-visibility clause, so a restricted survey's slug is not listed. */
+    visibleSurveyWhere: Prisma.SurveyWhereInput
+  ): Promise<TSurveyWithSlug[]> => {
     try {
       const surveys = await prisma.survey.findMany({
         where: {
           slug: { not: null },
           workspace: { organizationId },
+          ...andVisibleSurveys(visibleSurveyWhere),
         },
         select: {
           id: true,

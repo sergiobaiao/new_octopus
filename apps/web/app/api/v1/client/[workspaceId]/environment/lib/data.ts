@@ -1,8 +1,10 @@
 import "server-only";
+import type { TCreativePayload } from "@formbricks/creatives";
 import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { ZId } from "@formbricks/types/common";
+import type { TCustomCssStored } from "@formbricks/types/custom-css";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import {
   TJsWorkspaceStateActionClass,
@@ -10,12 +12,25 @@ import {
   TJsWorkspaceStateWorkspaceSetting,
 } from "@formbricks/types/js";
 import { PUBLIC_API_SURVEY_NAME_PLACEHOLDER } from "@formbricks/types/js-constants";
+import { isCustomOverlay, resolveOverlayAppearance } from "@formbricks/types/overlay";
 import { type TBaseFilters, buildSurveyInteractionRefreshMap } from "@formbricks/types/segment";
-import { selectSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
+import { selectPublicSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
+import { getPublicDomain } from "@/lib/getPublicUrl";
 import { toLegacyLanguageCodes } from "@/lib/i18n/utils";
 import { validateInputs } from "@/lib/utils/validate";
+import {
+  MAX_DELIVERED_CREATIVES,
+  type TDeliveredCreativeRow,
+  deliveredCreativeSelect,
+  getCreativesShowingNowWhere,
+  getPopupSurveyIds,
+  getUpcomingCreativesWhere,
+  toCreativePayloads,
+} from "@/modules/ee/creatives/lib/delivery";
+import { getIsCreativesEnabled } from "@/modules/ee/license-check/lib/utils";
 import { resolveStorageUrlsInObject } from "@/modules/storage/utils";
 import { transformPrismaSurvey } from "@/modules/survey/lib/utils";
+import { resolveRespondentCustomCss } from "@/modules/survey/link/lib/respondent-custom-css";
 
 /**
  * Optimized data fetcher for environment state
@@ -30,6 +45,7 @@ export interface WorkspaceStateData {
   };
   surveys: TJsWorkspaceStateSurvey[];
   actionClasses: TJsWorkspaceStateActionClass[];
+  creatives: TCreativePayload[];
 }
 
 /**
@@ -40,9 +56,11 @@ export interface WorkspaceStateData {
  * never round-trips through the server) would stop matching, and the survey would be hidden.
  *
  * So alongside each region-tagged language we expose a duplicate entry under its bare legacy code
- * (`de-DE` → `de`). The legacy entry only exists to satisfy the SDK's exact match; the survey renderer
- * canonicalizes whatever it receives, so content lookup still resolves to the canonical key. Canonical
- * entries are kept first so the renderer resolves to the canonical code.
+ * (`de-DE` → `de`). The legacy entry only exists to satisfy the SDK's exact match. The shared matcher
+ * (`matchSurveyLanguage` in `@formbricks/i18n-utils`) treats a stored code whose canonical form is also
+ * stored as a duplicate and resolves it to that canonical sibling (ENG-3961), so new SDKs and the
+ * renderer — which also re-resolves the code an old SDK hands it — always land on the canonical
+ * content key, never on the legacy one no content is stored under.
  *
  * Applied to multi-language surveys only: a single-language survey skips language matching in the SDK,
  * and adding an entry would flip it to "multi-language" and could hide it. Remove once SDK clients
@@ -72,6 +90,100 @@ const appendLegacyLanguageCodes = <
   return [...languages, ...legacyEntries];
 };
 
+/** What the SDKs read of an app survey: the 30 newest, and the older ones a creative opens. */
+const appSurveySelect = {
+  id: true,
+  welcomeCard: true,
+  // `name` deliberately not selected — internal label not needed by the
+  // SDK and replaced with a fixed placeholder below so older SDKs that
+  // decoded `Survey.name` as a required field keep working.
+  questions: true,
+  blocks: true,
+  type: true,
+  showLanguageSwitch: true,
+  autoSelectLanguage: true,
+  languages: {
+    select: {
+      default: true,
+      enabled: true,
+      language: {
+        select: {
+          id: true,
+          code: true,
+          alias: true,
+          createdAt: true,
+          updatedAt: true,
+          workspaceId: true,
+        },
+      },
+    },
+  },
+  endings: true,
+  autoClose: true,
+  keepEndingCardOpen: true,
+  styling: true,
+  status: true,
+  recaptcha: true,
+  // Only need to know if any filters exist so we can compute
+  // `hasFilters`. Real filter values, segment title/description, and
+  // surveys-list relation are never exposed to clients.
+  segment: {
+    select: {
+      id: true,
+      filters: true,
+    },
+  },
+  recontactDays: true,
+  displayLimit: true,
+  displayOption: true,
+  // ENG-1837: the definitions the SDK-rendered survey's recall and logic engines resolve
+  // through. ENG-2404: also what `transformPrismaSurvey` derives the legacy `variables` /
+  // `hiddenFields` from, which deployed SDK bundles still read (ENG-1838).
+  embeddedDataLinks: selectPublicSurveyEmbeddedDataLinks,
+  isBackButtonHidden: true,
+  isAutoProgressingEnabled: true,
+  triggers: {
+    select: {
+      actionClass: {
+        select: {
+          name: true,
+        },
+      },
+    },
+  },
+  displayPercentage: true,
+  delay: true,
+  // Checked in the browser when a trigger fires (ENG-3926). Public: the payload is.
+  showConditions: true,
+  startLogic: true,
+  workspaceOverwrites: true,
+  // Stored survey custom CSS — see the workspace field below. Replaced by compiled output.
+  customCss: true,
+} satisfies Prisma.SurveySelect;
+
+/**
+ * The creatives the payload carries: those that can show now, then the soonest upcoming ones in the
+ * capacity left, so creatives scheduled for later never push out one that is showing. An upcoming one
+ * past the cap arrives once it has started, with the next payload the SDK reads (every 30 minutes).
+ * Newest first, like `showingNow`.
+ */
+const withUpcomingCreatives = async (
+  workspaceId: string,
+  showingNow: TDeliveredCreativeRow[],
+  now: Date
+): Promise<TDeliveredCreativeRow[]> => {
+  const capacity = MAX_DELIVERED_CREATIVES - showingNow.length;
+  if (capacity <= 0) return showingNow;
+  const upcoming = await prisma.creative.findMany({
+    where: { workspaceId, ...getUpcomingCreativesWhere(now) },
+    orderBy: [{ startAt: "asc" }, { createdAt: "desc" }],
+    take: capacity,
+    select: deliveredCreativeSelect,
+  });
+  if (upcoming.length === 0) return showingNow;
+  return [...showingNow, ...upcoming].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+};
+
 /**
  * Single optimized query that fetches all required data
  * Replaces multiple separate service calls with one efficient database operation
@@ -80,20 +192,27 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
   validateInputs([workspaceId, ZId]);
 
   try {
+    const now = new Date();
     // Single query that fetches everything needed for environment state
     // Uses strategic includes and selects to minimize data transfer
     const workspaceData = await prisma.workspace.findUnique({
       where: { id: workspaceId },
       select: {
         id: true,
+        organizationId: true,
         legacyEnvironmentId: true,
         appSetupCompleted: true,
         recontactDays: true,
         clickOutsideClose: true,
         overlay: true,
+        overlayColor: true,
+        overlayOpacity: true,
         placement: true,
         inAppSurveyBranding: true,
         styling: true,
+        // Stored custom CSS (ENG-3552). Read here only to derive the compiled output below; the stored
+        // value carries the editable source and never reaches the response.
+        customCss: true,
         // Action classes (optimized for environment state)
         actionClasses: {
           select: {
@@ -118,69 +237,14 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
             createdAt: "desc",
           },
           take: 30, // Limit for performance
-          select: {
-            id: true,
-            welcomeCard: true,
-            // `name` deliberately not selected — internal label not needed by the
-            // SDK and replaced with a fixed placeholder below so older SDKs that
-            // decoded `Survey.name` as a required field keep working.
-            questions: true,
-            blocks: true,
-            variables: true,
-            type: true,
-            showLanguageSwitch: true,
-            languages: {
-              select: {
-                default: true,
-                enabled: true,
-                language: {
-                  select: {
-                    id: true,
-                    code: true,
-                    alias: true,
-                    createdAt: true,
-                    updatedAt: true,
-                    workspaceId: true,
-                  },
-                },
-              },
-            },
-            endings: true,
-            autoClose: true,
-            styling: true,
-            status: true,
-            recaptcha: true,
-            // Only need to know if any filters exist so we can compute
-            // `hasFilters`. Real filter values, segment title/description, and
-            // surveys-list relation are never exposed to clients.
-            segment: {
-              select: {
-                id: true,
-                filters: true,
-              },
-            },
-            recontactDays: true,
-            displayLimit: true,
-            displayOption: true,
-            hiddenFields: true,
-            // ENG-1837: the definitions the SDK-rendered survey's recall and logic engines resolve
-            // through. Rides in the same 60s-cached workspace-state payload as the columns above.
-            embeddedDataLinks: selectSurveyEmbeddedDataLinks,
-            isBackButtonHidden: true,
-            isAutoProgressingEnabled: true,
-            triggers: {
-              select: {
-                actionClass: {
-                  select: {
-                    name: true,
-                  },
-                },
-              },
-            },
-            displayPercentage: true,
-            delay: true,
-            workspaceOverwrites: true,
-          },
+          select: appSurveySelect,
+        },
+        // ENG-3994: the creatives the SDK shows, newest first; those that can show now come first.
+        creatives: {
+          where: getCreativesShowingNowWhere(now),
+          orderBy: { createdAt: "desc" },
+          take: MAX_DELIVERED_CREATIVES,
+          select: deliveredCreativeSelect,
         },
       },
     });
@@ -188,6 +252,42 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
     if (!workspaceData) {
       throw new ResourceNotFoundError("workspace", workspaceId);
     }
+
+    // Creatives reach sites only while the licence includes them (ENG-6602); nothing is written either
+    // way, so ones that were Active show again by themselves once it does. The licence read is cached,
+    // and this payload's own 60 s cache adds at most a minute to the licence's refresh. Each creative's
+    // look is computed from the workspace Look & Feel, never its survey's (ENG-3998).
+    const creatives = (await getIsCreativesEnabled(workspaceData.organizationId))
+      ? await toCreativePayloads(
+          await withUpcomingCreatives(workspaceData.id, workspaceData.creatives, now),
+          {
+            publicDomain: getPublicDomain(),
+            workspaceStyling: workspaceData.styling,
+          }
+        )
+      : [];
+
+    // A creative opens its survey as a popup from this payload alone, so every such survey has to be in
+    // it — also one outside the 30 newest, and one with no trigger of its own (it is sent with
+    // `triggers: []`, which every SDK reads as "never show it by itself").
+    const newestSurveyIds = new Set(workspaceData.surveys.map(({ id }) => id));
+    const missingSurveyIds = getPopupSurveyIds(creatives).filter((id) => !newestSurveyIds.has(id));
+    const appSurveys =
+      missingSurveyIds.length > 0
+        ? [
+            ...workspaceData.surveys,
+            ...(await prisma.survey.findMany({
+              where: {
+                id: { in: missingSurveyIds },
+                workspaceId,
+                type: "app",
+                status: "inProgress",
+                archivedAt: null,
+              },
+              select: appSurveySelect,
+            })),
+          ]
+        : workspaceData.surveys;
 
     // Backwards-compat response shape for SDKs from before PR #7931. Those
     // clients decoded `survey.name` and the full `segment` object as required
@@ -216,7 +316,7 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
     // `surveyInteraction` filter used by a live app survey onto the survey(s) it references, so the SDK
     // learns — per survey, per event (display / response / finish) — whether interacting with it can
     // change any live survey's membership, and skips the heavy `/user` refetch otherwise.
-    const surveysWithFilters = workspaceData.surveys.map((survey) => ({
+    const surveysWithFilters = appSurveys.map((survey) => ({
       id: survey.id,
       segmentFilters: (Array.isArray(survey.segment?.filters)
         ? (survey.segment.filters as unknown as TBaseFilters)
@@ -242,7 +342,19 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
       segmentFiltersById?.get(segmentId)
     );
 
-    const transformedSurveys = workspaceData.surveys.map((survey) => {
+    // Compiled custom CSS (ENG-3552): the workspace's once, in `workspaceSettings`, each survey's in the
+    // survey, and a survey's only while its style overrides apply (ENG-3723).
+    const customCss = await resolveRespondentCustomCss({
+      workspaceCustomCss: workspaceData.customCss as TCustomCssStored | null,
+      allowStyleOverwrite: workspaceData.styling?.allowStyleOverwrite,
+      surveys: appSurveys.map((survey) => ({
+        id: survey.id,
+        customCss: survey.customCss as TCustomCssStored | null,
+        styling: survey.styling,
+      })),
+    });
+
+    const transformedSurveys = appSurveys.map((survey) => {
       const realHasFilters =
         Array.isArray(survey.segment?.filters) && (survey.segment.filters as unknown[]).length > 0;
 
@@ -262,7 +374,8 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
           }
         : null;
 
-      const { segment: _segment, ...surveyWithoutSegment } = survey;
+      // `customCss` is the STORED value (source included); only its compiled form is sent, below.
+      const { segment: _segment, customCss: _storedCustomCss, ...surveyWithoutSegment } = survey;
 
       // Older SDKs (e.g. Android ≤ v1.2.0) decode `language.projectId` as a
       // required field. The column was renamed to `workspaceId` in v5, so
@@ -286,11 +399,22 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
       // targeting — otherwise it's dead weight on every survey in the response.
       const interactionRefresh = hasAny ? refreshBySurveyId[survey.id] : undefined;
 
+      // Sent inside the survey object, not `workspaceSettings`: every SDK forwards the raw survey JSON
+      // to `renderSurvey`, so the renderer gets it with no SDK release. Omitted for a preset overlay.
+      const overlayAppearance = resolveOverlayAppearance(survey.workspaceOverwrites, workspaceData);
+
+      const surveyCustomCss = customCss.surveys.get(survey.id);
+
       return {
         ...transformed,
         name: PUBLIC_API_SURVEY_NAME_PLACEHOLDER,
         segment: sanitizedSegment,
+        // Omitted entirely when there is none to deliver; never `null` or `{}`.
+        ...(surveyCustomCss ? { customCss: surveyCustomCss } : {}),
         ...(interactionRefresh ? { interactionRefresh } : {}),
+        ...(isCustomOverlay(overlayAppearance)
+          ? { overlayAppearance: { color: overlayAppearance.color, opacity: overlayAppearance.opacity } }
+          : {}),
       };
     });
 
@@ -306,6 +430,7 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
           placement: workspaceData.placement,
           inAppSurveyBranding: workspaceData.inAppSurveyBranding,
           styling: resolveStorageUrlsInObject(workspaceData.styling),
+          ...(customCss.workspace ? { customCss: customCss.workspace } : {}),
         },
       },
       // The runtime shape carries extra back-compat fields (placeholder
@@ -314,6 +439,7 @@ export const getWorkspaceStateData = async (workspaceId: string): Promise<Worksp
       // intentional and only this endpoint's response widens the type.
       surveys: resolveStorageUrlsInObject(transformedSurveys) as unknown as TJsWorkspaceStateSurvey[],
       actionClasses: workspaceData.actionClasses,
+      creatives,
     };
   } catch (error) {
     if (error instanceof ResourceNotFoundError) {

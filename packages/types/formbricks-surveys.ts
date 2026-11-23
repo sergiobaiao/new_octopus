@@ -1,8 +1,40 @@
+import type { TRendererCustomCss } from "./custom-css";
 import type { TJsFileUploadParams, TJsWorkspaceStateSurvey } from "./js";
 import type { TResponseData, TResponseHiddenFieldValue, TResponseUpdate } from "./responses";
+import type { TVisitSnapshot } from "./show-conditions";
 import type { TUploadFileConfig } from "./storage";
 import type { TSurveyStyling } from "./surveys/types";
 import type { TWorkspaceStyling } from "./workspace";
+
+/**
+ * How the survey renders. "system" follows the browser's dark-mode setting on the web; the native
+ * SDKs resolve their app's own theme and pass "light" or "dark". Omitted means light.
+ */
+export type TSurveyAppearance = "light" | "dark" | "system";
+
+/**
+ * Marks a trusted, contained box in a dashboard preview (ENG-3552). An inline survey rendered in
+ * preview mode mounts its dropdown portals in the closest ancestor carrying this attribute instead of
+ * `<body>`, so customer CSS — which reaches every `#fbjs` root — cannot lay them over the admin app.
+ * The element itself must sit outside `#fbjs` (customer CSS cannot select it) and contain its content
+ * (`contain: layout paint`, `isolation: isolate`).
+ */
+export const SURVEY_PREVIEW_BOUNDARY_ATTRIBUTE = "data-fb-preview-boundary";
+
+/**
+ * Viewport rect of the survey card, in CSS pixels, as the renderer measures it.
+ *
+ * Consumed by the native SDKs, which embed the renderer in a full-screen WebView. A platform
+ * WebView hit-tests its whole rectangle and ignores the `pointer-events: none` this renderer puts
+ * outside the card, so a survey with no overlay freezes the host app unless the host masks touches
+ * itself — and the host cannot know where the card is, because CSS decides that inside the page.
+ */
+export interface TSurveyCardRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
 export interface SurveyBaseProps {
   survey: TJsWorkspaceStateSurvey;
@@ -42,6 +74,12 @@ export interface SurveyBaseProps {
   startAtQuestionId?: string;
   clickOutside?: boolean;
   hiddenFieldsRecord?: TResponseHiddenFieldValue;
+  /**
+   * The editor preview only: a page address to run with instead of the one the survey is shown on, so
+   * a rule that reads `url` can be tried there (Test values). Ignored when unset or outside
+   * `isPreviewMode`.
+   */
+  previewPageUrl?: string;
   shouldResetQuestionId?: boolean;
   fullSizeCards?: boolean;
   showCardlessPreviewLogoSlot?: boolean;
@@ -74,11 +112,43 @@ export interface SurveyContainerProps extends Omit<SurveyBaseProps, "onFileUploa
   onResponseCreated?: (responseId?: string) => void | Promise<void>;
   onFileUpload?: (file: TJsFileUploadParams["file"], config?: TUploadFileConfig) => Promise<string>;
   onOpenExternalURL?: (url: string) => void | Promise<void>;
+  /** Notifies the host where the survey card is, and `null` once no card is on screen (while it
+   *  animates out, or before the first paint). Exists so a native host can pass touches outside the
+   *  card through to the app — see `TSurveyCardRect` for why it cannot work that out for itself.
+   *
+   *  Modal mode only, and nothing is measured unless a host passes it: web hosts omit it, because
+   *  CSS `pointer-events` already does the job inside a page. Reported on open, on every resize of
+   *  the card (each question changes its height), and on viewport resize or rotation. */
+  onCardRectChange?: (rect: TSurveyCardRect | null) => void;
   mode?: "modal" | "inline";
   containerId?: string;
+  /** Light by default. Can be changed later without a re-render via `formbricksSurveys.setAppearance`. */
+  appearance?: TSurveyAppearance;
+  /**
+   * Compiled workspace and survey custom CSS (ENG-3552). The ONLY input the renderer applies custom
+   * CSS from: CSS found on `survey` or `styling` is ignored, so an SDK that does not pass this prop
+   * gets no custom CSS rather than half of it. A missing scope (or field) means no CSS for it. Dark
+   * rules are already scoped to `#fbjs[data-appearance="dark"]`, so `setAppearance` switches them.
+   */
+  customCss?: TRendererCustomCss;
+  /**
+   * Page font (ENG-3864): the survey renders in the font of the page it is on instead of the survey
+   * font. Only an app survey on a web page has a page font to take, so only the web SDK (and the editor
+   * preview of an app survey) passes it; it is never read from `styling`, so a mobile SDK's WebView or a
+   * link survey keeps the survey font.
+   */
+  pageFont?: boolean;
   overlay?: "none" | "light" | "dark";
   placement?: "bottomLeft" | "bottomRight" | "topLeft" | "topRight" | "center";
   action?: string;
+  /**
+   * The creative whose click opened the survey (ENG-4001): js-core for a popup Destination, the link
+   * page for a validated `?creativeId=`. Sent with the display and, as `meta.openedByCreativeId`, with
+   * the response; the server checks it and stamps the creative's name. An older server ignores both.
+   */
+  creativeId?: string;
+  /** The visit when the survey shows, from the web SDK (ENG-3926); saved as the `visit*` meta fields. */
+  visit?: TVisitSnapshot;
   singleUseId?: string;
   singleUseResponseId?: string;
   pinAuthToken?: string;

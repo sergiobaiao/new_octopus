@@ -50,6 +50,13 @@ describe("OAuth protected resource metadata", () => {
         "workflows:write",
         "feedbackRecords:read",
         "feedbackRecords:write",
+        // Advertised since ENG-3470, together with the migration that grants them to clients
+        // registered before they existed — without it those clients would earn `invalid_scope`.
+        "responses:read",
+        "responses:write",
+        // Advertised since ENG-6581, with the migrations that grant them to existing clients.
+        "dashboards:read",
+        "dashboards:write",
         "offline_access",
       ],
       bearer_methods_supported: ["header"],

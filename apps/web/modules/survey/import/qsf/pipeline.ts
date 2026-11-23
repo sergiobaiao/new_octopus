@@ -1,0 +1,211 @@
+import "server-only";
+import { logger } from "@formbricks/logger";
+import { generateOrganizationAIObject } from "@/lib/ai/service";
+import { getAITimeoutMs } from "@/lib/ai/timeout";
+import { AI_TRACING_FEATURE } from "@/lib/posthog/ai-tracing-feature";
+import { getExternalUrlsPermission } from "@/modules/survey/lib/permission";
+import type { TSurveyImportAssembly, TSurveyImportDraft } from "../core/draft";
+import { SurveyImportFailedError, noQuestionsPlanned } from "../core/errors";
+import { yieldToOthers } from "../core/event-loop";
+import { checkImportDraftInSlices, elementsAtFault } from "../core/final-gate";
+import { getImportedSurveyName, getImporterTranslate } from "../core/imported-survey-name";
+import type { TSurveyImportResult, TSurveyImportRunParams } from "../core/lane";
+import { type TSurveyImportPipelineIssue, buildSurveyImportReport } from "../core/report";
+import { sanitizeName } from "../core/sanitize-text";
+import { SURVEY_IMPORT_AI_CALL_TIMEOUT_MS } from "../limits";
+import { type TQsfPlanGenerate, planQsfImport } from "./ai-plan";
+import { assembleQsfDraft } from "./assemble";
+import { fitQsfDraftToCreateLimit, fitQsfSurveyToCreateLimit } from "./fit-draft";
+import type { TPreparedQsfImport } from "./prepare";
+import type { TQsfSurvey } from "./qsf-model";
+import { sanitizeQsfTexts } from "./sanitize-text";
+
+/**
+ * The Qualtrics import pipeline (ENG-3654): a parsed QSF in, a v3 create document and the import
+ * report out. It is the Qualtrics lane (`qsfImportLane`, `../core/lane.ts`); nothing here knows about
+ * HTTP, so a later public route or a background job reuses it unchanged (ENG-3604).
+ *
+ * Two phases, because the route has to answer a bad file with a problem response before its stream
+ * opens:
+ *
+ * - `prepareQsfImport` (`prepare.ts`) is the reader and its limits, run in the upload's worker thread
+ *   (`../core/upload-thread.ts`), throwing `SurveyImportInputError` for a 422;
+ * - `runQsfImport` does the rest while the stream reports progress: sanitize the texts (yielding to
+ *   the event loop), ask the AI for a plan and check it (`ai`), assemble the draft and gate it with
+ *   the create's own checks (`assembling`).
+ *
+ * The AI never writes survey text: it says which type each question becomes and which option list
+ * plays which role, and the assembly copies every text from the file by key (ENG-3479).
+ */
+
+/** The Qualtrics lane's run, plus the model call the eval script swaps in. */
+export interface TRunQsfImportParams extends TSurveyImportRunParams<TPreparedQsfImport> {
+  /** The model call. The organization's AI by default; the eval script passes its own. */
+  generate?: TQsfPlanGenerate;
+}
+
+function organizationGenerate(params: TRunQsfImportParams): TQsfPlanGenerate {
+  const aiTracing = params.userId
+    ? { distinctId: params.userId, feature: AI_TRACING_FEATURE.SurveyImport, workspaceId: params.workspaceId }
+    : undefined;
+  // Not strict: the plan schemas default the fields a JSON-object provider may leave out, which a
+  // strict-decoding provider refuses. The answer is still validated against the schema, and the lane's
+  // checks judge every field after it.
+  return (request) =>
+    generateOrganizationAIObject({
+      organizationId: params.organizationId,
+      aiTracing,
+      ...request,
+      strictSchema: false,
+    });
+}
+
+const countElements = (document: TSurveyImportDraft): number =>
+  document.blocks.reduce((count, block) => count + block.elements.length, 0);
+
+/**
+ * Assemble the draft and hold it to the create's checks. A problem with one element drops that
+ * element (reported) and the draft is assembled again once; a problem anywhere else, or a second
+ * failure, fails the import. Only the problems' paths are logged: their reasons can quote the file.
+ *
+ * Assembly yields between questions, and the gate between its three checks, which are synchronous —
+ * the request schema's the costliest, about 1 s on a 2 MB draft — so no stretch holds the event loop
+ * for more than one of them.
+ */
+async function assembleCheckedDraft(
+  build: (excludedRefs: ReadonlySet<string>) => Promise<TSurveyImportAssembly>,
+  survey: TQsfSurvey,
+  signal: AbortSignal
+): Promise<{ assembly: TSurveyImportAssembly; dropped: TSurveyImportPipelineIssue[] }> {
+  const pause = () => yieldToOthers(signal);
+
+  const first = await build(new Set());
+  await pause();
+  const problems = await checkImportDraftInSlices(first.document, pause);
+  if (problems.length === 0) return { assembly: first, dropped: [] };
+
+  const names = problems.slice(0, 20).map((problem) => problem.name);
+  const atFault = elementsAtFault(problems);
+  if (!atFault) {
+    logger.error({ invalidParamNames: names }, "QSF import draft failed the create check outside an element");
+    throw new SurveyImportFailedError("draft_invalid");
+  }
+
+  const excluded = new Set(atFault.flatMap(([block, element]) => first.elementRefs[block]?.[element] ?? []));
+  logger.warn(
+    { invalidParamNames: names, droppedElements: excluded.size },
+    "QSF import dropped elements the create would refuse"
+  );
+  await pause();
+  const second = await build(excluded);
+  await pause();
+  if ((await checkImportDraftInSlices(second.document, pause)).length > 0) {
+    throw new SurveyImportFailedError("draft_invalid");
+  }
+
+  return {
+    assembly: second,
+    dropped: [...excluded].map((ref) => ({
+      code: "question_skipped" as const,
+      severity: "warning" as const,
+      questionTag: survey.questions.get(ref)?.exportTag ?? ref,
+      questionRef: ref,
+      params: { cause: "validation_failed" },
+    })),
+  };
+}
+
+/** Plan and assemble the survey. */
+export async function runQsfImport(
+  params: TRunQsfImportParams
+): Promise<TSurveyImportResult<TSurveyImportDraft>> {
+  const { prepared, workspaceId, organizationId, signal, onProgress } = params;
+  const { survey } = prepared;
+  const deadline = performance.now() + params.deadlineMs;
+
+  signal.throwIfAborted();
+  const texts = await sanitizeQsfTexts(survey, signal);
+
+  // Cut what cannot fit the create's request body before any of it is planned or assembled: the
+  // work after this is bounded by about one create body, and the AI is not paid for what goes.
+  signal.throwIfAborted();
+  const surveyFit = fitQsfSurveyToCreateLimit(survey, texts);
+  const keepForSurvey = (issue: TSurveyImportPipelineIssue) =>
+    issue.questionRef === undefined || !surveyFit.cutRefs.has(issue.questionRef);
+
+  signal.throwIfAborted();
+  onProgress("ai");
+  const planned = await planQsfImport({
+    survey,
+    texts,
+    generate: params.generate ?? organizationGenerate(params),
+    signal,
+    deadline,
+    callTimeoutMs: getAITimeoutMs(SURVEY_IMPORT_AI_CALL_TIMEOUT_MS),
+  });
+
+  signal.throwIfAborted();
+  onProgress("assembling");
+  if (planned.plan.questions.size === 0) throw noQuestionsPlanned(planned);
+
+  const name = await getImportedSurveyName(
+    workspaceId,
+    sanitizeName(survey.name) || "Qualtrics survey",
+    await getImporterTranslate(params.userId)
+  );
+  signal.throwIfAborted();
+
+  // Only asked when there is a redirect to keep: on Cloud it is a billing lookup.
+  const allowExternalUrls = survey.endRedirectUrl ? await getExternalUrlsPermission(organizationId) : false;
+  signal.throwIfAborted();
+
+  const { assembly, dropped } = await assembleCheckedDraft(
+    (excludedRefs) =>
+      assembleQsfDraft({
+        survey,
+        texts,
+        plan: planned.plan,
+        workspaceId,
+        name,
+        allowExternalUrls,
+        excludedRefs,
+        cutRefs: surveyFit.cutRefs,
+        signal,
+      }),
+    survey,
+    signal
+  );
+  // The draft the dialog sends back to be created has a size limit (`fitDraftToCreateLimit`). The survey
+  // was cut to an upper bound of it before planning; past it still, languages and then trailing
+  // questions are cut, and only then is the cut draft checked again.
+  await yieldToOthers(signal);
+  const fitted = fitQsfDraftToCreateLimit(assembly, survey);
+  if (countElements(assembly.document) === 0) throw new SurveyImportFailedError("no_questions");
+  if (fitted.dropped.length > 0) {
+    await yieldToOthers(signal);
+    const problems = await checkImportDraftInSlices(assembly.document, () => yieldToOthers(signal));
+    if (problems.length > 0) throw new SurveyImportFailedError("draft_invalid");
+  }
+
+  // A redirect replaces the end message, as in Qualtrics, so what sanitizing removed from it is moot.
+  const endsWithRedirect = assembly.document.endings.some((ending) => ending.type === "redirectToUrl");
+  const issues = [
+    ...survey.issues.filter(keepForSurvey),
+    ...texts.issues.filter(
+      (issue) => keepForSurvey(issue) && !(endsWithRedirect && issue.params?.subject === "ending")
+    ),
+    ...surveyFit.issues,
+    ...planned.issues,
+    ...dropped,
+    ...assembly.issues,
+  ];
+  return {
+    payload: assembly.document,
+    report: buildSurveyImportReport({
+      source: { kind: "qsf", fileName: prepared.fileName },
+      document: assembly.document,
+      issues: [...issues.filter(fitted.keepIssue), ...fitted.dropped],
+    }),
+    ...(planned.calls > 0 ? { usage: planned.usage } : {}),
+  };
+}

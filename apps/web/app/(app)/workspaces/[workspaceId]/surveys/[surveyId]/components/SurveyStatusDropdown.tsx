@@ -6,7 +6,9 @@ import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { useSurvey } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/context/survey-context";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
+import { SurveyStatusChangeDialog } from "@/modules/ee/creatives/components/survey-side/survey-status-change-dialog";
+import { useSurveyStatusChangeWithCreatives } from "@/modules/ee/creatives/hooks/use-survey-linked-creatives";
 import { updateSurveyAction } from "@/modules/survey/editor/actions";
 import {
   Select,
@@ -47,6 +49,14 @@ export const SurveyStatusDropdown = () => {
     }
   };
 
+  // Pausing, closing or resuming names the creatives that open the survey first.
+  const statusChange = useSurveyStatusChangeWithCreatives({
+    workspaceId: survey.workspaceId,
+    surveyId: survey.id,
+    currentStatus: survey.status,
+    applyStatus: handleStatusChange,
+  });
+
   // Archived surveys are read-only. Render the same status-select control (so it reads as a natural
   // status) with "Archived" as the value, but disabled — the status can't change while archived.
   if (survey.archivedAt) {
@@ -86,7 +96,7 @@ export const SurveyStatusDropdown = () => {
         <Select
           value={survey.status}
           onValueChange={(value: TSurvey["status"]) => {
-            handleStatusChange(value);
+            void statusChange.requestStatusChange(value);
           }}>
           <SelectTrigger className="w-[170px] bg-white md:w-[200px]">
             <SelectValue>
@@ -95,7 +105,7 @@ export const SurveyStatusDropdown = () => {
                 <span className="ml-2 text-sm text-slate-700">
                   {survey.status === "inProgress" && t("common.in_progress")}
                   {survey.status === "paused" && (isScheduled ? t("common.scheduled") : t("common.paused"))}
-                  {survey.status === "completed" && t("common.completed")}
+                  {survey.status === "completed" && t("common.closed")}
                 </span>
               </div>
             </SelectValue>
@@ -116,12 +126,13 @@ export const SurveyStatusDropdown = () => {
             <SelectItem className="group font-normal hover:text-slate-900" value="completed">
               <div className="flex w-full items-center justify-center gap-2">
                 <SurveyStatusIndicator status={"completed"} />
-                {t("common.completed")}
+                {t("common.closed")}
               </div>
             </SelectItem>
           </SelectContent>
         </Select>
       )}
+      <SurveyStatusChangeDialog {...statusChange.dialog} />
     </>
   );
 };

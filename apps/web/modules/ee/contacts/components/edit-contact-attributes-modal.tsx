@@ -8,7 +8,7 @@ import { useFieldArray, useForm } from "react-hook-form";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TContactAttributeDataType, TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { Button } from "@/modules/ui/components/button";
 import {
   Dialog,
@@ -32,11 +32,11 @@ interface TContactAttributeWithKeyInfo {
 }
 
 interface EditContactAttributesModalProps {
-  open: boolean;
-  setOpen: (open: boolean) => void;
-  contactId: string;
-  currentAttributes: TContactAttributeWithKeyInfo[];
-  attributeKeys: TContactAttributeKey[];
+  readonly open: boolean;
+  readonly setOpen: (open: boolean) => void;
+  readonly contactId: string;
+  readonly currentAttributes: TContactAttributeWithKeyInfo[];
+  readonly attributeKeys: TContactAttributeKey[];
 }
 
 export const EditContactAttributesModal = ({

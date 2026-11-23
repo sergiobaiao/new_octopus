@@ -13,6 +13,10 @@ vi.mock("@/modules/auth/lib/auth-client", () => ({
   authClient: { signOut: (...args: unknown[]) => baSignOut(...args) },
 }));
 vi.mock("@formbricks/logger", () => ({ logger: { error: loggerError } }));
+const { logoutPlainBeforeNavigation } = vi.hoisted(() => ({
+  logoutPlainBeforeNavigation: vi.fn(),
+}));
+vi.mock("@/app/plain/lib/plain-sdk", () => ({ logoutPlainBeforeNavigation }));
 
 const mockedLogSignOut = vi.mocked(logSignOutAction);
 // The hook reads a bare `localStorage` global, which vitest's jsdom doesn't expose on globalThis.
@@ -27,7 +31,7 @@ beforeEach(() => {
   vi.stubGlobal("localStorage", localStorageMock);
   vi.clearAllMocks();
   baSignOut.mockResolvedValue({ error: null });
-  mockedLogSignOut.mockResolvedValue(undefined);
+  mockedLogSignOut.mockResolvedValue({ data: undefined });
 });
 
 afterEach(() => {
@@ -46,11 +50,34 @@ describe("useSignOut", () => {
 
     await signOut({ reason: "user_initiated", organizationId: "org-1" });
 
-    expect(mockedLogSignOut).toHaveBeenCalledWith("user-1", "ada@example.com", {
+    expect(mockedLogSignOut).toHaveBeenCalledWith({
       reason: "user_initiated",
       redirectUrl: undefined,
       organizationId: "org-1",
     });
+    expect(baSignOut).toHaveBeenCalledTimes(1);
+    expect(window.location.href).toBe("/auth/login");
+  });
+
+  test("logs the Plain support chat out before signing out and redirecting", async () => {
+    let finishPlainLogout: () => void = () => undefined;
+    logoutPlainBeforeNavigation.mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishPlainLogout = resolve;
+      })
+    );
+    const { signOut } = useSignOut({ id: "user-1", email: "ada@example.com" });
+
+    const pending = signOut();
+    await vi.waitFor(() => expect(logoutPlainBeforeNavigation).toHaveBeenCalledTimes(1));
+
+    // While Plain's logout is still pending, neither Better Auth nor the redirect has run.
+    expect(baSignOut).not.toHaveBeenCalled();
+    expect(window.location.href).toBe("");
+
+    finishPlainLogout();
+    await pending;
+
     expect(baSignOut).toHaveBeenCalledTimes(1);
     expect(window.location.href).toBe("/auth/login");
   });
@@ -60,7 +87,7 @@ describe("useSignOut", () => {
 
     await signOut({ callbackUrl: "/dashboard" });
 
-    expect(mockedLogSignOut).toHaveBeenCalledWith("u", "e@x.com", {
+    expect(mockedLogSignOut).toHaveBeenCalledWith({
       reason: "user_initiated",
       redirectUrl: "/dashboard",
       organizationId: undefined,
@@ -92,6 +119,26 @@ describe("useSignOut", () => {
     await signOut();
 
     expect(mockedLogSignOut).not.toHaveBeenCalled();
+    expect(baSignOut).toHaveBeenCalledTimes(1);
+    expect(window.location.href).toBe("/auth/login");
+  });
+
+  test("skips the audit log after account deletion, when the session is already gone", async () => {
+    const { signOut } = useSignOut({ id: "u", email: "e@x.com" });
+
+    await signOut({ reason: "account_deletion" });
+
+    expect(mockedLogSignOut).not.toHaveBeenCalled();
+    expect(baSignOut).toHaveBeenCalledTimes(1);
+  });
+
+  test("logs and still signs out when the audit action returns a server error", async () => {
+    mockedLogSignOut.mockResolvedValueOnce({ serverError: "Not authenticated" });
+    const { signOut } = useSignOut({ id: "u", email: "e@x.com" });
+
+    await signOut();
+
+    expect(loggerError).toHaveBeenCalled();
     expect(baSignOut).toHaveBeenCalledTimes(1);
     expect(window.location.href).toBe("/auth/login");
   });

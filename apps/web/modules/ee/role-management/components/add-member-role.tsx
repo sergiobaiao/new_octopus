@@ -4,7 +4,8 @@ import { useMemo } from "react";
 import { type Control, Controller } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { TOrganizationRole } from "@formbricks/types/memberships";
-import { getAccessFlags } from "@/lib/membership/utils";
+import { getAccessFlags, getOrganizationRoleLabels } from "@/lib/membership/utils";
+import { getAssignableOrganizationRoles } from "@/modules/ee/role-management/lib/assignable-roles";
 import { Label } from "@/modules/ui/components/label";
 import {
   Select,
@@ -17,41 +18,44 @@ import {
 import { Muted, P } from "@/modules/ui/components/typography";
 
 interface AddMemberRoleProps {
-  control: Control<{ name: string; email: string; role: TOrganizationRole; teamIds: string[] }>;
-  isAccessControlAllowed: boolean;
-  isFormbricksCloud: boolean;
-  membershipRole?: TOrganizationRole;
+  readonly control: Control<{ name: string; email: string; role: TOrganizationRole; teamIds: string[] }>;
+  readonly isAccessControlAllowed: boolean;
+  readonly isFormbricksCloud: boolean;
+  readonly isDashboardViewerRoleEnabled: boolean;
+  readonly membershipRole?: TOrganizationRole;
 }
 
 export function AddMemberRole({
   control,
   isAccessControlAllowed,
   isFormbricksCloud,
+  isDashboardViewerRoleEnabled,
   membershipRole,
 }: AddMemberRoleProps) {
-  const { isMember, isOwner } = getAccessFlags(membershipRole);
+  const { isMember } = getAccessFlags(membershipRole);
 
   const { t } = useTranslation();
 
-  const roles = useMemo(() => {
-    let rolesArray = ["member"];
+  const roleLabels = getOrganizationRoleLabels(t);
 
-    if (isOwner) {
-      rolesArray.push("manager", "owner");
-      if (isFormbricksCloud) {
-        rolesArray.push("billing");
-      }
-    }
-    return rolesArray;
-  }, [isOwner, isFormbricksCloud]);
+  const roles = useMemo(
+    () =>
+      getAssignableOrganizationRoles({
+        assignerRole: membershipRole,
+        isFormbricksCloud,
+        isDashboardViewerRoleEnabled,
+      }),
+    [membershipRole, isFormbricksCloud, isDashboardViewerRoleEnabled]
+  );
 
   if (isMember) return null;
 
-  const rolesDescription = {
+  const rolesDescription: Record<TOrganizationRole, string> = {
     owner: t("workspace.settings.teams.owner_role_description"),
     manager: t("workspace.settings.teams.manager_role_description"),
     member: t("workspace.settings.teams.member_role_description"),
     billing: t("workspace.settings.teams.billing_role_description"),
+    dashboard_viewer: t("workspace.settings.teams.dashboard_viewer_role_description"),
   };
 
   return (
@@ -68,19 +72,17 @@ export function AddMemberRole({
               onChange(v as TOrganizationRole);
             }}
             value={value}>
-            <SelectTrigger className="capitalize">
+            <SelectTrigger>
               <SelectValue>
-                <P>{value}</P>
+                <P>{roleLabels[value]}</P>
               </SelectValue>
             </SelectTrigger>
             <SelectContent>
-              <SelectGroup className="flex flex-col-reverse">
+              <SelectGroup>
                 {roles.map((role) => (
                   <SelectItem key={role} value={role}>
-                    <P className="capitalize">{role}</P>
-                    <Muted className="text-slate-500">
-                      {(rolesDescription as Record<string, string>)[role]}
-                    </Muted>
+                    <P>{roleLabels[role]}</P>
+                    <Muted className="text-slate-500">{rolesDescription[role]}</Muted>
                   </SelectItem>
                 ))}
               </SelectGroup>

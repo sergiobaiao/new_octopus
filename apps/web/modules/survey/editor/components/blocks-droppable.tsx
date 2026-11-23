@@ -1,21 +1,20 @@
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
-import { Workspace } from "@formbricks/database/prisma-browser";
+import { type Dispatch, type SetStateAction, useMemo } from "react";
 import { TI18nString } from "@formbricks/types/i18n";
-import { TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement } from "@formbricks/types/surveys/elements";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
+import { type TWorkspaceWithoutCustomCss } from "@/modules/custom-css/lib/types";
 import { BlockCard } from "@/modules/survey/editor/components/block-card";
 
 interface BlocksDroppableProps {
   localSurvey: TSurvey;
-  setLocalSurvey: (survey: TSurvey) => void;
-  workspace: Workspace;
+  persistedSurvey: TSurvey;
+  setLocalSurvey: Dispatch<SetStateAction<TSurvey>>;
+  workspace: TWorkspaceWithoutCustomCss;
   moveElement: (elementIdx: number, up: boolean) => void;
   updateElement: (elementIdx: number, updatedAttributes: any) => void;
-  updateBlockLogic: (elementIdx: number, logic: TSurveyBlockLogic[]) => void;
-  updateBlockLogicFallback: (elementIdx: number, logicFallback: string | undefined) => void;
   updateBlockName: (blockIdx: number, name: string) => void;
   updateBlockButtonLabel: (
     blockIndex: number,
@@ -31,8 +30,6 @@ interface BlocksDroppableProps {
   isFormbricksCloud: boolean;
   isCxMode: boolean;
   locale: TUserLocale;
-  responseCount: number;
-  onAlertTrigger: () => void;
   isStorageConfigured: boolean;
   isExternalUrlsAllowed: boolean;
   duplicateBlock: (blockId: string) => void;
@@ -40,6 +37,9 @@ interface BlocksDroppableProps {
   moveBlock: (blockId: string, direction: "up" | "down") => void;
   addElementToBlock: (element: TSurveyElement, blockId: string, afterElementIdx: number) => void;
   moveElementToBlock?: (elementId: string, targetBlockId: string) => void;
+  // Id of the block the user last pressed or focused; that card re-renders on every survey change.
+  lastInteractedBlockId: string | null;
+  onBlockInteract: (blockId: string) => void;
 }
 
 export const BlocksDroppable = ({
@@ -48,21 +48,18 @@ export const BlocksDroppable = ({
   duplicateElement,
   invalidElements,
   localSurvey,
+  persistedSurvey,
   setLocalSurvey,
   moveElement,
   workspace,
   setActiveElementId,
   updateElement,
-  updateBlockLogic,
-  updateBlockLogicFallback,
   updateBlockName,
   updateBlockButtonLabel,
   addElement,
   isFormbricksCloud,
   isCxMode,
   locale,
-  responseCount,
-  onAlertTrigger,
   isStorageConfigured = true,
   isExternalUrlsAllowed,
   duplicateBlock,
@@ -70,12 +67,20 @@ export const BlocksDroppable = ({
   moveBlock,
   addElementToBlock,
   moveElementToBlock,
+  lastInteractedBlockId,
+  onBlockInteract,
 }: Readonly<BlocksDroppableProps>) => {
   const [parent] = useAutoAnimate();
 
+  // SortableContext memoizes its context value on `items`. Handing it `localSurvey.blocks` (a new
+  // array on every edit) would re-render every useSortable consumer — each memoized BlockCard — on
+  // every keystroke, so give it an id list that only changes when the block ids or their order do.
+  const blockIdsKey = JSON.stringify(localSurvey.blocks.map((block) => block.id));
+  const blockIds = useMemo(() => JSON.parse(blockIdsKey) as string[], [blockIdsKey]);
+
   return (
     <div className="group mb-5 flex w-full flex-col gap-5" ref={parent}>
-      <SortableContext items={localSurvey.blocks} strategy={verticalListSortingStrategy}>
+      <SortableContext items={blockIds} strategy={verticalListSortingStrategy}>
         {localSurvey.blocks.map((block, blockIdx) => {
           // Check if this is the last block and has elements
           const isLastBlock = blockIdx === localSurvey.blocks.length - 1;
@@ -85,14 +90,13 @@ export const BlocksDroppable = ({
             <BlockCard
               key={block.id}
               localSurvey={localSurvey}
+              persistedSurvey={persistedSurvey}
               setLocalSurvey={setLocalSurvey}
               workspace={workspace}
               block={block}
               blockIdx={blockIdx}
               moveElement={moveElement}
               updateElement={updateElement}
-              updateBlockLogic={updateBlockLogic}
-              updateBlockLogicFallback={updateBlockLogicFallback}
               updateBlockName={updateBlockName}
               updateBlockButtonLabel={updateBlockButtonLabel}
               duplicateElement={duplicateElement}
@@ -106,8 +110,6 @@ export const BlocksDroppable = ({
               isFormbricksCloud={isFormbricksCloud}
               isCxMode={isCxMode}
               locale={locale}
-              responseCount={responseCount}
-              onAlertTrigger={onAlertTrigger}
               isStorageConfigured={isStorageConfigured}
               isExternalUrlsAllowed={isExternalUrlsAllowed}
               duplicateBlock={duplicateBlock}
@@ -116,6 +118,8 @@ export const BlocksDroppable = ({
               addElementToBlock={addElementToBlock}
               moveElementToBlock={moveElementToBlock}
               totalBlocks={localSurvey.blocks.length}
+              isLastInteracted={lastInteractedBlockId === block.id}
+              onInteract={onBlockInteract}
             />
           );
         })}

@@ -3,8 +3,10 @@
 import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Workspace } from "@formbricks/database/prisma-browser";
-import { getIngestedStorageKeys } from "@formbricks/types/embedded-data-resolver";
+import type { TRendererCustomCss } from "@formbricks/types/custom-css";
+import { getIngestedStorageKeys } from "@formbricks/types/embedded-data-fields";
 import { TResponseData } from "@formbricks/types/responses";
+import { findElementByIdOrCode } from "@formbricks/types/surveys/element-lookup";
 import { TSurvey, TSurveyStyling } from "@formbricks/types/surveys/types";
 import { TWorkspaceStyling } from "@formbricks/types/workspace";
 import { toJsWorkspaceStateSurvey } from "@/lib/survey/client-utils";
@@ -16,7 +18,7 @@ import { useAppLocale } from "@/modules/survey/link/hooks/use-app-locale";
 import { buildSurveyDocumentTitle } from "@/modules/survey/link/lib/document-title";
 import {
   getHiddenFieldsFromSearchParams,
-  warnOnMissingIngestRows,
+  warnOnMissingEmbeddedDataJoin,
 } from "@/modules/survey/link/lib/hidden-fields";
 import { getPrefillValue } from "@/modules/survey/link/lib/prefill";
 import { getUserIdFromSearchParams } from "@/modules/survey/link/lib/user-id";
@@ -24,26 +26,32 @@ import { getSurveyLanguageTag, getWebAppLocale, isRTLLanguage } from "@/modules/
 import { SurveyInline } from "@/modules/ui/components/survey";
 
 interface SurveyClientWrapperProps {
-  survey: TSurvey;
-  workspace: Pick<Workspace, "styling" | "logo" | "linkSurveyBranding" | "customHeadScripts">;
-  styling: TWorkspaceStyling | TSurveyStyling;
-  publicDomain: string;
-  responseCount?: number;
-  languageCode: string;
-  isEmbed: boolean;
-  singleUseId?: string;
-  singleUseResponseId?: string;
-  contactId?: string;
-  canReadUserIdFromUrl?: boolean;
-  recaptchaSiteKey?: string;
-  isSpamProtectionEnabled: boolean;
-  isPreview: boolean;
-  verifiedEmail?: string;
-  IMPRINT_URL?: string;
-  PRIVACY_URL?: string;
-  TERMS_URL?: string;
-  IS_FORMBRICKS_CLOUD: boolean;
-  pinAuthToken?: string;
+  readonly survey: TSurvey;
+  readonly workspace: Pick<Workspace, "styling" | "logo" | "linkSurveyBranding" | "customHeadScripts">;
+  readonly styling: TWorkspaceStyling | TSurveyStyling;
+  readonly publicDomain: string;
+  readonly responseCount?: number;
+  readonly languageCode: string;
+  readonly isEmbed: boolean;
+  readonly singleUseId?: string;
+  readonly singleUseResponseId?: string;
+  readonly contactId?: string;
+  readonly canReadUserIdFromUrl?: boolean;
+  readonly recaptchaSiteKey?: string;
+  readonly isSpamProtectionEnabled: boolean;
+  readonly isPreview: boolean;
+  readonly verifiedEmail?: string;
+  readonly IMPRINT_URL?: string;
+  readonly PRIVACY_URL?: string;
+  readonly TERMS_URL?: string;
+  readonly IS_FORMBRICKS_CLOUD: boolean;
+  readonly pinAuthToken?: string;
+  /** Compiled workspace + survey custom CSS, resolved server-side (ENG-3552). Never the source. */
+  readonly customCss?: TRendererCustomCss;
+  /** The creative that opened this survey, already checked server-side from `?creativeId=` (ENG-4001). */
+  readonly creativeId?: string;
+  /** The app's release version, which the survey renderer is loaded under. */
+  readonly rendererVersion?: string;
 }
 
 let setBlockId = (_: string) => {};
@@ -70,6 +78,9 @@ export const SurveyClientWrapper = ({
   TERMS_URL,
   IS_FORMBRICKS_CLOUD,
   pinAuthToken,
+  customCss,
+  creativeId,
+  rendererVersion,
 }: SurveyClientWrapperProps) => {
   const searchParams = useSearchParams();
 
@@ -93,12 +104,18 @@ export const SurveyClientWrapper = ({
   // Extract survey properties outside useMemo to create stable references
   const welcomeCardEnabled = survey.welcomeCard.enabled;
 
+  // `startAt` is a Question ID or a question code; the survey runtime is handed the resolved Question ID.
+  const startAtElementId = useMemo(
+    () => (startAt ? findElementByIdOrCode(elements, startAt)?.id : undefined),
+    [elements, startAt]
+  );
+
   // Validate startAt parameter against survey elements
   const isStartAtValid = useMemo(() => {
     if (!startAt) return false;
     if (welcomeCardEnabled && startAt === "start") return true;
 
-    const isValid = elements.some((element) => element.id === startAt);
+    const isValid = startAtElementId !== undefined;
 
     // Clean up invalid startAt from URL to prevent confusion
     if (!isValid && globalThis.window !== undefined) {
@@ -108,7 +125,7 @@ export const SurveyClientWrapper = ({
     }
 
     return isValid;
-  }, [welcomeCardEnabled, elements, startAt]);
+  }, [welcomeCardEnabled, startAtElementId, startAt]);
 
   const prefillValue = getPrefillValue(survey, searchParams, languageCode);
   const [autoFocus, setAutoFocus] = useState(false);
@@ -122,10 +139,10 @@ export const SurveyClientWrapper = ({
 
   // Extract ingestible Embedded Data from URL parameters.
   //
-  // The allow-list is the survey's linked `ingested` rows, not the legacy `hiddenFields.fieldIds`
-  // column (ENG-1843). `locked` fields are deliberately included: the renderer's ingest contract
-  // drops their incoming values and logs why, and filtering them out here would silence that
-  // diagnostic while duplicating a rule that already has one home.
+  // The allow-list is the survey's linked `ingested` rows (ENG-1843), which the legacy
+  // `hiddenFields.fieldIds` is only derived from. `locked` fields are deliberately included: the
+  // renderer's ingest contract drops their incoming values and logs why, and filtering them out here
+  // would silence that diagnostic while duplicating a rule that already has one home.
   //
   // Keyed on the ids' contents, not the array identity, which changes on every parent render
   // (ENG-2366).
@@ -138,12 +155,11 @@ export const SurveyClientWrapper = ({
   // The diagnostic is a side effect, so it belongs in an effect rather than in the memo above: a memo
   // body runs twice per mount under StrictMode, so this warning printed twice on every dev page load,
   // and it would re-run on any `searchParams` change even though what it reports depends only on the
-  // survey. Keyed on content rather than array identity, like the memo above.
-  const legacyFieldIds = survey.hiddenFields.fieldIds ?? [];
+  // survey. Keyed on whether the join was read, which is all it reports on.
+  const hasEmbeddedFields = survey.embeddedFields !== undefined;
   useEffect(() => {
-    warnOnMissingIngestRows(ingestedStorageKeys, legacyFieldIds);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content, not array identity
-  }, [JSON.stringify(ingestedStorageKeys), JSON.stringify(legacyFieldIds)]);
+    warnOnMissingEmbeddedDataJoin(hasEmbeddedFields);
+  }, [hasEmbeddedFields]);
 
   // Include verified email in hidden fields if available
   const getVerifiedEmail = useMemo<Record<string, string> | null>(() => {
@@ -268,6 +284,9 @@ export const SurveyClientWrapper = ({
           isPreviewMode={isPreview}
           survey={jsSurvey}
           styling={styling}
+          customCss={customCss}
+          creativeId={creativeId}
+          rendererVersion={rendererVersion}
           languageCode={languageCode}
           onLanguageChange={setCurrentLanguageCode}
           onPageChange={handlePageChange}
@@ -283,7 +302,7 @@ export const SurveyClientWrapper = ({
           getSetResponseData={(f: (value: TResponseData) => void) => {
             setResponseData = f;
           }}
-          startAtQuestionId={startAt && isStartAtValid ? startAt : undefined}
+          startAtQuestionId={startAt && isStartAtValid ? (startAtElementId ?? startAt) : undefined}
           fullSizeCards={isEmbed}
           hiddenFieldsRecord={{
             ...hiddenFieldsRecord,

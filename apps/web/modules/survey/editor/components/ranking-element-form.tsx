@@ -17,21 +17,29 @@ import { TUserLocale } from "@formbricks/types/user";
 import { createI18nString, extractLanguageCodes } from "@/lib/i18n/utils";
 import { ElementFormInput } from "@/modules/survey/components/element-form-input";
 import { ElementOptionChoice } from "@/modules/survey/editor/components/element-option-choice";
-import { ValidationRulesEditor } from "@/modules/survey/editor/components/validation-rules-editor";
+import { type TSetOptionHidden } from "@/modules/survey/editor/components/option-hide-button";
+import { NO_ELEMENT_LOCK, TElementLock } from "@/modules/survey/editor/lib/published-lock";
+import {
+  ensureSpecialChoicesOrder,
+  getShuffleOptionAfterAddingSpecialChoice,
+  getShuffleOptionAfterRemovingSpecialChoice,
+} from "@/modules/survey/editor/lib/special-choices";
 import { Button } from "@/modules/ui/components/button";
 import { Label } from "@/modules/ui/components/label";
-import { ShuffleOptionSelect } from "@/modules/ui/components/shuffle-option-select";
 
 interface RankingElementFormProps {
-  localSurvey: TSurvey;
-  element: TSurveyRankingElement;
-  elementIdx: number;
-  updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
-  selectedLanguageCode: string;
-  isInvalid: boolean;
-  locale: TUserLocale;
-  isStorageConfigured: boolean;
-  isExternalUrlsAllowed?: boolean;
+  readonly localSurvey: TSurvey;
+  readonly element: TSurveyRankingElement;
+  readonly elementIdx: number;
+  readonly updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
+  readonly selectedLanguageCode: string;
+  readonly isInvalid: boolean;
+  readonly locale: TUserLocale;
+  readonly isStorageConfigured: boolean;
+  readonly isExternalUrlsAllowed?: boolean;
+  readonly lock?: TElementLock;
+  /** The Hide quick action on each option (ENG-6949). */
+  readonly onSetOptionHidden?: TSetOptionHidden;
 }
 
 export const RankingElementForm = ({
@@ -44,6 +52,8 @@ export const RankingElementForm = ({
   locale,
   isStorageConfigured = true,
   isExternalUrlsAllowed,
+  lock = NO_ELEMENT_LOCK,
+  onSetOptionHidden,
 }: RankingElementFormProps): JSX.Element => {
   const { t } = useTranslation();
   const lastChoiceRef = useRef<HTMLInputElement>(null);
@@ -63,8 +73,10 @@ export const RankingElementForm = ({
     }
   };
 
+  const hasOtherChoice = element.choices.some((choice) => choice.id === "other");
+
   const addChoice = (choiceIdx: number) => {
-    let newChoices = !element.choices ? [] : element.choices;
+    const choices = !element.choices ? [] : element.choices;
 
     const newChoice = {
       id: createId(),
@@ -72,7 +84,11 @@ export const RankingElementForm = ({
     };
 
     updateElement(elementIdx, {
-      choices: [...newChoices.slice(0, choiceIdx + 1), newChoice, ...newChoices.slice(choiceIdx + 1)],
+      choices: ensureSpecialChoicesOrder([
+        ...choices.slice(0, choiceIdx + 1),
+        newChoice,
+        ...choices.slice(choiceIdx + 1),
+      ]),
     });
   };
 
@@ -88,10 +104,32 @@ export const RankingElementForm = ({
       label: createI18nString("", surveyLanguageCodes),
     };
 
-    updateElement(elementIdx, { choices: [...choices, newChoice] });
+    updateElement(elementIdx, { choices: ensureSpecialChoicesOrder([...choices, newChoice]) });
+  };
+
+  const addOtherChoice = () => {
+    if (hasOtherChoice || element.choices.length >= 25) return;
+
+    const otherChoice = {
+      id: "other",
+      label: createI18nString(t("common.other"), surveyLanguageCodes),
+    };
+    const nextShuffleOption = getShuffleOptionAfterAddingSpecialChoice(element.shuffleOption);
+
+    updateElement(elementIdx, {
+      choices: ensureSpecialChoicesOrder([...element.choices, otherChoice]),
+      ...(!element.otherOptionPlaceholder && {
+        otherOptionPlaceholder: createI18nString(
+          t("workspace.surveys.edit.please_specify"),
+          surveyLanguageCodes
+        ),
+      }),
+      ...(nextShuffleOption && { shuffleOption: nextShuffleOption }),
+    });
   };
 
   const deleteChoice = (choiceIdx: number) => {
+    if (lock.isOptionLocked("choices", element.choices[choiceIdx].id)) return;
     const newChoices = element.choices.filter((_, idx) => idx !== choiceIdx);
     const choiceValue = element.choices[choiceIdx].label[selectedLanguageCode];
 
@@ -99,35 +137,12 @@ export const RankingElementForm = ({
       setIsInvalidValue(null);
     }
 
-    updateElement(elementIdx, { choices: newChoices });
-  };
+    const nextShuffleOption = getShuffleOptionAfterRemovingSpecialChoice(element.shuffleOption, newChoices);
 
-  const shuffleOptionsTypes = {
-    none: {
-      id: "none",
-      label: t("workspace.surveys.edit.keep_current_order"),
-      show: true,
-    },
-    all: {
-      id: "all",
-      label: t("workspace.surveys.edit.randomize_all"),
-      show: element.choices.length > 0,
-    },
-    exceptLast: {
-      id: "exceptLast",
-      label: t("workspace.surveys.edit.randomize_all_except_last"),
-      show: true,
-    },
-    reverseOrderOccasionally: {
-      id: "reverseOrderOccasionally",
-      label: t("workspace.surveys.edit.reverse_order_occasionally"),
-      show: true,
-    },
-    reverseOrderExceptLast: {
-      id: "reverseOrderExceptLast",
-      label: t("workspace.surveys.edit.reverse_order_occasionally_except_last"),
-      show: true,
-    },
+    updateElement(elementIdx, {
+      choices: newChoices,
+      ...(nextShuffleOption && { shuffleOption: nextShuffleOption }),
+    });
   };
 
   useEffect(() => {
@@ -199,7 +214,7 @@ export const RankingElementForm = ({
             onDragEnd={(event) => {
               const { active, over } = event;
 
-              if (!active || !over) {
+              if (!active || !over || active.id === "other" || over.id === "other") {
                 return;
               }
 
@@ -232,6 +247,8 @@ export const RankingElementForm = ({
                     surveyLanguageCodes={surveyLanguageCodes}
                     locale={locale}
                     isStorageConfigured={isStorageConfigured}
+                    lock={lock}
+                    onSetOptionHidden={onSetOptionHidden}
                   />
                 ))}
               </div>
@@ -239,35 +256,30 @@ export const RankingElementForm = ({
           </DndContext>
 
           <div className="mt-2 flex flex-1 items-center justify-between gap-2">
-            <Button
-              size="sm"
-              variant="secondary"
-              type="button"
-              disabled={element.choices?.length >= 25}
-              onClick={() => addOption()}>
-              {t("workspace.surveys.edit.add_option")}
-              <PlusIcon />
-            </Button>
-            <ShuffleOptionSelect
-              shuffleOptionsTypes={shuffleOptionsTypes}
-              updateElement={updateElement}
-              shuffleOption={element.shuffleOption}
-              elementIdx={elementIdx}
-            />
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant="secondary"
+                type="button"
+                disabled={element.choices?.length >= 25}
+                onClick={() => addOption()}>
+                {t("workspace.surveys.edit.add_option")}
+                <PlusIcon />
+              </Button>
+              {!hasOtherChoice && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  type="button"
+                  disabled={element.choices?.length >= 25}
+                  onClick={addOtherChoice}>
+                  {t("workspace.surveys.edit.add_other")}
+                </Button>
+              )}
+            </div>
           </div>
         </div>
       </div>
-
-      <ValidationRulesEditor
-        elementType={element.type}
-        validation={element.validation}
-        onUpdateValidation={(validation) => {
-          updateElement(elementIdx, {
-            validation,
-          });
-        }}
-        element={element}
-      />
     </form>
   );
 };

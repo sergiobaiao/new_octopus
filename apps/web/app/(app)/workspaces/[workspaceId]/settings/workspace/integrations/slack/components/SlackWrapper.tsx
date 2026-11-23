@@ -5,6 +5,7 @@ import { TIntegrationItem } from "@formbricks/types/integration";
 import { TIntegrationSlack, TIntegrationSlackConfigData } from "@formbricks/types/integration/slack";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
+import { useIntegration } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/hooks/use-integration";
 import { getSlackChannelsAction } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/slack/actions";
 import { AddChannelMappingModal } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/slack/components/AddChannelMappingModal";
 import { ManageIntegration } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/slack/components/ManageIntegration";
@@ -16,6 +17,7 @@ interface SlackWrapperProps {
   isEnabled: boolean;
   workspaceId: string;
   surveys: TSurvey[];
+  surveyVisibilityEnabled: boolean;
   slackIntegration?: TIntegrationSlack;
   webAppUrl: string;
   locale: TUserLocale;
@@ -25,10 +27,12 @@ export const SlackWrapper = ({
   isEnabled,
   workspaceId,
   surveys,
-  slackIntegration,
+  surveyVisibilityEnabled,
+  slackIntegration: initialSlackIntegration,
   webAppUrl,
   locale,
-}: SlackWrapperProps) => {
+}: Readonly<SlackWrapperProps>) => {
+  const slackIntegration = useIntegration(workspaceId, "slack", initialSlackIntegration);
   const [isConnected, setIsConnected] = useState(slackIntegration ? !!slackIntegration.config?.key : false);
   const [slackChannels, setSlackChannels] = useState<TIntegrationItem[]>([]);
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
@@ -70,6 +74,7 @@ export const SlackWrapper = ({
       <AddChannelMappingModal
         workspaceId={workspaceId}
         surveys={surveys}
+        surveyVisibilityEnabled={surveyVisibilityEnabled}
         open={isModalOpen}
         setOpen={setIsModalOpen}
         channels={slackChannels}
@@ -78,6 +83,8 @@ export const SlackWrapper = ({
       />
       <ManageIntegration
         slackIntegration={slackIntegration}
+        surveys={surveys}
+        surveyVisibilityEnabled={surveyVisibilityEnabled}
         setOpenAddIntegrationModal={setIsModalOpen}
         setIsConnected={setIsConnected}
         setSelectedIntegration={setSelectedIntegration}

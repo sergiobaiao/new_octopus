@@ -1,6 +1,7 @@
 "use server";
 
 import { z } from "zod";
+import { logger } from "@formbricks/logger";
 import { ZId } from "@formbricks/types/common";
 import { AuthenticationError } from "@formbricks/types/errors";
 import { ZUserEmail, ZUserName } from "@formbricks/types/user";
@@ -8,7 +9,10 @@ import { INVITE_DISABLED } from "@/lib/constants";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
 import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
 import { sendInviteMemberEmail } from "@/modules/email";
-import { applyInviteRateLimit } from "@/modules/organization/settings/teams/lib/invite-rate-limit";
+import {
+  reserveInviteRateLimit,
+  settleInviteRateLimit,
+} from "@/modules/organization/settings/teams/lib/invite-rate-limit";
 import { checkSetupInviteAuthorization } from "@/modules/setup/organization/[organizationId]/invite/lib/authorization";
 import { inviteUser } from "@/modules/setup/organization/[organizationId]/invite/lib/invite";
 
@@ -33,18 +37,38 @@ export const inviteOrganizationMemberAction = authenticatedActionClient
       ctx.auditLoggingCtx.organizationId = parsedInput.organizationId;
 
       // Shares one recipient-counted budget with settings, bulk, and resend invite paths.
-      await applyInviteRateLimit(parsedInput.organizationId);
+      const rateLimitReservation = await reserveInviteRateLimit(parsedInput.organizationId, ctx.user.id);
 
-      const invitedUserId = await inviteUser({
-        organizationId: parsedInput.organizationId,
-        invitee: {
-          email: parsedInput.email,
-          name: parsedInput.name,
-        },
-        currentUserId: ctx.user.id,
-      });
+      let invitedUserId: Awaited<ReturnType<typeof inviteUser>>;
+      try {
+        invitedUserId = await inviteUser({
+          organizationId: parsedInput.organizationId,
+          invitee: {
+            email: parsedInput.email,
+            name: parsedInput.name,
+          },
+          currentUserId: ctx.user.id,
+        });
+      } catch (error) {
+        await settleInviteRateLimit(rateLimitReservation, 0);
+        throw error;
+      }
+      await settleInviteRateLimit(rateLimitReservation, 1);
 
-      await sendInviteMemberEmail(invitedUserId, parsedInput.email, ctx.user.name, "");
+      // Best-effort, like the other invite actions: the invite already exists and can be shared by link,
+      // so a failed or rate-limited email must not strand it behind "Invite already exists" on a retry.
+      try {
+        await sendInviteMemberEmail(
+          invitedUserId,
+          parsedInput.email,
+          ctx.user.name,
+          "",
+          parsedInput.organizationId,
+          ctx.user.id
+        );
+      } catch (error) {
+        logger.error({ err: error }, "Failed to send onboarding invite email");
+      }
 
       ctx.auditLoggingCtx.inviteId = invitedUserId;
       ctx.auditLoggingCtx.newObject = {

@@ -1,23 +1,35 @@
 import "server-only";
 import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
+import type { TCustomCssStored } from "@formbricks/types/custom-css";
+import type { TLinkedEmbeddedField } from "@formbricks/types/embedded-data-resolver";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { hasUnfinishedShowConditions } from "@formbricks/types/show-conditions";
 import {
   collectDeclaredFieldNames,
   describeDeclaredFieldNameError,
   validateNewDeclaredFieldNames,
 } from "@formbricks/types/surveys/declared-field-guard";
+import { carryOverCodes } from "@formbricks/types/surveys/fill-missing-codes";
 import type { TSurvey } from "@formbricks/types/surveys/types";
-import { getActionClasses } from "@/lib/actionClass/service";
+import { type TV3SurveyWriteReport, toV3CustomCssError } from "@/app/api/v3/lib/custom-css";
+import type { InvalidParam } from "@/app/api/v3/lib/response";
+import { getActionClasses, getActionClassesInTransaction } from "@/lib/actionClass/service";
 import { reconcileEmbeddedData } from "@/lib/embedded-data/reconcile";
 import { scheduleFeedbackSourceReconciliation } from "@/lib/feedback-source/mapping-reconciliation";
-import { selectSurvey } from "@/lib/survey/service";
+import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
+import { fillSurveyBlockCodes } from "@/lib/survey/fill-codes";
+import { APP_SURVEY_TRIGGER_REQUIRED_MESSAGE } from "@/lib/survey/publish-rule";
+import { selectSurveyWithCustomCss } from "@/lib/survey/service";
+import { stripIsDraftFromBlocks, transformPrismaSurvey } from "@/lib/survey/utils";
 import {
-  APP_SURVEY_TRIGGER_REQUIRED_MESSAGE,
-  isAppSurveyMissingTriggersToPublish,
-  stripIsDraftFromBlocks,
-  transformPrismaSurvey,
-} from "@/lib/survey/utils";
+  SURVEY_WRITE_TRANSACTION_OPTIONS,
+  type TSurveyWriteTransaction,
+} from "@/lib/survey/write-transaction";
+import { invalidateCustomCssCaches, resolveCustomCssWrite } from "@/modules/custom-css/lib/service";
+import { isAppSurveyBlockedFromPublishing } from "@/modules/ee/creatives/lib/survey-publish";
+import { getIsQuotasEnabled } from "@/modules/ee/license-check/lib/utils";
+import { hasMatrixElement, syncQuotaMatrixConditions } from "@/modules/ee/quotas/lib/quotas";
 import { handleTriggerUpdates } from "@/modules/survey/lib/trigger-updates";
 import {
   isSurveySchedulingDue,
@@ -25,8 +37,14 @@ import {
   reconcileDueSurveySchedules,
 } from "@/modules/survey/scheduling/lib/survey-scheduling";
 import { v3DistributionToScalars } from "./distribution";
+import {
+  type TV3SurveyEmbeddedField,
+  V3SurveyEmbeddedFieldsError,
+  toLinkedEmbeddedFields,
+} from "./embedded-fields";
+import { getV3LibraryFieldIdsByKey, resolveV3EmbeddedFieldLibraryKeys } from "./embedded-fields-library";
 import { type TV3SurveyLanguageRequest, ensureV3WorkspaceLanguages } from "./languages";
-import { prepareV3SurveyPatchInput } from "./prepare";
+import { type TV3SurveyReportedVisibility, prepareV3SurveyPatchInput } from "./prepare";
 import { V3SurveyReferenceValidationError } from "./reference-validation";
 import type { TV3SurveyDocument } from "./schemas";
 import {
@@ -35,8 +53,13 @@ import {
   setV3SurveySegmentFilters,
 } from "./targeting";
 import { resolveV3SurveyTriggers } from "./triggers";
-import { getV3SurveyMediaInvalidParams } from "./validation";
-import { assertV3SurveyTargetingWritePermission, assertV3SurveyWritePermissions } from "./write-permissions";
+import { getV3SurveyIntroducedMediaInvalidParams } from "./validation";
+import { NO_VISIBLE_SURVEYS } from "./visibility-context";
+import {
+  V3SurveyWritePermissionError,
+  assertV3SurveyTargetingWritePermission,
+  assertV3SurveyWritePermissions,
+} from "./write-permissions";
 
 function buildSurveyLanguageUpdate(
   currentSurvey: TSurvey,
@@ -111,7 +134,7 @@ async function reconcilePersistedV3SurveyPatch({
 
   const reconciledSurvey = await prisma.survey.findUnique({
     where: { id: survey.id },
-    select: selectSurvey,
+    select: selectSurveyWithCustomCss,
   });
 
   if (!reconciledSurvey) {
@@ -137,17 +160,41 @@ async function buildV3AppSurveyPatchWrites(params: {
   currentSurvey: TSurvey;
   document: TV3SurveyDocument;
   data: Prisma.SurveyUpdateInput;
+  visibleSurveyWhere: Prisma.SurveyWhereInput;
+  replacesDistribution: boolean;
+  transaction: TSurveyWriteTransaction | undefined;
 }): Promise<TV3SegmentFilterWrite | null> {
-  const { currentSurvey, document, data } = params;
+  const { currentSurvey, document, data, visibleSurveyWhere, replacesDistribution, transaction } = params;
   const distribution = document.distribution;
   if (!distribution) {
     return null;
   }
 
-  const actionClasses = await getActionClasses(currentSurvey.workspaceId);
+  const actionClasses = transaction
+    ? await getActionClassesInTransaction(transaction.tx, currentSurvey.workspaceId)
+    : await getActionClasses(currentSurvey.workspaceId);
   const resolvedTriggers = resolveV3SurveyTriggers(distribution.triggers, actionClasses);
 
-  Object.assign(data, v3DistributionToScalars(distribution));
+  const { showConditions, ...scalars } = v3DistributionToScalars(distribution);
+  Object.assign(data, scalars);
+  // The stored conditions were read without a draft's unfinished rows. A patch that does not send
+  // `distribution` keeps them while the survey stays a draft. One that sends it, or that takes the
+  // survey live, writes what was validated: a live survey must not keep a row that can never pass.
+  // A nullable JSON column takes `Prisma.DbNull`, not `null`, to store "no conditions".
+  if (replacesDistribution || document.status !== "draft") {
+    // Going live without sending `distribution` would write the cleaned copy: an AND group would lose
+    // a row and show to more visitors, and a lone unfinished row would show to everyone. The editor
+    // refuses to publish in this state, so the API does too.
+    if (!replacesDistribution && hasUnfinishedShowConditions(currentSurvey.showConditions)) {
+      throw new V3SurveyReferenceValidationError([
+        {
+          name: "distribution.showConditions",
+          reason: "Finish or remove the unfinished show conditions before publishing",
+        },
+      ]);
+    }
+    data.showConditions = showConditions ?? Prisma.DbNull;
+  }
   data.triggers = handleTriggerUpdates(resolvedTriggers, currentSurvey.triggers, actionClasses);
 
   const nextFilters = document.targeting?.filters ?? [];
@@ -169,9 +216,99 @@ async function buildV3AppSurveyPatchWrites(params: {
   }
 
   // Validate attribute-key references on the changed filters before the write (mirrors trigger ids).
-  await assertV3SurveyTargetingFilterReferences(currentSurvey.workspaceId, nextFilters);
+  await assertV3SurveyTargetingFilterReferences(
+    currentSurvey.workspaceId,
+    nextFilters,
+    visibleSurveyWhere,
+    transaction?.tx
+  );
 
   return { segmentId, filters: nextFilters };
+}
+
+/**
+ * Optimistic-concurrency precondition (ENG-3069): the `updatedAt` the caller last read.
+ * Enforced as a compare-and-set in the UPDATE's own `where`, so there is no read-then-write window.
+ */
+export type TV3SurveyWritePrecondition = { expectedUpdatedAt: Date };
+
+/**
+ * ENG-3070: the *stored* survey does not satisfy the v3 document contract, so the request was never
+ * evaluated. Distinct from a reference-validation failure because the fix is to repair the survey,
+ * not the payload — and because reporting it as `invalid_params` on request paths misattributes it.
+ */
+export class V3SurveyStoredDocumentError extends Error {
+  constructor(readonly invalidParams: InvalidParam[]) {
+    super("Stored survey does not satisfy the v3 survey document contract");
+    this.name = "V3SurveyStoredDocumentError";
+  }
+}
+
+export class V3SurveyStaleError extends Error {
+  constructor(
+    readonly expectedUpdatedAt: Date,
+    readonly currentUpdatedAt: Date,
+    /** Whether the early read caught it, or the compare-and-set did. Useful for judging real races. */
+    readonly detectedAt: "read" | "write"
+  ) {
+    super("Survey was modified since it was last read");
+    this.name = "V3SurveyStaleError";
+  }
+}
+
+/** The survey was archived between the authorized read and the write. Same 422 as the pre-write guard. */
+export class V3SurveyArchivedError extends Error {
+  constructor() {
+    super("Survey is archived");
+    this.name = "V3SurveyArchivedError";
+  }
+}
+
+/**
+ * Throw when the caller's precondition no longer matches the stored survey.
+ *
+ * Exported because the no-write paths need it too. RFC 9110 evaluates a precondition *before* the
+ * method, so an outcome that happens to be a no-op does not excuse a stale caller: reordering blocks
+ * into the order they already hold must still fail, or a caller whose view of the survey is out of
+ * date gets a 200 that reads as confirmation.
+ */
+export function assertV3SurveyPrecondition(
+  currentSurvey: { updatedAt: Date },
+  precondition: TV3SurveyWritePrecondition | undefined
+): void {
+  if (precondition && currentSurvey.updatedAt.getTime() !== precondition.expectedUpdatedAt.getTime()) {
+    throw new V3SurveyStaleError(precondition.expectedUpdatedAt, currentSurvey.updatedAt, "read");
+  }
+}
+
+/**
+ * A P2025 from the survey UPDATE means the row no longer matched its `where`: the survey is gone, it was
+ * archived under us, or — under a precondition — it moved on. One cheap re-read tells the three apart.
+ * Scoped by workspace even though the caller is already authorized for this id — an unscoped
+ * findUnique-by-id is the shape that gets copy-pasted somewhere it is not safe.
+ */
+async function resolveUpdateMiss(
+  currentSurvey: TSurvey,
+  precondition: TV3SurveyWritePrecondition | undefined,
+  cause: Error
+): Promise<Error> {
+  const row = await prisma.survey.findFirst({
+    where: { id: currentSurvey.id, workspaceId: currentSurvey.workspaceId },
+    select: { updatedAt: true, archivedAt: true },
+  });
+
+  if (!row) {
+    return new ResourceNotFoundError("Survey", currentSurvey.id);
+  }
+  if (row.archivedAt) {
+    return new V3SurveyArchivedError();
+  }
+  if (precondition) {
+    return new V3SurveyStaleError(precondition.expectedUpdatedAt, row.updatedAt, "write");
+  }
+
+  // Live, unarchived, unconditional — and the UPDATE still missed it. Not a state this code can explain.
+  return new DatabaseError(cause.message);
 }
 
 export async function executeV3SurveyPatch(params: {
@@ -179,18 +316,61 @@ export async function executeV3SurveyPatch(params: {
   document: TV3SurveyDocument;
   languageRequests: TV3SurveyLanguageRequest[];
   requestId?: string;
+  precondition?: TV3SurveyWritePrecondition;
+  /** The surveys the caller may reference in targeting (ENG-3282). Omitted, nothing is referenceable. */
+  visibleSurveyWhere?: Prisma.SurveyWhereInput;
+  /**
+   * ENG-3641: the custom CSS to store, already resolved by the shared custom CSS service. Present only
+   * when the CSS actually changed; absent leaves the column untouched.
+   */
+  customCss?: { stored: TCustomCssStored | null };
+  /** Whether the request sent `distribution`, which replaces the stored one whole. */
+  replacesDistribution?: boolean;
+  /** The survey's organization, when the caller already has it; else it is read from the workspace. */
+  organizationId?: string;
+  /** See {@link TPatchV3SurveyOptions.embeddedFields}. */
+  embeddedFields?: TLinkedEmbeddedField[];
+  /**
+   * ENG-6845: a transaction the caller opened, so the patch lands together with the caller's own writes
+   * or not at all. The languages it adds, the survey, its segment filters and Embedded Data rows are
+   * written through it, and the References the caller created in it are visible to the checks here.
+   * Omitted, the patch opens its own transaction, as it always has.
+   */
+  transaction?: TSurveyWriteTransaction;
 }): Promise<TSurvey> {
-  const { currentSurvey, document, languageRequests, requestId } = params;
-  const mediaInvalidParams = getV3SurveyMediaInvalidParams(document.blocks);
+  const {
+    currentSurvey,
+    document,
+    languageRequests,
+    requestId,
+    precondition,
+    visibleSurveyWhere = NO_VISIBLE_SURVEYS,
+    customCss,
+    replacesDistribution = false,
+    organizationId,
+    embeddedFields,
+    transaction,
+  } = params;
+  // Same rule as prepare's validation (ENG-3975): media the stored survey already had does not block a
+  // patch that leaves it untouched.
+  const mediaInvalidParams = getV3SurveyIntroducedMediaInvalidParams(document.blocks, currentSurvey.blocks);
   if (mediaInvalidParams.length > 0) {
     throw new V3SurveyReferenceValidationError(mediaInvalidParams);
   }
 
-  // An app survey can never be shown without a trigger, so reject setting a non-draft status with no
-  // effective triggers. Triggers only change when the patch carries a `distribution` (top-level
-  // replacement); otherwise the survey keeps its current triggers.
+  // An app survey can never be shown without a trigger or a creative that opens it, so reject setting a
+  // non-draft status with neither. Triggers only change when the patch carries a `distribution`
+  // (top-level replacement); otherwise the survey keeps its current triggers.
   const effectiveTriggers = document.distribution ? document.distribution.triggers : currentSurvey.triggers;
-  if (isAppSurveyMissingTriggersToPublish(currentSurvey.type, document.status, effectiveTriggers)) {
+  if (
+    await isAppSurveyBlockedFromPublishing({
+      surveyId: currentSurvey.id,
+      workspaceId: currentSurvey.workspaceId,
+      type: currentSurvey.type,
+      status: document.status,
+      triggers: effectiveTriggers,
+    })
+  ) {
     throw new V3SurveyReferenceValidationError([
       { name: "triggers", reason: APP_SURVEY_TRIGGER_REQUIRED_MESSAGE },
     ]);
@@ -200,9 +380,14 @@ export async function executeV3SurveyPatch(params: {
   // refusal is a validation response rather than a rollback, and before `ensureV3WorkspaceLanguages`
   // — which writes workspace languages — so a rejected patch creates nothing. Names `currentSurvey`
   // already declares are grandfathered and pass untouched.
+  //
+  // The declared names come from the legacy keys alone: prepare derived them from `embeddedFields`
+  // when the request sent it (ENG-6930), and the flat v3 entries are not the `{ field, link }` pairs
+  // the guard and the code filler read.
+  const declared = { variables: document.variables, hiddenFields: document.hiddenFields };
   const declaredFieldNameErrors = validateNewDeclaredFieldNames({
     existing: collectDeclaredFieldNames(currentSurvey),
-    incoming: collectDeclaredFieldNames(document),
+    incoming: collectDeclaredFieldNames(declared),
   });
   if (declaredFieldNameErrors.length > 0) {
     throw new V3SurveyReferenceValidationError(
@@ -215,7 +400,12 @@ export async function executeV3SurveyPatch(params: {
     );
   }
 
-  const languages = await ensureV3WorkspaceLanguages(currentSurvey.workspaceId, languageRequests, requestId);
+  const languages = await ensureV3WorkspaceLanguages(
+    currentSurvey.workspaceId,
+    languageRequests,
+    requestId,
+    transaction?.tx
+  );
   const normalizedScheduling = normalizeSurveyScheduling({
     currentStatus: currentSurvey.status,
     closeOn: currentSurvey.closeOn,
@@ -227,90 +417,170 @@ export async function executeV3SurveyPatch(params: {
     name: document.name,
     status: document.status,
     metadata: document.metadata,
+    showLanguageSwitch: document.showLanguageSwitch,
+    autoSelectLanguage: document.autoSelectLanguage,
     welcomeCard: document.welcomeCard,
-    blocks: stripIsDraftFromBlocks(document.blocks),
+    // ENG-6782: a block `update` replaces the whole block, so a caller that sends none of the codes
+    // would otherwise wipe the stored ones. Carry them over by id first, then code what is new.
+    blocks: fillSurveyBlockCodes(
+      carryOverCodes(currentSurvey.blocks, stripIsDraftFromBlocks(document.blocks)),
+      declared
+    ),
     endings: document.endings,
-    hiddenFields: document.hiddenFields,
-    variables: document.variables,
+    // ENG-6932: the merged document always carries the rules (omitted keeps the stored ones); none is
+    // stored as `null`, which a nullable JSON column takes as `Prisma.DbNull`.
+    startLogic: document.startLogic.length > 0 ? document.startLogic : Prisma.DbNull,
     closeOn: normalizedScheduling.closeOn,
     publishOn: normalizedScheduling.publishOn,
     languages: buildSurveyLanguageUpdate(currentSurvey, languages),
+    ...(customCss ? { customCss: customCss.stored ?? Prisma.DbNull } : {}),
   };
 
   // App-only runtime/distribution settings (display scalars, triggers); also yields the segment
   // targeting write to perform, if any.
   const segmentFilterWrite =
     currentSurvey.type === "app"
-      ? await buildV3AppSurveyPatchWrites({ currentSurvey, document, data })
+      ? await buildV3AppSurveyPatchWrites({
+          currentSurvey,
+          document,
+          data,
+          visibleSurveyWhere,
+          replacesDistribution,
+          transaction,
+        })
       : null;
 
+  // ENG-6934: the license is resolved here, outside the transaction.
+  const syncQuotaMatrix = await prepareV3QuotaMatrixSync(currentSurvey, data.blocks, organizationId);
+
   const runSurveyUpdate = (client: Prisma.TransactionClient) =>
-    client.survey.update({ where: { id: currentSurvey.id }, data, select: selectSurvey });
+    client.survey.update({
+      // ENG-3069: compare-and-set. `updatedAt` is legal in a unique where (extendedWhereUnique), and
+      // Survey's @updatedAt bumps on every writer — so the row matches only if nobody has written
+      // since the caller's read. Two agents editing different blocks can no longer silently
+      // overwrite each other's whole `blocks` array.
+      //
+      // `archivedAt: null` makes the pipeline's archived guard hold for the whole request: that guard
+      // reads the survey once, up front, and this UPDATE carries `status` from the same read — so an
+      // archive landing in between would otherwise be written straight back to `inProgress`.
+      where: {
+        id: currentSurvey.id,
+        archivedAt: null,
+        ...(precondition ? { updatedAt: precondition.expectedUpdatedAt } : {}),
+      },
+      data,
+      // Narrow: the survey this returns would describe the Embedded Data rows before the reconcile
+      // below, so the transaction re-reads through `selectSurvey` after it instead.
+      select: { id: true },
+    });
+
+  // One transaction, always. Two writes have to land with the survey or not at all:
+  //
+  // - Segment filters live on a separate row, so a mid-write failure would leave targeting out of
+  //   step with the survey it belongs to.
+  // - The EmbeddedData rows are the only place `variables` / `hiddenFields` are stored (ENG-2404),
+  //   so a patch that moves them without reconciling the rows would not persist them at all.
+  //
+  // The reconcile therefore runs here rather than after the commit — matching `updateSurveyInternal`
+  // — which is what makes the unconditional transaction necessary: a same-statement fast path can
+  // no longer be correct. Under a caller's transaction (ENG-6845) that transaction is this one.
+  const writeSurvey = async (tx: Prisma.TransactionClient) => {
+    if (segmentFilterWrite) {
+      await setV3SurveySegmentFilters(segmentFilterWrite.segmentId, segmentFilterWrite.filters, tx);
+    }
+
+    await runSurveyUpdate(tx);
+    // ENG-6934: the quotas' matrix conditions follow a row or column reorder, as the blocks' do.
+    await syncQuotaMatrix(tx);
+
+    // ENG-6930: typed Embedded Data, when the request sent it, is the complete set and wins over the
+    // legacy keys (which prepare derived from it). Library entries link the workspace's row, read
+    // inside this transaction so a field deleted since the request was resolved is refused. Complete
+    // by now: prepare filled in every default (`settleV3EmbeddedFieldFormats`). Linked fields a caller
+    // hands in (an Update from a Formbricks file, ENG-6851) come first: they are already resolved.
+    const typedFields = document.embeddedFields as TV3SurveyEmbeddedField[] | undefined;
+    const typedEmbeddedFields =
+      !embeddedFields && typedFields
+        ? toLinkedEmbeddedFields(
+            typedFields,
+            await getV3LibraryFieldIdsByKey(tx, currentSurvey.workspaceId, typedFields)
+          )
+        : undefined;
+    if (typedEmbeddedFields && !typedEmbeddedFields.ok) {
+      throw new V3SurveyEmbeddedFieldsError(typedEmbeddedFields.invalidParams);
+    }
+    const linkedEmbeddedFields = embeddedFields ?? typedEmbeddedFields?.fields;
+
+    // ENG-2412: from the patch document — the rows are the only place Embedded Data is stored
+    // (ENG-2404). Safe on a partial patch for two reasons: `prepareV3SurveyPatchInput` merges the
+    // body over the current survey first, so both keys arrive populated; and
+    // `resolveDesiredEmbeddedFields` carries a group's current rows over untouched if its key is
+    // absent anyway. `workspaceId` comes from the stored survey, never the client (ENG-1749).
+    await reconcileEmbeddedData(tx, {
+      surveyId: currentSurvey.id,
+      workspaceId: currentSurvey.workspaceId,
+      patch: {
+        variables: document.variables,
+        hiddenFields: document.hiddenFields,
+        ...(linkedEmbeddedFields ? { embeddedFields: linkedEmbeddedFields } : {}),
+      },
+    });
+
+    // Re-read AFTER the reconcile. The response's `variables` / `hiddenFields` — and the audit
+    // log's — are derived from the rows at the read seam, so a survey selected before the
+    // reconcile would report the pre-patch fields back to the caller that just changed them.
+    return tx.survey.findUniqueOrThrow({
+      where: { id: currentSurvey.id, workspaceId: currentSurvey.workspaceId },
+      select: selectSurveyWithCustomCss,
+    });
+  };
 
   try {
-    // One transaction, always. Two writes have to land with the survey or not at all:
-    //
-    // - Segment filters live on a separate row, so a mid-write failure would leave targeting out of
-    //   step with the survey it belongs to.
-    // - ENG-1837 made the EmbeddedData tables the read source of truth for definitions, so a patch
-    //   that moves `variables` / `hiddenFields` without reconciling the rows leaves recall, the logic
-    //   engine, export columns and the response filters reading the pre-patch set. This used to be a
-    //   dormant inconsistency (readers used the legacy columns this write does update); it stops
-    //   being dormant the moment the readers point at the rows.
-    //
-    // The reconcile therefore runs here rather than after the commit — matching `updateSurveyInternal`
-    // — which is what makes the unconditional transaction necessary: a same-statement fast path can
-    // no longer be correct.
-    const persistedSurvey = await prisma.$transaction(
-      async (tx) => {
-        if (segmentFilterWrite) {
-          await setV3SurveySegmentFilters(segmentFilterWrite.segmentId, segmentFilterWrite.filters, tx);
-        }
+    const persistedSurvey = transaction
+      ? await writeSurvey(transaction.tx)
+      : await prisma.$transaction(
+          writeSurvey,
+          // Matched to the other reconcile call sites: this transaction rewrites blocks and languages,
+          // adds an indexed read plus a write per changed field, then reads back through
+          // `selectSurvey`'s deep select — enough to approach Prisma's 5s default on a large survey.
+          SURVEY_WRITE_TRANSACTION_OPTIONS
+        );
+    const patchedSurvey = transformPrismaSurvey<TSurvey>(persistedSurvey);
 
-        const survey = await runSurveyUpdate(tx);
+    const finishAfterCommit = async (): Promise<TSurvey> => {
+      // ENG-2064: this route writes blocks directly rather than going through updateSurveyInternal, so
+      // it needs the same feedback-source reconciliation — it is the surface an automation would use to
+      // change a survey's questions. Best-effort; failures log without failing the patch.
+      await scheduleFeedbackSourceReconciliation(
+        currentSurvey.id,
+        currentSurvey.workspaceId,
+        persistedSurvey.blocks
+      );
 
-        // ENG-2412: from the patch document, which is what makes the rows the write source of
-        // truth rather than a copy of the columns `data` just wrote. Safe on a partial patch for two
-        // reasons: `prepareV3SurveyPatchInput` merges the body over the current survey first, so both
-        // keys arrive populated; and `resolveDesiredEmbeddedFields` carries a group's current rows
-        // over untouched if its key is absent anyway. `workspaceId` comes from the stored survey,
-        // never the client (ENG-1749).
-        //
-        // NOTE for whoever moves the v3 serializer onto the tables (ENG-1853): `survey` was read
-        // BEFORE this reconcile, so the `embeddedDataLinks` it carries — and the `embeddedFields`
-        // inlined from them below — describe the PRE-patch rows. Inert today, because
-        // `serializeV3SurveyResource` and the audit log read the legacy columns and nothing else
-        // consumes them (`updateSurveyInternal` has the same shape). The moment the serializer reads
-        // the rows, this returns a stale PATCH/MCP response and needs a re-read after the reconcile.
-        await reconcileEmbeddedData(tx, {
-          surveyId: currentSurvey.id,
-          workspaceId: currentSurvey.workspaceId,
-          patch: { variables: document.variables, hiddenFields: document.hiddenFields },
-        });
+      if (customCss) {
+        await invalidateCustomCssCaches(currentSurvey.workspaceId);
+      }
 
-        return survey;
-      },
-      // Matched to the other reconcile call sites: this transaction rewrites blocks and languages,
-      // reads back through `selectSurvey`'s deep select, and now adds an indexed read plus a write
-      // per changed field — enough to approach Prisma's 5s default on a large survey.
-      { timeout: 20_000, maxWait: 10_000 }
-    );
+      return await reconcilePersistedV3SurveyPatch({
+        survey: patchedSurvey,
+        workspaceId: currentSurvey.workspaceId,
+      });
+    };
 
-    // ENG-2064: this route writes blocks directly rather than going through updateSurveyInternal, so
-    // it needs the same feedback-source reconciliation — it is the surface an automation would use to
-    // change a survey's questions. Best-effort; failures log without failing the patch.
-    await scheduleFeedbackSourceReconciliation(
-      currentSurvey.id,
-      currentSurvey.workspaceId,
-      persistedSurvey.blocks
-    );
+    if (transaction) {
+      transaction.afterCommit(finishAfterCommit);
+      return patchedSurvey;
+    }
 
-    return await reconcilePersistedV3SurveyPatch({
-      survey: transformPrismaSurvey<TSurvey>(persistedSurvey),
-      workspaceId: currentSurvey.workspaceId,
-    });
+    return await finishAfterCommit();
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      // Only the survey UPDATE can raise a P2025 here: the segment write wraps its own, the
+      // reconcile and trigger writes are `*Many`/`create`, and the re-read runs inside the
+      // transaction that just updated the row, so it cannot miss.
+      if (error.code === "P2025") {
+        throw await resolveUpdateMiss(currentSurvey, precondition, error);
+      }
       throw new DatabaseError(error.message);
     }
 
@@ -318,16 +588,139 @@ export async function executeV3SurveyPatch(params: {
   }
 }
 
+/**
+ * ENG-6934: the step that makes the quotas' matrix conditions follow a row or column reorder, run
+ * inside the patch's transaction. Only where quotas are licensed, as every other quota write is, and
+ * only when the blocks hold a matrix (the license is not read otherwise); else a step that does nothing.
+ */
+async function prepareV3QuotaMatrixSync(
+  currentSurvey: TSurvey,
+  blocks: Prisma.SurveyUpdateInput["blocks"],
+  organizationId: string | undefined
+): Promise<(tx: Prisma.TransactionClient) => Promise<void>> {
+  const skip = async () => {};
+  if (!Array.isArray(blocks) || !hasMatrixElement(blocks)) return skip;
+  if (!(await getIsV3QuotasEnabled(currentSurvey.workspaceId, organizationId))) return skip;
+  const matrixBlocks: readonly unknown[] = blocks;
+  return (tx) => syncQuotaMatrixConditions(tx, currentSurvey.id, matrixBlocks);
+}
+
+/** Whether the survey's organization is licensed for quotas; a workspace with none is not. */
+async function getIsV3QuotasEnabled(workspaceId: string, organizationId: string | undefined) {
+  const resolvedOrganizationId = organizationId ?? (await getOrganizationByWorkspaceId(workspaceId))?.id;
+  return resolvedOrganizationId ? getIsQuotasEnabled(resolvedOrganizationId) : false;
+}
+
+/**
+ * ENG-3641: survey CSS through the shared custom CSS service. The merged document carries the stored
+ * source when the patch omits `customCss`, so an unrelated patch is `unchanged` — no plan check, no
+ * processing, no write — and only a real addition or edit needs Scale and spends the caller's custom
+ * CSS budget. Removal needs neither.
+ */
+async function resolveV3SurveyPatchCustomCss(
+  currentSurvey: TSurvey,
+  document: TV3SurveyDocument,
+  organizationId: string | undefined,
+  principal: string | null | undefined
+) {
+  const outcome = await resolveCustomCssWrite({
+    scope: "survey",
+    organizationId:
+      organizationId ??
+      (async () => {
+        const organization = await getOrganizationByWorkspaceId(currentSurvey.workspaceId);
+        if (!organization) {
+          throw new V3SurveyWritePermissionError(
+            `Unable to verify custom CSS permissions for workspaceId: ${currentSurvey.workspaceId}`
+          );
+        }
+        return organization.id;
+      }),
+    existing: currentSurvey.customCss,
+    input: document.customCss ?? null,
+    principal,
+  });
+
+  if (!outcome.ok) {
+    throw toV3CustomCssError(outcome);
+  }
+
+  return outcome;
+}
+
+function toV3SurveyPreparationError(
+  origin: "request" | "storedSurvey" | "embeddedFields" | undefined,
+  invalidParams: InvalidParam[]
+): Error {
+  if (origin === "storedSurvey") return new V3SurveyStoredDocumentError(invalidParams);
+  if (origin === "embeddedFields") return new V3SurveyEmbeddedFieldsError(invalidParams);
+  return new V3SurveyReferenceValidationError(invalidParams);
+}
+
+export interface TPatchV3SurveyOptions {
+  requestId?: string;
+  organizationId?: string;
+  /** The `updatedAt` the write is made against; without one, the body's round-tripped `updatedAt`. */
+  precondition?: TV3SurveyWritePrecondition;
+  reportedVisibility?: TV3SurveyReportedVisibility;
+  /** The surveys the caller may name in targeting (ENG-3282). None when omitted. */
+  visibleSurveyWhere?: Prisma.SurveyWhereInput;
+  /** Filled with the custom CSS warnings when the patch changed the survey's custom CSS. */
+  report?: TV3SurveyWriteReport;
+  /** Who processing an added or edited `customCss` is charged to (`getV3CustomCssPrincipal`). */
+  customCssPrincipal?: string | null;
+  /**
+   * A transaction the caller opened, so the patch lands with the caller's own writes or not at all
+   * (ENG-6851: an Update from a Formbricks file writes the survey's references in it). See
+   * `executeV3SurveyPatch`.
+   */
+  transaction?: TSurveyWriteTransaction;
+  /**
+   * The survey's hidden fields and variables with some linked to the workspace's library, in place of
+   * the local fields the patch's `variables` and `hiddenFields` would make of them: what an Update
+   * from a Formbricks file writes for the shared fields it brings, as its create does. Each linked
+   * field is checked against the library before anything is written.
+   */
+  embeddedFields?: TLinkedEmbeddedField[];
+}
+
 export async function patchV3Survey(
   currentSurvey: TSurvey,
   input: unknown,
-  requestId?: string,
-  organizationId?: string
+  {
+    requestId,
+    organizationId,
+    precondition,
+    reportedVisibility,
+    visibleSurveyWhere = NO_VISIBLE_SURVEYS,
+    report,
+    customCssPrincipal,
+    transaction,
+    embeddedFields,
+  }: TPatchV3SurveyOptions = {}
 ): Promise<TSurvey> {
-  const preparation = prepareV3SurveyPatchInput(currentSurvey, input);
-  if (!preparation.ok) {
-    throw new V3SurveyReferenceValidationError(preparation.validation.invalidParams);
+  // ENG-6930: library fields linked by key get the library's definition before anything is judged.
+  const resolved = await resolveV3EmbeddedFieldLibraryKeys(
+    currentSurvey.workspaceId,
+    input,
+    currentSurvey.embeddedFields
+  );
+  if (!resolved.ok) {
+    throw new V3SurveyEmbeddedFieldsError(resolved.invalidParams);
   }
+
+  const preparation = prepareV3SurveyPatchInput(currentSurvey, resolved.input, { reportedVisibility });
+  if (!preparation.ok) {
+    throw toV3SurveyPreparationError(preparation.origin, preparation.validation.invalidParams);
+  }
+
+  // Two ways in: the block endpoints pass `expectedUpdatedAt` explicitly, while a PATCH caller
+  // round-tripping GET output gets it from the body's `updatedAt` via prepare. An explicit one wins.
+  const effectivePrecondition = precondition ?? preparation.precondition;
+
+  // Cheap pre-flight so a stale caller gets an accurate 409 without a write attempt. The
+  // compare-and-set below remains the actual guarantee — this only improves the error.
+  assertV3SurveyPrecondition(currentSurvey, effectivePrecondition);
 
   await assertV3SurveyWritePermissions(
     {
@@ -343,11 +736,30 @@ export async function patchV3Survey(
   );
 
   await assertV3SurveyTargetingWritePermission(currentSurvey, preparation.document, organizationId);
+  const customCss = await resolveV3SurveyPatchCustomCss(
+    currentSurvey,
+    preparation.document,
+    organizationId,
+    customCssPrincipal
+  );
 
-  return await executeV3SurveyPatch({
+  const survey = await executeV3SurveyPatch({
     currentSurvey,
     document: preparation.document,
     languageRequests: preparation.languageRequests,
     requestId,
+    precondition: effectivePrecondition,
+    visibleSurveyWhere,
+    ...(customCss.changed ? { customCss: { stored: customCss.stored } } : {}),
+    replacesDistribution: typeof input === "object" && input !== null && "distribution" in input,
+    organizationId,
+    embeddedFields,
+    transaction,
   });
+
+  if (report && customCss.changed) {
+    report.customCssWarnings = customCss.warnings;
+  }
+
+  return survey;
 }

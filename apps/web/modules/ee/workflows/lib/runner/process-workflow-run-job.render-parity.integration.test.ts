@@ -213,12 +213,16 @@ const makeRun = (definition = makeDefinition(), overrides: Record<string, unknow
   attempt: 0,
   triggerPayload,
   workflowVersion: { definition },
-  workflow: { definition },
+  // A real run row carries its workflow's creator, who the email's rate limits count (ENG-3823).
+  workflow: { definition, createdBy: "cm9zr4wcr000108l8creator1" },
   ...overrides,
 });
 
 // Real survey shape consumed by getElementResponseMapping (blocks -> elements) with localized headlines.
 const survey = {
+  visibility: "workspace",
+  visibilityVersion: 0,
+  visibilityProjectedVersion: 0,
   id: SURVEY_ID,
   workspaceId: WORKSPACE_ID,
   languages: [],

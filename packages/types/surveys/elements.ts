@@ -3,6 +3,7 @@ import { ZStorageUrl, isSafeLinkUrl } from "../common";
 import { ZI18nString } from "../i18n";
 import { ZAllowedFileExtension } from "../storage";
 import { TSurveyElementTypeEnum } from "./constants";
+import { ZConditionGroup } from "./logic";
 import { FORBIDDEN_IDS } from "./validation";
 import { ZValidationRules } from "./validation-rules";
 
@@ -62,22 +63,45 @@ export const ZSurveyElementBase = z.object({
   headline: ZI18nString,
   subheader: ZI18nString.optional(),
   imageUrl: ZStorageUrl.optional(),
+  // Text alternative for `imageUrl`. Empty or absent renders `alt=""` (decorative); never derived from the
+  // file name, which can carry personal data.
+  imageAltText: ZI18nString.optional(),
   videoUrl: ZStorageUrl.optional(),
   required: z.boolean(),
   scale: z.enum(["number", "smiley", "star"]).optional(),
   range: z.union([z.literal(5), z.literal(3), z.literal(4), z.literal(7), z.literal(10)]).optional(),
   isDraft: z.boolean().optional(),
+  /**
+   * Show-if (ENG-6931): the element is shown only when this condition group matches, re-evaluated
+   * live as answers above it on the same page change. It may use earlier blocks plus elements above
+   * it in the same block. Absent, or an empty group, means always shown.
+   */
+  showIf: ZConditionGroup.optional(),
+});
+
+/**
+ * The code an exported file, webhook, prefill and start-at link use instead of the Question ID
+ * (ADR 0021). Optional on purpose: surveys stored before codes existed have none and must keep
+ * loading. The character rules live in `./codes` and run from `surveyRefinement`, not here, so a
+ * stored survey with a bad code is reported rather than made unreadable.
+ */
+export const ZElementCode = z.string().optional();
+
+// Every element that can be answered. CTA has no answer and therefore no code, so it extends
+// `ZSurveyElementBase` directly.
+export const ZSurveyQuestionElementBase = ZSurveyElementBase.extend({
+  code: ZElementCode,
 });
 
 // OpenText Element
 export const ZSurveyOpenTextElementInputType = z.enum(["text", "email", "url", "number", "phone"]);
 export type TSurveyOpenTextElementInputType = z.infer<typeof ZSurveyOpenTextElementInputType>;
 
-export const ZSurveyOpenTextElement = ZSurveyElementBase.extend({
+export const ZSurveyOpenTextElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.OpenText),
   placeholder: ZI18nString.optional(),
   longAnswer: z.boolean().optional(),
-  inputType: ZSurveyOpenTextElementInputType.optional().prefault("text"),
+  inputType: ZSurveyOpenTextElementInputType.prefault("text"),
   insightsEnabled: z.boolean().prefault(false).optional(),
   charLimit: z
     .object({
@@ -120,7 +144,7 @@ export const ZSurveyOpenTextElement = ZSurveyElementBase.extend({
 export type TSurveyOpenTextElement = z.infer<typeof ZSurveyOpenTextElement>;
 
 // Consent Element
-export const ZSurveyConsentElement = ZSurveyElementBase.extend({
+export const ZSurveyConsentElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.Consent),
   label: ZI18nString,
   validation: ZValidation.optional(),
@@ -128,10 +152,27 @@ export const ZSurveyConsentElement = ZSurveyElementBase.extend({
 
 export type TSurveyConsentElement = z.infer<typeof ZSurveyConsentElement>;
 
+/**
+ * Option show-if and Hidden (ENG-6937, json-shapes §2), on every item a respondent picks from: the
+ * choices of single select, multi select and ranking, picture choices, and matrix rows and columns.
+ *
+ * - `showIf`: the item is shown only when this group matches, re-evaluated live. It may use what its
+ *   element's show-if may use: earlier blocks plus elements above the element on its block.
+ * - `hidden: true` retires the item on a live survey instead of deleting it (P1, P9). It wins over
+ *   `showIf`: the item is never shown and is recorded as not shown, but keeps its id, answer code and
+ *   earlier answers. Both stay allowed on published surveys (ADR 0020).
+ */
+export const ZOptionVisibility = {
+  showIf: ZConditionGroup.optional(),
+  hidden: z.boolean().optional(),
+};
+
 // Multiple Choice Elements
 export const ZSurveyElementChoice = z.object({
   id: z.string(),
   label: ZI18nString,
+  code: ZElementCode,
+  ...ZOptionVisibility,
 });
 
 export type TSurveyElementChoice = z.infer<typeof ZSurveyElementChoice>;
@@ -145,27 +186,56 @@ export const ZShuffleOption = z.enum([
 ]);
 export type TShuffleOption = z.infer<typeof ZShuffleOption>;
 
-export const ZMultipleChoiceOptionDisplayType = z.enum(["list", "dropdown"]);
+const emptyStringAsUnset = (value: unknown): unknown => (value === "" ? undefined : value);
+
+/**
+ * `shuffleOption` as it must be read back from storage.
+ *
+ * Surveys exist that hold the empty string here — Radix renders `value=""` as an unset dropdown, so
+ * the element looks fine in the editor while publishing fails on it. `prefault` heals only
+ * `undefined`, so the empty string is normalised away before the enum sees it (ENG-2833). Any other
+ * out-of-enum value still fails, and now reports at this field rather than at the whole element.
+ *
+ * The trailing `.optional()` / `.prefault()` are what keep the key optional on the element: a
+ * preprocess step takes `unknown`, so without them Zod would make `shuffleOption` a required key.
+ */
+export const ZStoredShuffleOption = z.preprocess(emptyStringAsUnset, ZShuffleOption.optional()).optional();
+export const ZStoredShuffleOptionWithDefault = z
+  .preprocess(emptyStringAsUnset, ZShuffleOption.prefault("none"))
+  .prefault("none");
+
+// "row" is a list laid out side by side, for short choices such as Yes / No.
+export const ZMultipleChoiceOptionDisplayType = z.enum(["list", "row", "dropdown"]);
 export type TMultipleChoiceOptionDisplayType = z.infer<typeof ZMultipleChoiceOptionDisplayType>;
 
+/**
+ * Copied options (ENG-6938, json-shapes §3): the id of the earlier question whose options this one
+ * copies. Copied options keep the source's option ids and answer codes, and each carries an ordinary
+ * show-if "picked in the source". Choices copy from choices (single select, multi select, ranking),
+ * pictures from pictures. The validator checks the source exists, comes earlier and is compatible.
+ */
+export const ZOptionsCopiedFrom = z.string().optional();
+
 // Multiple Choice Single Element
-export const ZSurveyMultipleChoiceSingleElement = ZSurveyElementBase.extend({
+export const ZSurveyMultipleChoiceSingleElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.MultipleChoiceSingle),
+  optionsCopiedFrom: ZOptionsCopiedFrom,
   choices: z.array(ZSurveyElementChoice).min(2, {
     error: "Multiple Choice Element must have at least two choices",
   }),
-  shuffleOption: ZShuffleOption.optional(),
+  shuffleOption: ZStoredShuffleOption,
   otherOptionPlaceholder: ZI18nString.optional(),
   displayType: ZMultipleChoiceOptionDisplayType.optional(),
 });
 
 // Multiple Choice Multi Element
-export const ZSurveyMultipleChoiceMultiElement = ZSurveyElementBase.extend({
+export const ZSurveyMultipleChoiceMultiElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.MultipleChoiceMulti),
+  optionsCopiedFrom: ZOptionsCopiedFrom,
   choices: z.array(ZSurveyElementChoice).min(2, {
     error: "Multiple Choice Element must have at least two choices",
   }),
-  shuffleOption: ZShuffleOption.optional(),
+  shuffleOption: ZStoredShuffleOption,
   otherOptionPlaceholder: ZI18nString.optional(),
   validation: ZValidation.optional(),
   displayType: ZMultipleChoiceOptionDisplayType.optional(),
@@ -180,11 +250,11 @@ export const ZSurveyMultipleChoiceElement = z.union([
 export type TSurveyMultipleChoiceElement = z.infer<typeof ZSurveyMultipleChoiceElement>;
 
 // NPS Element
-export const ZSurveyNPSElement = ZSurveyElementBase.extend({
+export const ZSurveyNPSElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.NPS),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 export type TSurveyNPSElement = z.infer<typeof ZSurveyNPSElement>;
@@ -192,7 +262,7 @@ export type TSurveyNPSElement = z.infer<typeof ZSurveyNPSElement>;
 // CTA Element
 export const ZSurveyCTAElement = ZSurveyElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.CTA),
-  buttonExternal: z.boolean().optional().prefault(false),
+  buttonExternal: z.boolean().prefault(false),
   buttonUrl: z.string().optional(),
   ctaButtonLabel: ZI18nString.optional(),
 }).superRefine((data, ctx) => {
@@ -229,13 +299,13 @@ export const ZSurveyCTAElement = ZSurveyElementBase.extend({
 export type TSurveyCTAElement = z.infer<typeof ZSurveyCTAElement>;
 
 // Rating Element
-export const ZSurveyRatingElement = ZSurveyElementBase.extend({
+export const ZSurveyRatingElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.Rating),
   scale: z.enum(["number", "smiley", "star"]),
   range: z.union([z.literal(5), z.literal(3), z.literal(4), z.literal(6), z.literal(7), z.literal(10)]),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 export type TSurveyRatingElement = z.infer<typeof ZSurveyRatingElement>;
@@ -243,14 +313,18 @@ export type TSurveyRatingElement = z.infer<typeof ZSurveyRatingElement>;
 // Picture Selection Element
 export const ZSurveyPictureChoice = z.object({
   id: z.string(),
+  code: ZElementCode,
   imageUrl: ZStorageUrl,
+  imageAltText: ZI18nString.optional(),
+  ...ZOptionVisibility,
 });
 
 export type TSurveyPictureChoice = z.infer<typeof ZSurveyPictureChoice>;
 
-export const ZSurveyPictureSelectionElement = ZSurveyElementBase.extend({
+export const ZSurveyPictureSelectionElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.PictureSelection),
-  allowMulti: z.boolean().optional().prefault(false),
+  optionsCopiedFrom: ZOptionsCopiedFrom,
+  allowMulti: z.boolean().prefault(false),
   choices: z.array(ZSurveyPictureChoice).min(2, {
     error: "Picture Selection element must have a minimum of 2 choices",
   }),
@@ -260,7 +334,7 @@ export const ZSurveyPictureSelectionElement = ZSurveyElementBase.extend({
 export type TSurveyPictureSelectionElement = z.infer<typeof ZSurveyPictureSelectionElement>;
 
 // Date Element
-export const ZSurveyDateElement = ZSurveyElementBase.extend({
+export const ZSurveyDateElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.Date),
   html: ZI18nString.optional(),
   format: z.enum(["M-d-y", "d-M-y", "y-M-d"]),
@@ -270,7 +344,7 @@ export const ZSurveyDateElement = ZSurveyElementBase.extend({
 export type TSurveyDateElement = z.infer<typeof ZSurveyDateElement>;
 
 // File Upload Element
-export const ZSurveyFileUploadElement = ZSurveyElementBase.extend({
+export const ZSurveyFileUploadElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.FileUpload),
   allowMultipleFiles: z.boolean(),
   maxSizeInMB: z.number().optional(),
@@ -280,8 +354,16 @@ export const ZSurveyFileUploadElement = ZSurveyElementBase.extend({
 
 export type TSurveyFileUploadElement = z.infer<typeof ZSurveyFileUploadElement>;
 
+// Signature Element
+export const ZSurveySignatureElement = ZSurveyQuestionElementBase.extend({
+  type: z.literal(TSurveyElementTypeEnum.Signature),
+  allowTypedSignature: z.boolean().prefault(true),
+});
+
+export type TSurveySignatureElement = z.infer<typeof ZSurveySignatureElement>;
+
 // Cal Element
-export const ZSurveyCalElement = ZSurveyElementBase.extend({
+export const ZSurveyCalElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.Cal),
   calUserName: z.string().min(1, {
     error: "Cal user name is required",
@@ -295,15 +377,17 @@ export type TSurveyCalElement = z.infer<typeof ZSurveyCalElement>;
 export const ZSurveyMatrixElementChoice = z.object({
   id: z.string(),
   label: ZI18nString,
+  code: ZElementCode,
+  ...ZOptionVisibility,
 });
 
 export type TSurveyMatrixElementChoice = z.infer<typeof ZSurveyMatrixElementChoice>;
 
-export const ZSurveyMatrixElement = ZSurveyElementBase.extend({
+export const ZSurveyMatrixElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.Matrix),
   rows: z.array(ZSurveyMatrixElementChoice),
   columns: z.array(ZSurveyMatrixElementChoice),
-  shuffleOption: ZShuffleOption.optional().prefault("none"),
+  shuffleOption: ZStoredShuffleOptionWithDefault,
   validation: ZValidation.optional(),
 });
 
@@ -318,7 +402,7 @@ const ZToggleInputConfig = z.object({
 
 export type TInputFieldConfig = z.infer<typeof ZToggleInputConfig>;
 
-export const ZSurveyAddressElement = ZSurveyElementBase.extend({
+export const ZSurveyAddressElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.Address),
   addressLine1: ZToggleInputConfig,
   addressLine2: ZToggleInputConfig,
@@ -332,8 +416,9 @@ export const ZSurveyAddressElement = ZSurveyElementBase.extend({
 export type TSurveyAddressElement = z.infer<typeof ZSurveyAddressElement>;
 
 // Ranking Element
-export const ZSurveyRankingElement = ZSurveyElementBase.extend({
+export const ZSurveyRankingElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.Ranking),
+  optionsCopiedFrom: ZOptionsCopiedFrom,
   choices: z
     .array(ZSurveyElementChoice)
     .min(2, {
@@ -343,14 +428,14 @@ export const ZSurveyRankingElement = ZSurveyElementBase.extend({
       error: "Ranking Element can have at most 25 options",
     }),
   otherOptionPlaceholder: ZI18nString.optional(),
-  shuffleOption: ZShuffleOption.optional(),
+  shuffleOption: ZStoredShuffleOption,
   validation: ZValidation.optional(),
 });
 
 export type TSurveyRankingElement = z.infer<typeof ZSurveyRankingElement>;
 
 // Contact Info Element
-export const ZSurveyContactInfoElement = ZSurveyElementBase.extend({
+export const ZSurveyContactInfoElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.ContactInfo),
   firstName: ZToggleInputConfig,
   lastName: ZToggleInputConfig,
@@ -363,31 +448,35 @@ export const ZSurveyContactInfoElement = ZSurveyElementBase.extend({
 export type TSurveyContactInfoElement = z.infer<typeof ZSurveyContactInfoElement>;
 
 // CSAT Element
-export const ZSurveyCsatElement = ZSurveyElementBase.extend({
+export const ZSurveyCsatElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.CSAT),
   scale: z.enum(["number", "smiley", "star"]),
   range: z.literal(5),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 export type TSurveyCsatElement = z.infer<typeof ZSurveyCsatElement>;
 
 // CES Element
-export const ZSurveyCesElement = ZSurveyElementBase.extend({
+export const ZSurveyCesElement = ZSurveyQuestionElementBase.extend({
   type: z.literal(TSurveyElementTypeEnum.CES),
   scale: z.enum(["number", "smiley", "star"]),
   range: z.union([z.literal(5), z.literal(7)]),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 export type TSurveyCesElement = z.infer<typeof ZSurveyCesElement>;
 
-// Union of all element types
-export const ZSurveyElement = z.union([
+// Union of all element types.
+// Discriminated on `type` on purpose: a plain `z.union` reports a single `invalid_union` issue at the
+// element's own path with the bare default message "Invalid input", hiding which field actually failed.
+// Discriminating picks the one member that matches and surfaces its inner issue path (e.g.
+// `blocks.0.elements.0.rows.1.label.de`), which is what the editor needs to name the broken field.
+export const ZSurveyElement = z.discriminatedUnion("type", [
   ZSurveyOpenTextElement,
   ZSurveyConsentElement,
   ZSurveyMultipleChoiceSingleElement,
@@ -405,6 +494,7 @@ export const ZSurveyElement = z.union([
   ZSurveyContactInfoElement,
   ZSurveyCsatElement,
   ZSurveyCesElement,
+  ZSurveySignatureElement,
 ]);
 
 export type TSurveyElement = z.infer<typeof ZSurveyElement>;

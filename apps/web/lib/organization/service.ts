@@ -25,7 +25,10 @@ import { updateUser } from "@/lib/user/service";
 import { getBillingUsageCycleWindow } from "@/lib/utils/billing";
 import { getWorkspaces } from "@/lib/workspace/service";
 import { cleanupStripeCustomer } from "@/modules/ee/billing/lib/organization-billing";
+import { requestEmailAuditErasureRequired } from "@/modules/email/lib/email-audit-maintenance";
 import { deleteHubTenantData } from "@/modules/hub/service";
+import { countOrganizationResponses } from "@/modules/organization/usage/lib/response-count";
+import { deleteWorkspaceFilesBestEffort } from "@/modules/storage/service";
 import { validateInputs } from "../utils/validate";
 
 export const select = {
@@ -184,6 +187,11 @@ export const createOrganization = async (
       select,
     });
 
+    logger.warn(
+      { securityEvent: "organization.created", organizationId: organization.id },
+      "Organization created"
+    );
+
     return mapOrganization(organization);
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
@@ -280,46 +288,57 @@ export const updateOrganization = async (
 export const deleteOrganization = async (organizationId: string) => {
   validateInputs([organizationId, ZId]);
   try {
-    const deletedOrganization = await prisma.organization.delete({
-      where: {
-        id: organizationId,
+    const deletedOrganization = await prisma.$transaction(
+      async (tx) => {
+        await requestEmailAuditErasureRequired({ organizationId }, tx);
+        return tx.organization.delete({
+          where: {
+            id: organizationId,
+          },
+          select: {
+            id: true,
+            name: true,
+            billing: {
+              select: {
+                stripeCustomerId: true,
+              },
+            },
+            memberships: {
+              select: {
+                userId: true,
+              },
+            },
+            // legacyEnvironmentId is selected off the *deleted* rows so both storage prefixes are
+            // captured atomically, before the cascade takes the workspace rows with it. Reading them
+            // back afterwards is not possible, which is why getWorkspaceLegacyStoragePrefixes cannot
+            // be used here.
+            workspaces: {
+              select: {
+                id: true,
+                legacyEnvironmentId: true,
+              },
+            },
+            teams: {
+              select: {
+                id: true,
+              },
+            },
+            apiKeys: {
+              select: {
+                id: true,
+              },
+            },
+            feedbackDirectories: {
+              select: {
+                id: true,
+                workspaces: { select: { workspaceId: true } },
+              },
+            },
+          },
+        });
       },
-      select: {
-        id: true,
-        name: true,
-        billing: {
-          select: {
-            stripeCustomerId: true,
-          },
-        },
-        memberships: {
-          select: {
-            userId: true,
-          },
-        },
-        workspaces: {
-          select: {
-            id: true,
-          },
-        },
-        teams: {
-          select: {
-            id: true,
-          },
-        },
-        apiKeys: {
-          select: {
-            id: true,
-          },
-        },
-        feedbackDirectories: {
-          select: {
-            id: true,
-            workspaces: { select: { workspaceId: true } },
-          },
-        },
-      },
-    });
+      { timeout: 60_000 }
+    );
 
     await runPostCommitProjection("organization_delete_relationship_cleanup", () =>
       deleteOrganizationRelationships(organizationId)
@@ -358,6 +377,13 @@ export const deleteOrganization = async (organizationId: string) => {
     for (const directory of deletedOrganization.feedbackDirectories) {
       await deleteHubTenantData(directory.id);
     }
+
+    // Best-effort: remove each workspace's uploaded files (survey media, logos, response
+    // attachments). The cascade has already dropped every row that referenced them, so leaving
+    // them behind orphans respondent data in the bucket with nothing left to enumerate it by.
+    for (const workspace of deletedOrganization.workspaces) {
+      await deleteWorkspaceFilesBestEffort(workspace);
+    }
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
       throw new DatabaseError(error.message);
@@ -379,25 +405,10 @@ export const getMonthlyOrganizationResponseCount = reactCache(
 
       const usageCycleWindow = getBillingUsageCycleWindow(organization.billing);
 
-      // Get all workspace IDs for the organization
-      const workspaces = await getWorkspaces(organizationId);
-      const workspaceIds = workspaces.map((workspace) => workspace.id);
-
-      // Use Prisma's aggregate to count responses for all workspaces
-      const responseAggregations = await prisma.response.aggregate({
-        _count: {
-          id: true,
-        },
-        where: {
-          AND: [
-            { survey: { workspaceId: { in: workspaceIds } } },
-            { createdAt: { gte: usageCycleWindow.start, lt: usageCycleWindow.end } },
-          ],
-        },
+      return await countOrganizationResponses(organizationId, {
+        gte: usageCycleWindow.start,
+        lt: usageCycleWindow.end,
       });
-
-      // The result is an aggregation of the total count
-      return responseAggregations._count.id;
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError) {
         throw new DatabaseError(error.message);

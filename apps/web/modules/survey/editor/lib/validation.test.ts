@@ -24,13 +24,13 @@ import {
   TSurveyLanguage,
   TSurveyRedirectUrlCard,
   TSurveyWelcomeCard,
+  ZSurvey,
 } from "@formbricks/types/surveys/types";
 import {
   TValidateIdErrorCode,
   validateCardFieldsForAllLanguages,
   validateQuestionLabels,
 } from "@formbricks/types/surveys/validation";
-import { isAppSurveyMissingTriggersToPublish } from "@/lib/survey/utils";
 import { checkForEmptyFallBackValue } from "@/lib/utils/recall";
 import * as validation from "./validation";
 
@@ -421,6 +421,30 @@ describe("validation.isEndingCardValid", () => {
     expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(true);
   });
 
+  test("requires every language for image alt text once the default has text", () => {
+    const card: TSurveyEndScreenCard = {
+      ...baseEndScreenCard,
+      imageUrl: "https://example.com/img.jpg",
+      imageAltText: { default: "Team photo", en: "Team photo", de: "" },
+    };
+    expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(false);
+    expect(
+      validation.isEndingCardValid(
+        { ...card, imageAltText: { default: "Team photo", en: "Team photo", de: "Teamfoto" } },
+        surveyLanguagesEnabled
+      )
+    ).toBe(true);
+  });
+
+  test("accepts an empty image alt text without translations (decorative image)", () => {
+    const card: TSurveyEndScreenCard = {
+      ...baseEndScreenCard,
+      imageUrl: "https://example.com/img.jpg",
+      imageAltText: { default: "" },
+    };
+    expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(true);
+  });
+
   test("should return false for endScreen card if headline is invalid", () => {
     const card = { ...baseEndScreenCard, headline: { default: "Thank You", en: "Thank You", de: "" } };
     expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(false);
@@ -458,11 +482,34 @@ describe("validation.isEndingCardValid", () => {
     expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(true);
   });
 
+  test("should return true for endScreen card with a mailto: button link", () => {
+    const card: TSurveyEndScreenCard = {
+      ...baseEndScreenCard,
+      buttonLabel: { default: "Go", en: "Go", de: "Los" },
+      buttonLink: "mailto:hello@example.com",
+    };
+    expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(true);
+  });
+
+  test("should return false for endScreen card with a javascript: button link", () => {
+    const card: TSurveyEndScreenCard = {
+      ...baseEndScreenCard,
+      buttonLabel: { default: "Go", en: "Go", de: "Los" },
+      buttonLink: "javascript:alert(1)",
+    };
+    expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(false);
+  });
+
+  test("should return false for a redirectToUrl card with a mailto: url", () => {
+    const card: TSurveyRedirectUrlCard = { ...baseRedirectUrlCard, url: "mailto:hello@example.com" };
+    expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(false);
+  });
+
   test("should return true for endScreen card with dynamic URL containing recall", () => {
     const card: TSurveyEndScreenCard = {
       ...baseEndScreenCard,
       buttonLabel: { default: "Go", en: "Go", de: "Los" },
-      buttonLink: "https://#recall:test123/fallback:example.com",
+      buttonLink: "https://#recall:test123/fallback:example.com#",
     };
     expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(true);
   });
@@ -483,7 +530,7 @@ describe("validation.isEndingCardValid", () => {
   });
 
   test("should return true for redirectUrl card with dynamic URL containing recall", () => {
-    const card = { ...baseRedirectUrlCard, url: "https://#recall:test123/fallback:example.com" };
+    const card = { ...baseRedirectUrlCard, url: "https://#recall:test123/fallback:example.com#" };
     expect(validation.isEndingCardValid(card, surveyLanguagesEnabled)).toBe(true);
   });
 
@@ -660,6 +707,38 @@ describe("validation.validateElement", () => {
       const q = {
         ...pictureSelectionElementBase,
         choices: [],
+      };
+      expect(validation.validateElement(q, surveyLanguagesEnabled)).toBe(false);
+    });
+
+    test("requires every language for a choice's image alt text once the default has text", () => {
+      const withAlt = (de: string) => ({
+        ...pictureSelectionElementBase,
+        choices: [
+          { ...pictureSelectionElementBase.choices[0], imageAltText: { default: "Cat", en: "Cat", de } },
+          pictureSelectionElementBase.choices[1],
+        ],
+      });
+      expect(validation.validateElement(withAlt(""), surveyLanguagesEnabled)).toBe(false);
+      expect(validation.validateElement(withAlt("Katze"), surveyLanguagesEnabled)).toBe(true);
+    });
+
+    test("accepts empty choice alt text without translations (decorative image)", () => {
+      const q = {
+        ...pictureSelectionElementBase,
+        choices: pictureSelectionElementBase.choices.map((choice) => ({
+          ...choice,
+          imageAltText: { default: "" },
+        })),
+      };
+      expect(validation.validateElement(q, surveyLanguagesEnabled)).toBe(true);
+    });
+
+    test("requires every language for the question image's alt text once the default has text", () => {
+      const q = {
+        ...pictureSelectionElementBase,
+        imageUrl: "https://example.com/hero.jpg",
+        imageAltText: { default: "Hero", en: "Hero", de: "" },
       };
       expect(validation.validateElement(q, surveyLanguagesEnabled)).toBe(false);
     });
@@ -1305,9 +1384,6 @@ describe("validation.isSurveyValid", () => {
 
 describe("validation.getValidateIdErrorMessage", () => {
   const mockT: TFunction = ((key: string, params?: Record<string, string>) => {
-    // Simulate localized entity labels
-    if (key === "common.hidden_field") return "Hidden field";
-    if (key === "workspace.surveys.edit.question") return "Question";
     if (!params) return key;
     return Object.entries(params).reduce((str, [k, v]) => str.replace(`{${k}}`, v), key);
   }) as TFunction;
@@ -1315,7 +1391,6 @@ describe("validation.getValidateIdErrorMessage", () => {
   test("returns translated message for Empty error code", () => {
     const result = validation.getValidateIdErrorMessage(
       { code: TValidateIdErrorCode.Empty, field: "" },
-      "hiddenField",
       mockT
     );
     expect(result).toContain("validate_id_empty");
@@ -1324,7 +1399,6 @@ describe("validation.getValidateIdErrorMessage", () => {
   test("returns translated message for Duplicate error code", () => {
     const result = validation.getValidateIdErrorMessage(
       { code: TValidateIdErrorCode.Duplicate, field: "test" },
-      "question",
       mockT
     );
     expect(result).toContain("validate_id_duplicate");
@@ -1333,7 +1407,6 @@ describe("validation.getValidateIdErrorMessage", () => {
   test("returns translated message for Reserved error code with field name", () => {
     const result = validation.getValidateIdErrorMessage(
       { code: TValidateIdErrorCode.Reserved, field: "userId" },
-      "hiddenField",
       mockT
     );
     expect(result).toContain("validate_id_reserved");
@@ -1342,7 +1415,6 @@ describe("validation.getValidateIdErrorMessage", () => {
   test("returns translated message for HasSpaces error code", () => {
     const result = validation.getValidateIdErrorMessage(
       { code: TValidateIdErrorCode.HasSpaces, field: "my field" },
-      "hiddenField",
       mockT
     );
     expect(result).toContain("validate_id_no_spaces");
@@ -1351,7 +1423,6 @@ describe("validation.getValidateIdErrorMessage", () => {
   test("returns translated message for InvalidChars error code", () => {
     const result = validation.getValidateIdErrorMessage(
       { code: TValidateIdErrorCode.InvalidChars, field: "field!" },
-      "question",
       mockT
     );
     expect(result).toContain("validate_id_invalid_chars");
@@ -1360,43 +1431,37 @@ describe("validation.getValidateIdErrorMessage", () => {
   test("returns a distinct message for NotSafeIdentifier error code", () => {
     const result = validation.getValidateIdErrorMessage(
       { code: TValidateIdErrorCode.NotSafeIdentifier, field: "Legacy-Field" },
-      "hiddenField",
       mockT
     );
     expect(result).toContain("validate_id_not_safe_identifier");
     expect(result).not.toContain("validate_id_invalid_chars");
   });
 
-  test("localizes type before passing to translation function", () => {
-    const spyT = vi.fn().mockImplementation((key: string) => {
-      if (key === "common.hidden_field") return "Hidden field";
-      return "translated";
-    });
+  test("asks for the sentence alone, with no entity to interpolate", () => {
+    // The `{type}` placeholder is gone with the cards that shared these strings, so a second lookup
+    // for "Hidden field" or "Variable" is the regression to catch: it would mean the sentences had
+    // drifted back to naming an entity this function no longer knows about.
+    const spyT = vi.fn().mockReturnValue("translated");
     const result = validation.getValidateIdErrorMessage(
       { code: TValidateIdErrorCode.Empty, field: "" },
-      "hiddenField",
       spyT as unknown as TFunction
     );
-    expect(spyT).toHaveBeenCalledWith("common.hidden_field");
-    expect(spyT).toHaveBeenCalledWith("workspace.surveys.edit.validate_id_empty", {
-      type: "Hidden field",
-    });
+
+    expect(spyT).toHaveBeenCalledTimes(1);
+    expect(spyT).toHaveBeenCalledWith("workspace.surveys.edit.validate_id_empty");
     expect(result).toBe("translated");
   });
 
-  test("localizes question type and passes field for Reserved error code", () => {
-    const spyT = vi.fn().mockImplementation((key: string) => {
-      if (key === "workspace.surveys.edit.question") return "Question";
-      return "translated";
-    });
+  test("passes the refused field for Reserved, and nothing else", () => {
+    const spyT = vi.fn().mockReturnValue("translated");
+
     validation.getValidateIdErrorMessage(
       { code: TValidateIdErrorCode.Reserved, field: "userId" },
-      "question",
       spyT as unknown as TFunction
     );
-    expect(spyT).toHaveBeenCalledWith("workspace.surveys.edit.question");
+
+    expect(spyT).toHaveBeenCalledTimes(1);
     expect(spyT).toHaveBeenCalledWith("workspace.surveys.edit.validate_id_reserved", {
-      type: "Question",
       field: "userId",
     });
   });
@@ -1459,25 +1524,334 @@ describe("validation.isBlockLogicItemValid", () => {
   });
 });
 
+// Mirrors the en-US strings the element-issue messages are built from, so the assertions below read
+// as the author sees them rather than as raw keys.
+const elementIssueMessages: Record<string, string> = {
+  "common.row_n": "Row {n}",
+  "common.column_n": "Column {n}",
+  "common.choice_n": "Choice {n}",
+  "workspace.surveys.edit.invalid_field_in_question":
+    "Check {field} in question {questionNumber} of block {blockNumber}",
+  "workspace.surveys.edit.invalid_field_in_question_for_languages":
+    "Check {field} in question {questionNumber} of block {blockNumber} for the following languages: {languages}",
+  "workspace.surveys.edit.invalid_question_in_block":
+    "Check question {questionNumber} in block {blockNumber}",
+  "workspace.surveys.edit.issue_in_question": "Question {questionNumber} of block {blockNumber}: {message}",
+  "workspace.surveys.edit.field_label_shuffle_option": "ordering",
+};
+
+const elementIssueT: TFunction = ((key: string, params?: Record<string, string | number>) => {
+  const template = elementIssueMessages[key] ?? key;
+  if (!params) return template;
+  return Object.entries(params).reduce((str, [k, v]) => str.replace(`{${k}}`, String(v)), template);
+}) as TFunction;
+
+describe("validation.describeElementIssue", () => {
+  test("names the matrix row, question and block, and reports the failing language", () => {
+    const result = validation.describeElementIssue(
+      {
+        code: "invalid_type",
+        expected: "string",
+        path: ["blocks", 0, "elements", 0, "rows", 1, "label", "de"],
+        message: "Invalid input: expected string, received undefined",
+      },
+      elementIssueT,
+      "en-US"
+    );
+
+    expect(result).toEqual({
+      languageCode: "de",
+      message: "Check Row 2 label in question 1 of block 1 for the following languages: German",
+    });
+  });
+
+  test("names a matrix column without a language when the path has none", () => {
+    const result = validation.describeElementIssue(
+      {
+        code: "invalid_type",
+        expected: "string",
+        path: ["blocks", 2, "elements", 1, "columns", 0, "label"],
+        message: "Invalid input: expected string, received undefined",
+      },
+      elementIssueT,
+      "en-US"
+    );
+
+    expect(result).toEqual({ message: "Check Column 1 label in question 2 of block 3" });
+  });
+
+  test("falls back to the language code when the locale has no label for it", () => {
+    const result = validation.describeElementIssue(
+      {
+        code: "invalid_type",
+        expected: "string",
+        path: ["blocks", 0, "elements", 0, "headline", "xx-not-a-language"],
+        message: "Invalid input: expected string, received undefined",
+      },
+      elementIssueT,
+      "en-US"
+    );
+
+    expect(result).toEqual({
+      languageCode: "xx-not-a-language",
+      message: "Check headline in question 1 of block 1 for the following languages: xx-not-a-language",
+    });
+  });
+
+  test("names only the question and block when the issue points at the element itself", () => {
+    const result = validation.describeElementIssue(
+      { code: "invalid_union", errors: [], path: ["blocks", 1, "elements", 3], message: "Invalid input" },
+      elementIssueT,
+      "en-US"
+    );
+
+    expect(result).toEqual({ message: "Check question 4 in block 2" });
+  });
+
+  test("keeps a message the schema authored and only prepends its location", () => {
+    const result = validation.describeElementIssue(
+      {
+        code: "too_small",
+        origin: "array",
+        minimum: 2,
+        path: ["blocks", 0, "elements", 0, "choices"],
+        message: "Multiple Choice Element must have at least two choices",
+      },
+      elementIssueT,
+      "en-US"
+    );
+
+    expect(result).toEqual({
+      message: "Question 1 of block 1: Multiple Choice Element must have at least two choices",
+    });
+  });
+
+  test("returns null for issues outside an element so their own message is kept", () => {
+    expect(
+      validation.describeElementIssue(
+        {
+          code: "too_small",
+          origin: "string",
+          minimum: 1,
+          path: ["blocks", 0, "name"],
+          message: "Block name is required",
+        },
+        elementIssueT,
+        "en-US"
+      )
+    ).toBeNull();
+    expect(
+      validation.describeElementIssue(
+        { code: "invalid_union", errors: [], path: ["endings", 0, "headline"], message: "Invalid input" },
+        elementIssueT,
+        "en-US"
+      )
+    ).toBeNull();
+  });
+});
+
+describe("ZSurvey element issues reach the editor with a usable path", () => {
+  const buildLanguage = (id: string, code: string, isDefault: boolean): TSurveyLanguage => ({
+    language: {
+      id,
+      code,
+      alias: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      workspaceId: "cl9dsxhzt0000qz0h5z6z6z62",
+    },
+    default: isDefault,
+    enabled: true,
+  });
+
+  const buildSurveyWithElement = (element: Record<string, unknown>) => ({
+    id: "cl9dsxhzt0000qz0h5z6z6z61",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    name: "Matrix survey",
+    type: "link",
+    workspaceId: "cl9dsxhzt0000qz0h5z6z6z62",
+    createdBy: null,
+    visibility: "workspace",
+    ownerId: null,
+    visibilityVersion: 0,
+    visibilityProjectedVersion: 0,
+    visibilityChangedAt: null,
+    visibilityChangedById: null,
+    status: "draft",
+    publishOn: null,
+    closeOn: null,
+    displayOption: "displayOnce",
+    autoClose: null,
+    triggers: [],
+    recontactDays: null,
+    displayLimit: null,
+    welcomeCard: { enabled: false, timeToFinish: false, showResponseCount: false },
+    questions: [],
+    blocks: [{ id: "block1", name: "Block 1", elements: [element] }],
+    endings: [],
+    hiddenFields: { enabled: false },
+    delay: 0,
+    displayPercentage: null,
+    autoComplete: null,
+    surveyClosedMessage: { enabled: false },
+    workspaceOverwrites: null,
+    recaptcha: null,
+    singleUse: null,
+    styling: null,
+    segment: null,
+    languages: [
+      buildLanguage("cl9dsxhzt0000qz0h5z6z6z6a", "en", true),
+      buildLanguage("cl9dsxhzt0000qz0h5z6z6z6b", "de", false),
+    ],
+    showLanguageSwitch: false,
+    isVerifyEmailEnabled: false,
+    variables: [],
+    followUps: [],
+    isBackButtonHidden: false,
+    isAutoProgressingEnabled: true,
+    metadata: {},
+    slug: null,
+    isCaptureIpEnabled: false,
+    isAnonymizeResponsesEnabled: false,
+  });
+
+  // A matrix element whose second row label has no value for the enabled `de` language. This is the
+  // shape a survey ends up in when a translation is dropped, and it must not parse.
+  const buildSurveyWithBrokenMatrixRow = () =>
+    buildSurveyWithElement({
+      id: "matrix1",
+      type: "matrix",
+      headline: { default: "How satisfied are you?", de: "Wie zufrieden sind Sie?" },
+      required: true,
+      rows: [
+        { id: "r1", label: { default: "Design", de: "Design" } },
+        { id: "r2", label: { default: "Performance", de: undefined } },
+      ],
+      columns: [{ id: "c1", label: { default: "Good", de: "Gut" } }],
+    });
+
+  // The shape that blocked the reported survey: a multi-select whose ordering holds a value the
+  // enum does not know. `shuffleOption` is what the author has to fix, so the toast has to name it.
+  const buildSurveyWithShuffleOption = (shuffleOption: unknown) =>
+    buildSurveyWithElement({
+      id: "choice1",
+      type: "multipleChoiceMulti",
+      headline: { default: "What got in the way?", de: "Was stand im Weg?" },
+      required: true,
+      shuffleOption,
+      choices: [
+        { id: "c1", label: { default: "Time", de: "Zeit" } },
+        { id: "c2", label: { default: "Budget", de: "Budget" } },
+      ],
+    });
+
+  test("a matrix row label missing an enabled language points at the row, not at the element", () => {
+    const result = ZSurvey.safeParse(buildSurveyWithBrokenMatrixRow());
+
+    expect(result.success).toBe(false);
+    const issue = result.error?.issues[0];
+
+    // Before the element union was discriminated, this was a single `invalid_union` issue at
+    // ["blocks", 0, "elements", 0] carrying Zod's bare "Invalid input" — no field, nothing actionable.
+    expect(issue?.path).toEqual(["blocks", 0, "elements", 0, "rows", 1, "label", "de"]);
+  });
+
+  test("the editor turns that issue into a message naming the row, question and block", () => {
+    const result = ZSurvey.safeParse(buildSurveyWithBrokenMatrixRow());
+    const issue = result.error?.issues[0];
+
+    const described = validation.describeElementIssue(
+      { ...issue, path: issue?.path ?? [], message: issue?.message ?? "" },
+      elementIssueT,
+      "en-US"
+    );
+
+    expect(described).toEqual({
+      languageCode: "de",
+      message: "Check Row 2 label in question 1 of block 1 for the following languages: German",
+    });
+  });
+
+  test("an out-of-enum shuffleOption points at the field, not at the element", () => {
+    const result = ZSurvey.safeParse(buildSurveyWithShuffleOption("random"));
+
+    expect(result.success).toBe(false);
+    const issue = result.error?.issues[0];
+
+    // On the plain union this was ["blocks", 0, "elements", 0] with the bare "Invalid input" the
+    // customer saw. The field name is the one word an author needs to unblock themselves.
+    expect(issue?.path).toEqual(["blocks", 0, "elements", 0, "shuffleOption"]);
+    expect(issue?.code).toBe("invalid_value");
+  });
+
+  test("the editor names the ordering field for that issue", () => {
+    const result = ZSurvey.safeParse(buildSurveyWithShuffleOption("random"));
+    const issue = result.error?.issues[0];
+
+    const described = validation.describeElementIssue(
+      { ...issue, path: issue?.path ?? [], message: issue?.message ?? "" },
+      elementIssueT,
+      "en-US"
+    );
+
+    // Zod renders this as `Invalid option: expected one of "none"|"all"|…`, which is generated rather
+    // than schema-authored — so the message is built from the path instead of passed through.
+    expect(described).toEqual({ message: "Check ordering in question 1 of block 1" });
+  });
+
+  test("an empty shuffleOption is healed on read rather than blocking publish", () => {
+    const result = ZSurvey.safeParse(buildSurveyWithShuffleOption(""));
+
+    expect(result.success).toBe(true);
+    expect(result.data?.blocks[0].elements[0]).toMatchObject({ shuffleOption: undefined });
+  });
+
+  test("an empty shuffleOption on a matrix falls back to its default", () => {
+    const survey = buildSurveyWithElement({
+      id: "matrix1",
+      type: "matrix",
+      headline: { default: "How satisfied are you?", de: "Wie zufrieden sind Sie?" },
+      required: true,
+      shuffleOption: "",
+      rows: [{ id: "r1", label: { default: "Design", de: "Design" } }],
+      columns: [{ id: "c1", label: { default: "Good", de: "Gut" } }],
+    });
+    const result = ZSurvey.safeParse(survey);
+
+    expect(result.success).toBe(true);
+    expect(result.data?.blocks[0].elements[0]).toMatchObject({ shuffleOption: "none" });
+  });
+});
+
 // ENG-2581: the editor stopped disabling Save / Save & Close / Publish for a missing trigger and
-// now blocks the click instead, so this predicate is what decides whether the click is refused.
+// now blocks the click instead, so this predicate is what decides whether the click is refused. It is
+// the server's publish rule itself (`lib/survey/publish-rule.ts`), so the two can't drift.
 describe("validation.isMissingRequiredTrigger", () => {
   const appSurveyWithoutTriggers = { type: "app", triggers: [] } as unknown as TSurvey;
 
   test.each(["inProgress", "paused", "completed"] as const)(
     "refuses an app survey with no trigger heading for %s",
     (targetStatus) => {
-      expect(validation.isMissingRequiredTrigger(appSurveyWithoutTriggers, targetStatus)).toBe(true);
+      expect(validation.isMissingRequiredTrigger(appSurveyWithoutTriggers, targetStatus, false)).toBe(true);
     }
   );
 
+  test("publishes an app survey with no trigger of its own when a creative opens it (ENG-3994)", () => {
+    expect(validation.isMissingRequiredTrigger(appSurveyWithoutTriggers, "inProgress", true)).toBe(false);
+  });
+
   test("lets an app survey with no trigger be saved as a draft", () => {
-    expect(validation.isMissingRequiredTrigger(appSurveyWithoutTriggers, "draft")).toBe(false);
+    expect(validation.isMissingRequiredTrigger(appSurveyWithoutTriggers, "draft", false)).toBe(false);
   });
 
   test("lets a link survey publish with no trigger", () => {
     expect(
-      validation.isMissingRequiredTrigger({ type: "link", triggers: [] } as unknown as TSurvey, "inProgress")
+      validation.isMissingRequiredTrigger(
+        { type: "link", triggers: [] } as unknown as TSurvey,
+        "inProgress",
+        false
+      )
     ).toBe(false);
   });
 
@@ -1487,7 +1861,7 @@ describe("validation.isMissingRequiredTrigger", () => {
       triggers: [{ actionClass: { id: "action1", name: "Click" } }],
     } as unknown as TSurvey;
 
-    expect(validation.isMissingRequiredTrigger(withTrigger, "inProgress")).toBe(false);
+    expect(validation.isMissingRequiredTrigger(withTrigger, "inProgress", false)).toBe(false);
   });
 
   test.each([
@@ -1496,24 +1870,11 @@ describe("validation.isMissingRequiredTrigger", () => {
     ["a hole left by a removed trigger", [undefined]],
   ])("treats %s as no trigger", (_case, triggers) => {
     expect(
-      validation.isMissingRequiredTrigger({ type: "app", triggers } as unknown as TSurvey, "inProgress")
+      validation.isMissingRequiredTrigger(
+        { type: "app", triggers } as unknown as TSurvey,
+        "inProgress",
+        false
+      )
     ).toBe(true);
-  });
-
-  // The client cannot import the server-only module that owns the same rule, so the two are separate
-  // code. This is what keeps them from drifting: the client must refuse exactly what the server
-  // rejects, or the editor promises a save the API then fails.
-  test("agrees with the server-side rule on every type/status/trigger combination", () => {
-    for (const type of ["app", "link"] as const) {
-      for (const status of ["draft", "inProgress", "paused", "completed"] as const) {
-        for (const triggers of [[], [{ actionClass: { id: "action1" } }]]) {
-          const survey = { type, triggers } as unknown as TSurvey;
-
-          expect(validation.isMissingRequiredTrigger(survey, status)).toBe(
-            isAppSurveyMissingTriggersToPublish(type, status, triggers)
-          );
-        }
-      }
-    }
   });
 });

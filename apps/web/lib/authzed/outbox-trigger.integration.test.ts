@@ -7,17 +7,27 @@ import { resetDb } from "@/integration/reset-db";
 import {
   AUTHZED_OUTBOX_MAX_PERMANENT_FAILURES,
   AUTHZED_OUTBOX_MAX_RETRY_DELAY_MS,
+  claimAuthzedOutboxEvents,
   hasStaleAuthzedRevocation,
+  hasUnclaimedAuthzedOutboxEvent,
+  markAuthzedOutboxEventsDelivered,
   markAuthzedOutboxEventsFailed,
 } from "@/lib/authzed/outbox-repository";
+import { AUTHZED_OUTBOX_SAFETY_NET_UNCLAIMED_MS } from "@/lib/authzed/outbox-safety-net";
 
-const migration = readFileSync(
-  join(
-    dirname(fileURLToPath(import.meta.url)),
-    "../../../../packages/database/migration/20260818120000_add_authzed_projection_outbox/migration.sql"
-  ),
-  "utf8"
-);
+const readMigration = (name: string): string =>
+  readFileSync(
+    join(
+      dirname(fileURLToPath(import.meta.url)),
+      `../../../../packages/database/migration/${name}/migration.sql`
+    ),
+    "utf8"
+  );
+
+const migration = readMigration("20260818120000_add_authzed_projection_outbox");
+// Re-declares both trigger functions with the survey case (ENG-3282). Replaying the outbox migration
+// alone would roll them back to the pre-survey classifier, so the convergence test replays both.
+const surveyMigration = readMigration("20261002120002_add_survey_projection_trigger");
 
 /**
  * The durable outbox against a real PostgreSQL (ENG-2408).
@@ -62,8 +72,10 @@ beforeEach(async () => {
 
 describe("AuthZed projection outbox triggers", () => {
   test("the migration converges when applied repeatedly", async () => {
-    await prisma.$executeRawUnsafe(migration);
-    await prisma.$executeRawUnsafe(migration);
+    for (let run = 0; run < 2; run++) {
+      await prisma.$executeRawUnsafe(migration);
+      await prisma.$executeRawUnsafe(surveyMigration);
+    }
 
     const [catalog] = await prisma.$queryRaw<Array<{ indexes: bigint; triggers: bigint }>>`
       SELECT
@@ -75,7 +87,7 @@ describe("AuthZed projection outbox triggers", () => {
            AND NOT tgisinternal) AS triggers
     `;
     expect(Number(catalog?.indexes)).toBe(3);
-    expect(Number(catalog?.triggers)).toBe(11);
+    expect(Number(catalog?.triggers)).toBe(12);
   });
 
   test("does not classify an accepted invite as a revocation", async () => {
@@ -233,6 +245,175 @@ describe("AuthZed projection outbox triggers", () => {
 
     expect(await outboxRows()).toEqual([
       { isRevocation: true, primaryId: organization.id, secondaryId: user.id, targetType: "membership" },
+    ]);
+  });
+});
+
+const seedSurvey = async (label: string) => {
+  const [owner, organization] = await Promise.all([
+    seedUser(`${label}@integration.test`),
+    seedOrganization(label),
+  ]);
+  const workspace = await prisma.workspace.create({
+    data: { name: `${label} Workspace`, organizationId: organization.id },
+  });
+  return { owner, organization, workspace };
+};
+
+const surveyEvents = async () => (await outboxRows()).filter((row) => row.targetType === "survey");
+
+describe("AuthZed projection outbox triggers: survey (ENG-3282)", () => {
+  test("classifies each survey transition by whether it can take access away", async () => {
+    const { owner, organization, workspace } = await seedSurvey("survey-transitions");
+    const other = await seedUser("survey-transitions-other@integration.test");
+    const otherWorkspace = await prisma.workspace.create({
+      data: { name: "Other Workspace", organizationId: organization.id },
+    });
+    await clearOutbox();
+
+    // INSERT → grant. Also proves the `visibilityPending` trigger, not Prisma, decides the column: the
+    // row starts in its initial projection (version 0, never acknowledged) until the projector runs.
+    const survey = await prisma.survey.create({
+      data: { name: "Transitions", workspaceId: workspace.id, ownerId: owner.id, createdBy: owner.id },
+    });
+    expect(survey).toMatchObject({
+      visibilityPending: true,
+      visibilityProjectedVersion: -1,
+      visibilityVersion: 0,
+    });
+    expect(await surveyEvents()).toEqual([
+      { isRevocation: false, primaryId: survey.id, secondaryId: null, targetType: "survey" },
+    ]);
+
+    const expectNext = async (
+      data: Parameters<typeof prisma.survey.update>[0]["data"],
+      isRevocation: boolean
+    ) => {
+      await clearOutbox();
+      await prisma.survey.update({ where: { id: survey.id }, data });
+      expect(await surveyEvents()).toEqual([
+        { isRevocation, primaryId: survey.id, secondaryId: null, targetType: "survey" },
+      ]);
+    };
+
+    await expectNext({ visibility: "restricted" }, true); // workspace → restricted drops the shared edge
+    await expectNext({ visibility: "workspace" }, false); // restricted → workspace only adds
+    await expectNext({ visibility: "workspace" }, false); // unchanged facts project identical edges
+    await expectNext({ ownerId: other.id }, true); // the previous owner loses change_visibility
+    await expectNext({ workspaceId: otherWorkspace.id }, true); // the previous workspace loses read
+
+    // Content writes are not authorization facts: the trigger does not fire at all.
+    await clearOutbox();
+    await prisma.survey.update({ where: { id: survey.id }, data: { blocks: [], name: "Renamed" } });
+    await prisma.survey.update({ where: { id: survey.id }, data: { visibilityVersion: { increment: 1 } } });
+    expect(await surveyEvents()).toEqual([]);
+
+    // DELETE is not a revocation: every survey decision resolves the row first and denies once it is
+    // gone, and counting it would let a workspace delete with many surveys arm the freshness guard.
+    await clearOutbox();
+    await prisma.survey.delete({ where: { id: survey.id } });
+    expect(await surveyEvents()).toEqual([
+      { isRevocation: false, primaryId: survey.id, secondaryId: null, targetType: "survey" },
+    ]);
+  });
+
+  test("keeps visibilityPending in step with the two versions", async () => {
+    const { workspace } = await seedSurvey("survey-pending");
+    // Whatever pair the insert supplies, it starts in its initial projection.
+    const survey = await prisma.survey.create({
+      data: {
+        name: "Pending",
+        visibilityProjectedVersion: 3,
+        visibilityVersion: 3,
+        workspaceId: workspace.id,
+      },
+    });
+    expect(survey).toMatchObject({
+      visibilityPending: true,
+      visibilityProjectedVersion: -1,
+      visibilityVersion: 0,
+    });
+
+    const acked = await prisma.survey.update({
+      where: { id: survey.id },
+      data: { visibilityProjectedVersion: survey.visibilityVersion },
+    });
+    expect(acked.visibilityPending).toBe(false);
+
+    // Only an insert is rewritten: an update that leaves the versions equal stays settled.
+    const touched = await prisma.survey.update({
+      where: { id: survey.id },
+      data: { visibilityPending: true },
+    });
+    expect(touched).toMatchObject({ visibilityPending: false, visibilityVersion: 0 });
+
+    const bumped = await prisma.survey.update({
+      where: { id: survey.id },
+      data: { visibilityVersion: { increment: 1 } },
+    });
+    expect(bumped.visibilityPending).toBe(true);
+  });
+
+  test("sets the owner to null when the owning user is deleted, without a survey revocation", async () => {
+    const { owner, workspace } = await seedSurvey("survey-owner-delete");
+    const surveys = await Promise.all(
+      ["Orphan 1", "Orphan 2", "Orphan 3"].map((name) =>
+        prisma.survey.create({ data: { name, workspaceId: workspace.id, ownerId: owner.id } })
+      )
+    );
+    const restricted = await prisma.survey.create({
+      data: {
+        name: "Orphan restricted",
+        workspaceId: workspace.id,
+        ownerId: owner.id,
+        visibility: "restricted",
+      },
+    });
+    await clearOutbox();
+
+    await prisma.user.delete({ where: { id: owner.id } });
+
+    for (const survey of [...surveys, restricted]) {
+      await expect(
+        prisma.survey.findUniqueOrThrow({ where: { id: survey.id }, select: { ownerId: true } })
+      ).resolves.toEqual({ ownerId: null });
+    }
+    // One reconcile per survey, none of them a revocation: both owner arms intersect workspace read,
+    // which the user's own revocation (below) already takes away.
+    const events = await surveyEvents();
+    expect(events).toHaveLength(4);
+    expect(events.every((event) => !event.isRevocation)).toBe(true);
+    expect((await outboxRows()).some((row) => row.targetType === "user" && row.isRevocation)).toBe(true);
+  });
+
+  test("still counts an owner cleared together with a revoking change as a revocation", async () => {
+    const { owner, workspace } = await seedSurvey("survey-owner-null-restrict");
+    const survey = await prisma.survey.create({
+      data: { name: "Restrict", workspaceId: workspace.id, ownerId: owner.id },
+    });
+    const otherWorkspace = await prisma.workspace.create({
+      data: { name: "Moved", organizationId: workspace.organizationId },
+    });
+
+    await clearOutbox();
+    await prisma.survey.update({
+      where: { id: survey.id },
+      data: { ownerId: null, visibility: "restricted" },
+    });
+    expect(await surveyEvents()).toEqual([
+      { isRevocation: true, primaryId: survey.id, secondaryId: null, targetType: "survey" },
+    ]);
+
+    await clearOutbox();
+    await prisma.survey.update({ where: { id: survey.id }, data: { visibility: "workspace" } });
+    await prisma.survey.update({ where: { id: survey.id }, data: { ownerId: owner.id } });
+    await clearOutbox();
+    await prisma.survey.update({
+      where: { id: survey.id },
+      data: { ownerId: null, workspaceId: otherWorkspace.id },
+    });
+    expect(await surveyEvents()).toEqual([
+      { isRevocation: true, primaryId: survey.id, secondaryId: null, targetType: "survey" },
     ]);
   });
 });
@@ -411,6 +592,66 @@ describe("AuthZed projection freshness guard", () => {
     await prisma.$executeRaw`UPDATE "AuthzedProjectionOutbox" SET "deadLetteredAt" = NOW() WHERE "id" = 'fresh-dead-letter'`;
     // No age bound on dead letters is deliberate: an old one is more dangerous than a fresh one.
     await expect(hasStaleAuthzedRevocation()).resolves.toBe(true);
+  });
+});
+
+describe("AuthZed projection outbox safety-net probe", () => {
+  const unclaimed = () => hasUnclaimedAuthzedOutboxEvent(AUTHZED_OUTBOX_SAFETY_NET_UNCLAIMED_MS);
+  const setRow = (id: string, assignments: string): Promise<unknown> =>
+    prisma.$executeRawUnsafe(`UPDATE "AuthzedProjectionOutbox" SET ${assignments} WHERE "id" = $1`, id);
+
+  test("fires for an event left claimable past the threshold, and for one whose lease expired", async () => {
+    await insertClaimedEvent("stalled");
+    await setRow("stalled", `"availableAt" = NOW() - INTERVAL '1 minute'`);
+    await expect(unclaimed()).resolves.toBe(true);
+
+    // A worker that died mid-delivery leaves an expired lease: that event is claimable again.
+    await setRow("stalled", `"leaseExpiresAt" = NOW() - INTERVAL '1 second'`);
+    await expect(unclaimed()).resolves.toBe(true);
+  });
+
+  test("stays quiet for work the delivery job is still handling or must not retry yet", async () => {
+    // Just enqueued: the five-second job has not had its turn.
+    await insertClaimedEvent("fresh");
+    await expect(unclaimed()).resolves.toBe(false);
+
+    // Held by a live lease: another process is delivering it right now.
+    await setRow(
+      "fresh",
+      `"availableAt" = NOW() - INTERVAL '1 minute', "leaseExpiresAt" = NOW() + INTERVAL '1 minute'`
+    );
+    await expect(unclaimed()).resolves.toBe(false);
+
+    // Backing off after a failure: the safety net must not retry SpiceDB faster than the backoff.
+    await setRow("fresh", `"leaseExpiresAt" = NULL, "availableAt" = NOW() + INTERVAL '1 minute'`);
+    await expect(unclaimed()).resolves.toBe(false);
+
+    // Dead letters and delivered history are never claimable.
+    await setRow("fresh", `"availableAt" = NOW() - INTERVAL '1 hour', "deadLetteredAt" = NOW()`);
+    await expect(unclaimed()).resolves.toBe(false);
+    await setRow("fresh", `"deadLetteredAt" = NULL, "processedAt" = NOW()`);
+    await expect(unclaimed()).resolves.toBe(false);
+  });
+
+  test("clears the fail-closed guard once a backlog past the 60-second window is delivered", async () => {
+    // formbricks#9697: revocations pending for hours after the delivery job stopped. The guard must
+    // deny while they are pending and release on its own once delivery claims and settles them.
+    await insertClaimedEvent("overdue-revocation", { isRevocation: true });
+    await setRow(
+      "overdue-revocation",
+      `"leaseOwner" = NULL, "createdAt" = NOW() - INTERVAL '6 hours', "availableAt" = NOW() - INTERVAL '6 hours'`
+    );
+    await expect(hasStaleAuthzedRevocation()).resolves.toBe(true);
+    await expect(unclaimed()).resolves.toBe(true);
+
+    const claimed = await claimAuthzedOutboxEvents("safety-net");
+    expect(claimed.map(({ id }) => id)).toEqual(["overdue-revocation"]);
+    // Claimed and leased: a second replica's probe now leaves it alone.
+    await expect(unclaimed()).resolves.toBe(false);
+
+    await markAuthzedOutboxEventsDelivered("safety-net", ["overdue-revocation"]);
+    await expect(hasStaleAuthzedRevocation()).resolves.toBe(false);
+    await expect(unclaimed()).resolves.toBe(false);
   });
 });
 

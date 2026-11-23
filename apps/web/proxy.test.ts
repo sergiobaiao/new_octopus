@@ -2,7 +2,7 @@ import { unstable_doesMiddlewareMatch } from "next/experimental/testing/server";
 import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { FORMBRICKS_CLIENT_IP_HEADER } from "@/lib/utils/client-ip";
-import { config, proxy } from "./proxy";
+import { INGEST_REQUEST_BODY_LIMIT_BYTES, config, proxy } from "./proxy";
 
 const { mockGetProxySession, mockIsPublicDomainConfigured, mockIsRequestFromPublicDomain } = vi.hoisted(
   () => ({
@@ -70,6 +70,24 @@ describe("proxy", () => {
     expect(response.headers.get("location")).toBe(
       "http://localhost:3000/auth/login?callbackUrl=http%3A%2F%2Flocalhost%3A3000%2Fenvironments%2Ftest"
     );
+  });
+
+  test("rewrites ID-free marketing links to the single marketing-links route, keeping the query", async () => {
+    mockGetProxySession.mockResolvedValue({ userId: "user-1", expires: new Date(Date.now() + 60_000) });
+
+    const response = await proxy(new NextRequest("http://localhost:3000/contacts/segments?utm_source=x"));
+
+    expect(response.headers.get("x-middleware-rewrite")).toBe(
+      "http://localhost:3000/marketing-links/contacts/segments?utm_source=x"
+    );
+  });
+
+  test("does not rewrite paths that only share a prefix with a marketing link", async () => {
+    mockGetProxySession.mockResolvedValue(null);
+
+    const response = await proxy(new NextRequest("http://localhost:3000/billing-confirmation"));
+
+    expect(response.headers.get("x-middleware-rewrite")).toBeNull();
   });
 
   test("rejects invalid callback URLs", async () => {
@@ -187,6 +205,73 @@ describe("proxy", () => {
     expect(response.cookies.get("formbricks-workspace-id")?.value).toBe("ws-456");
   });
 
+  test("sets the active-organization cookie from an /organizations/[organizationId] path", async () => {
+    mockGetProxySession.mockResolvedValue({
+      userId: "user-1",
+      expires: new Date(Date.now() + 60_000),
+    });
+
+    // An organization with no workspace lands here; without this cookie, account settings would
+    // follow the workspace cookie back into the previously visited organization.
+    const request = new NextRequest("http://localhost:3000/organizations/org-2/landing");
+    request.cookies.set("formbricks-workspace-id", "ws-of-org-1");
+
+    const response = await proxy(request);
+
+    expect(response.cookies.get("formbricks-organization-id")?.value).toBe("org-2");
+    expect(response.cookies.get("formbricks-workspace-id")).toBeUndefined();
+  });
+
+  test("does not re-set the active-organization cookie when the request already carries the same value", async () => {
+    mockGetProxySession.mockResolvedValue(null);
+
+    const request = new NextRequest("http://localhost:3000/organizations/org-2/settings/general");
+    request.cookies.set("formbricks-organization-id", "org-2");
+
+    const response = await proxy(request);
+
+    expect(response.cookies.get("formbricks-organization-id")).toBeUndefined();
+  });
+
+  test("clears the active-organization cookie when a workspace is visited", async () => {
+    mockGetProxySession.mockResolvedValue(null);
+
+    const request = new NextRequest("http://localhost:3000/workspaces/ws-1/surveys");
+    request.cookies.set("formbricks-organization-id", "org-2");
+
+    const response = await proxy(request);
+
+    // A deletion is a Set-Cookie with an empty value that has already expired.
+    expect(response.cookies.get("formbricks-organization-id")?.value).toBe("");
+    expect(response.cookies.get("formbricks-workspace-id")?.value).toBe("ws-1");
+  });
+
+  test("writes no organization cookie on a workspace request whose cookies are already current", async () => {
+    mockGetProxySession.mockResolvedValue(null);
+
+    // A Set-Cookie on a server-action POST forces a router refresh; with no organization cookie to
+    // clear and the workspace cookie unchanged, the response must not carry one.
+    const request = new NextRequest("http://localhost:3000/workspaces/ws-1/surveys");
+    request.cookies.set("formbricks-workspace-id", "ws-1");
+
+    const response = await proxy(request);
+
+    expect(response.cookies.get("formbricks-organization-id")).toBeUndefined();
+    expect(response.cookies.get("formbricks-workspace-id")).toBeUndefined();
+  });
+
+  test("leaves the active-organization cookie alone on a prefetch", async () => {
+    mockGetProxySession.mockResolvedValue(null);
+
+    const request = new NextRequest("http://localhost:3000/organizations/org-2/settings/general", {
+      headers: { "next-router-prefetch": "1" },
+    });
+
+    const response = await proxy(request);
+
+    expect(response.cookies.get("formbricks-organization-id")).toBeUndefined();
+  });
+
   test("overwrites a caller-supplied private IP header with the canonical trusted hop", async () => {
     mockGetProxySession.mockResolvedValue(null);
     const request = new NextRequest("http://localhost:3000/api/auth/sign-in/email", {
@@ -218,6 +303,54 @@ describe("proxy", () => {
       FORMBRICKS_CLIENT_IP_HEADER
     );
     expect(response.headers.get(FORMBRICKS_CLIENT_IP_HEADER)).toBeNull();
+  });
+
+  describe("PostHog /ingest body limit", () => {
+    const ingest = (path: string, headers: Record<string, string>) =>
+      proxy(new NextRequest(`http://localhost:3000${path}`, { method: "POST", headers }));
+
+    test("refuses a declared body over the limit with 413", async () => {
+      const response = await ingest("/ingest/s/", {
+        "content-length": String(INGEST_REQUEST_BODY_LIMIT_BYTES + 1),
+      });
+
+      expect(response.status).toBe(413);
+    });
+
+    test("refuses a Content-Length that does not parse with 413", async () => {
+      const response = await ingest("/ingest/e/", { "content-length": "lots" });
+
+      expect(response.status).toBe(413);
+    });
+
+    test.each(["/ingest/e/", "/INGEST/e", "/InGeSt/batch", "/Ingest"])(
+      "refuses a body of undeclared length to %s with 411",
+      async (path) => {
+        // Next's rewrite matches any case of the path, so the bound has to as well.
+        const response = await ingest(path, { "transfer-encoding": "chunked" });
+
+        expect(response.status).toBe(411);
+      }
+    );
+
+    test("forwards a body up to the limit", async () => {
+      mockGetProxySession.mockResolvedValue(null);
+      const response = await ingest("/ingest/e/", {
+        "content-length": String(INGEST_REQUEST_BODY_LIMIT_BYTES),
+      });
+
+      expect(response.headers.get("x-middleware-next")).toBe("1");
+    });
+
+    test.each(["/ingestion", "/api/v1/management/responses"])(
+      "leaves %s to its own route's limits",
+      async (path) => {
+        mockGetProxySession.mockResolvedValue(null);
+        const response = await ingest(path, { "transfer-encoding": "chunked" });
+
+        expect(response.headers.get("x-middleware-next")).toBe("1");
+      }
+    );
   });
 });
 

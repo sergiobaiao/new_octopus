@@ -16,15 +16,16 @@ import React, { useEffect } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/cn";
+import { copyToClipboard } from "@/lib/utils/clipboard";
 import "./style.css";
 
 interface CodeBlockProps {
-  children: React.ReactNode;
-  language: string;
-  customCodeClass?: string;
-  customEditorClass?: string;
-  showCopyToClipboard?: boolean;
-  noMargin?: boolean;
+  readonly children: React.ReactNode;
+  readonly language: string;
+  readonly customCodeClass?: string;
+  readonly customEditorClass?: string;
+  readonly showCopyToClipboard?: boolean;
+  readonly noMargin?: boolean;
 }
 
 export const CodeBlock = ({
@@ -46,10 +47,13 @@ export const CodeBlock = ({
         <div className="absolute top-2 right-2 z-20 flex cursor-pointer items-center justify-center p-1.5 text-slate-500 hover:text-slate-900">
           <CopyIcon
             data-testid="copy-icon"
-            onClick={() => {
+            onClick={async () => {
               const childText = children?.toString() || "";
-              navigator.clipboard.writeText(childText);
-              toast.success(t("common.copied_to_clipboard"));
+              if (await copyToClipboard(childText)) {
+                toast.success(t("common.copied_to_clipboard"));
+              } else {
+                toast.error(t("common.failed_to_copy_to_clipboard"));
+              }
             }}
             className="size-4"
           />

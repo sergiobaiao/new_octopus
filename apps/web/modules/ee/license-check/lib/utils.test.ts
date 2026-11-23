@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { logger } from "@formbricks/logger";
 import * as constants from "@/lib/constants";
 import { CLOUD_STRIPE_FEATURE_LOOKUP_KEYS } from "@/modules/billing/lib/stripe-catalog";
 import type { TEnterpriseLicenseFeatures } from "@/modules/ee/license-check/types/enterprise-license";
@@ -10,10 +11,14 @@ import {
   getAccessControlPermission,
   getBiggerUploadFileSizePermission,
   getBulkInvitePermission,
+  getCustomCssPermission,
   getIsAISmartToolsEnabled,
   getIsAuditLogsEnabled,
   getIsContactsEnabled,
+  getIsCreativesEnabled,
+  getIsDashboardViewerRoleEnabled,
   getIsDashboardsEnabled,
+  getIsDataRetentionEnabled,
   getIsFeedbackDirectoriesEnabled,
   getIsMultiOrgEnabled,
   getIsQuotasEnabled,
@@ -36,6 +41,10 @@ vi.mock("@/lib/constants", async (importOriginal) => {
     AUDIT_LOG_ENABLED: true,
   };
 });
+
+vi.mock("@formbricks/logger", () => ({
+  logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
 
 vi.mock("@/modules/entitlements/lib/checks", () => ({
   hasOrganizationEntitlementWithLicenseGuard: vi.fn(),
@@ -67,6 +76,8 @@ const defaultFeatures: TEnterpriseLicenseFeatures = {
   feedbackDirectories: false,
   dashboards: false,
   workflows: false,
+  dataRetention: false,
+  creatives: false,
 };
 
 const defaultLicense = {
@@ -189,6 +200,31 @@ describe("License Utils", () => {
       const result = await getBulkInvitePermission("org_1");
 
       expect(result).toBe(false);
+    });
+  });
+
+  describe("getCustomCssPermission", () => {
+    test("returns true on self-hosted on every plan, without a license or an entitlement check", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+
+      await expect(getCustomCssPermission("org_1")).resolves.toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).not.toHaveBeenCalled();
+      expect(getEnterpriseLicense).not.toHaveBeenCalled();
+    });
+
+    test("uses the cloud custom-css entitlement", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValueOnce(true);
+
+      await expect(getCustomCssPermission("org_1")).resolves.toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).toHaveBeenCalledWith("org_1", "custom-css");
+    });
+
+    test("returns false on cloud without the custom-css entitlement", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValueOnce(false);
+
+      await expect(getCustomCssPermission("org_1")).resolves.toBe(false);
     });
   });
 
@@ -340,6 +376,24 @@ describe("License Utils", () => {
       expect(hasOrganizationEntitlementWithLicenseGuard).not.toHaveBeenCalled();
     });
 
+    test.each([
+      [true, true, true],
+      [true, false, false],
+      [false, true, false],
+      [false, false, false],
+    ])(
+      "offers the Dashboard viewer role only with Access Control (%s) and Dashboards (%s) both entitled",
+      async (accessControl, dashboards, expected) => {
+        vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+        vi.mocked(getEnterpriseLicense).mockResolvedValue({
+          ...defaultLicense,
+          features: { ...defaultFeatures, accessControl, dashboards },
+        });
+
+        await expect(getIsDashboardViewerRoleEnabled("org_1")).resolves.toBe(expected);
+      }
+    );
+
     test("returns false for self-hosted FRD / dashboards / workflows when not enabled", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
       vi.mocked(getEnterpriseLicense).mockResolvedValue({
@@ -357,6 +411,52 @@ describe("License Utils", () => {
       expect(dashboards).toBe(false);
       expect(workflows).toBe(false);
       expect(hasOrganizationEntitlementWithLicenseGuard).not.toHaveBeenCalled();
+    });
+
+    test("uses the cloud data retention entitlement", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValueOnce(true);
+
+      const result = await getIsDataRetentionEnabled("org_1");
+
+      expect(result).toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).toHaveBeenCalledWith(
+        "org_1",
+        CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.DATA_RETENTION
+      );
+      expect(getEnterpriseLicense).not.toHaveBeenCalled();
+    });
+
+    test("returns self-hosted data retention from the license", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+      vi.mocked(getEnterpriseLicense).mockResolvedValue({
+        ...defaultLicense,
+        features: { ...defaultFeatures, dataRetention: true },
+      });
+
+      expect(await getIsDataRetentionEnabled("org_1")).toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).not.toHaveBeenCalled();
+    });
+
+    test("returns false for self-hosted data retention when the license doesn't grant it", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+      vi.mocked(getEnterpriseLicense).mockResolvedValue({
+        ...defaultLicense,
+        features: defaultFeatures,
+      });
+
+      expect(await getIsDataRetentionEnabled("org_1")).toBe(false);
+    });
+
+    test("returns false for self-hosted data retention when the license is inactive", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+      vi.mocked(getEnterpriseLicense).mockResolvedValue({
+        ...defaultLicense,
+        active: false,
+        features: { ...defaultFeatures, dataRetention: true },
+      });
+
+      expect(await getIsDataRetentionEnabled("org_1")).toBe(false);
     });
   });
 
@@ -497,6 +597,54 @@ describe("License Utils", () => {
       const result = await getIsSamlSsoEnabled();
 
       expect(result).toBe(true);
+    });
+  });
+
+  // Creatives are self-hosted only (ENG-6602): no Cloud plan includes them, so there is no Stripe path.
+  describe("getIsCreativesEnabled", () => {
+    const licenseWithCreatives = {
+      ...defaultLicense,
+      features: { ...defaultFeatures, creatives: true },
+    };
+
+    test("is off on Cloud, even with a licence that includes Creatives", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(getEnterpriseLicense).mockResolvedValue(licenseWithCreatives);
+      vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValue(true);
+
+      expect(await getIsCreativesEnabled("org_1")).toBe(false);
+      expect(hasOrganizationEntitlementWithLicenseGuard).not.toHaveBeenCalled();
+    });
+
+    test("is off without a licence", async () => {
+      vi.mocked(getEnterpriseLicense).mockResolvedValue({
+        ...defaultLicense,
+        active: false,
+        features: null,
+        status: "no-license",
+      });
+
+      expect(await getIsCreativesEnabled("org_1")).toBe(false);
+    });
+
+    test("is off with an active licence that doesn't include Creatives", async () => {
+      expect(await getIsCreativesEnabled("org_1")).toBe(false);
+    });
+
+    test("is off with an inactive licence, even one that includes Creatives", async () => {
+      vi.mocked(getEnterpriseLicense).mockResolvedValue({
+        ...licenseWithCreatives,
+        active: false,
+        status: "expired",
+      });
+
+      expect(await getIsCreativesEnabled("org_1")).toBe(false);
+    });
+
+    test("is on with an active self-hosted licence that includes Creatives", async () => {
+      vi.mocked(getEnterpriseLicense).mockResolvedValue(licenseWithCreatives);
+
+      expect(await getIsCreativesEnabled("org_1")).toBe(true);
     });
   });
 
@@ -683,6 +831,52 @@ describe("License Utils", () => {
     test("returns false when auditLogs feature is not enabled", async () => {
       vi.mocked(constants).AUDIT_LOG_ENABLED = true;
       vi.mocked(getLicenseFeatures).mockResolvedValue({ ...defaultFeatures, auditLogs: false });
+
+      const result = await getIsAuditLogsEnabled();
+
+      expect(result).toBe(false);
+    });
+
+    test("returns false when there is no active licence, as after the grace period", async () => {
+      vi.mocked(constants).AUDIT_LOG_ENABLED = true;
+      vi.mocked(getLicenseFeatures).mockResolvedValue(null);
+
+      const result = await getIsAuditLogsEnabled();
+
+      expect(result).toBe(false);
+    });
+
+    test("returns true on Cloud from the env var alone, without consulting the licence", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(constants).AUDIT_LOG_ENABLED = true;
+      vi.mocked(getLicenseFeatures).mockResolvedValue(null);
+
+      const result = await getIsAuditLogsEnabled();
+
+      expect(result).toBe(true);
+      expect(getLicenseFeatures).not.toHaveBeenCalled();
+    });
+
+    test("warns once each time the licence starts withholding audit logging", async () => {
+      vi.mocked(constants).AUDIT_LOG_ENABLED = true;
+      const licensed = { ...defaultFeatures, auditLogs: true };
+      vi.mocked(getLicenseFeatures)
+        .mockResolvedValueOnce(licensed)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(licensed)
+        .mockResolvedValueOnce({ ...defaultFeatures, auditLogs: false });
+
+      const results = [];
+      for (let i = 0; i < 5; i++) results.push(await getIsAuditLogsEnabled());
+
+      expect(results).toEqual([true, false, false, true, false]);
+      expect(logger.warn).toHaveBeenCalledTimes(2);
+    });
+
+    test("returns false on Cloud when audit logs are globally disabled", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(constants).AUDIT_LOG_ENABLED = false;
 
       const result = await getIsAuditLogsEnabled();
 

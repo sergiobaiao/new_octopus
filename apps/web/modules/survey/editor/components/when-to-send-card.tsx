@@ -9,8 +9,11 @@ import { TActionClass } from "@formbricks/types/action-classes";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { cn } from "@/lib/cn";
 import { getAccessFlags } from "@/lib/membership/utils";
+import { OpenedByCreatives } from "@/modules/ee/creatives/components/survey-side/opened-by-creatives";
+import type { TSurveyLinkedCreative } from "@/modules/ee/creatives/lib/survey-side";
 import { getTeamPermissionFlags } from "@/modules/ee/teams/utils/teams";
 import { TTeamPermission } from "@/modules/ee/teams/workspace-teams/types/team";
+import { ShowConditionsBlock } from "@/modules/show-conditions/components/show-conditions-block";
 import { AddActionModal } from "@/modules/survey/editor/components/add-action-modal";
 import { ActionClassInfo } from "@/modules/ui/components/action-class-info";
 import { AdvancedOptionToggle } from "@/modules/ui/components/advanced-option-toggle";
@@ -29,7 +32,11 @@ interface WhenToSendCardProps {
   workspacePermission: TTeamPermission | null;
   /** A save or publish was just blocked because this card has no trigger (ENG-2581). */
   hasError?: boolean;
+  /** The linked creatives, which open the survey on every click whatever its actions (ENG-3579). */
+  openedByCreatives?: readonly TSurveyLinkedCreative[];
 }
+
+const NO_CREATIVES: readonly TSurveyLinkedCreative[] = [];
 
 export const WhenToSendCard = ({
   workspaceId,
@@ -39,6 +46,7 @@ export const WhenToSendCard = ({
   membershipRole,
   workspacePermission,
   hasError = false,
+  openedByCreatives = NO_CREATIVES,
 }: Readonly<WhenToSendCardProps>) => {
   const { t } = useTranslation();
   const [open, setOpen] = useState(localSurvey.type === "app" ? true : false);
@@ -89,6 +97,10 @@ export const WhenToSendCard = ({
       const updatedSurvey = { ...localSurvey, autoClose: 10 };
       setLocalSurvey(updatedSurvey);
     }
+  };
+
+  const handleKeepEndingCardOpenToggle = () => {
+    setLocalSurvey({ ...localSurvey, keepEndingCardOpen: !localSurvey.keepEndingCardOpen });
   };
 
   const handleDelayToggle = () => {
@@ -163,6 +175,9 @@ export const WhenToSendCard = ({
     return !localSurvey.triggers || !localSurvey.triggers.length || !localSurvey.triggers[0];
   }, [localSurvey]);
 
+  // A creative opening the survey is what displays it, so the card isn't waiting for an action.
+  const isWaitingForOpener = containsEmptyTriggers && openedByCreatives.length === 0;
+
   // Read at render time rather than mirrored into state, so adding a trigger clears the error the
   // moment the survey has one — nothing has to remember to reset a flag.
   const showError = hasError && containsEmptyTriggers;
@@ -196,9 +211,9 @@ export const WhenToSendCard = ({
           className="h-full w-full cursor-pointer rounded-lg hover:bg-slate-50"
           id="whenToSendCardTrigger"
           aria-invalid={showError}>
-          <div className="inline-flex px-4 py-4">
+          <button type="button" className="inline-flex px-4 py-4 text-left">
             <div className="flex items-center pr-5 pl-2">
-              {containsEmptyTriggers ? (
+              {isWaitingForOpener ? (
                 <div
                   className={cn(
                     "size-7 rounded-full border",
@@ -221,13 +236,18 @@ export const WhenToSendCard = ({
                   : t("workspace.surveys.edit.choose_the_actions_which_trigger_the_survey")}
               </p>
             </div>
-          </div>
+          </button>
         </Collapsible.CollapsibleTrigger>
 
         <Collapsible.CollapsibleContent className="flex flex-col overflow-hidden data-[state=closed]:animate-collapsible-up data-[state=open]:animate-collapsible-down">
           <hr className="py-1 text-slate-600" />
 
           <div className="px-3 pt-1 pb-3">
+            {openedByCreatives.length > 0 && (
+              <div className="mb-3 rounded-lg border border-slate-300 bg-slate-50 p-4">
+                <OpenedByCreatives workspaceId={workspaceId} creatives={openedByCreatives} />
+              </div>
+            )}
             <div className="filter-scrollbar flex flex-col gap-4 overflow-auto rounded-lg border border-slate-300 bg-slate-50 p-4">
               <p className="text-sm font-semibold text-slate-800">
                 {t("workspace.surveys.edit.trigger_survey_when_one_of_the_actions_is_fired")}
@@ -287,6 +307,13 @@ export const WhenToSendCard = ({
                   {t("common.add_action")}
                 </Button>
               </div>
+
+              {/* Inside the trigger box, so it reads as one rule: trigger AND conditions (ENG-3687). */}
+              <ShowConditionsBlock
+                value={localSurvey.showConditions ?? null}
+                onChange={(showConditions) => setLocalSurvey((survey) => ({ ...survey, showConditions }))}
+                isReadOnly={isReadOnly}
+              />
             </div>
 
             {/* Survey Display Settings */}
@@ -358,6 +385,13 @@ export const WhenToSendCard = ({
                 </p>
               </label>
             </AdvancedOptionToggle>
+            <AdvancedOptionToggle
+              htmlId="keepEndingCardOpen"
+              isChecked={localSurvey.keepEndingCardOpen ?? false}
+              onToggle={handleKeepEndingCardOpenToggle}
+              title={t("workspace.surveys.edit.keep_ending_card_open")}
+              description={t("workspace.surveys.edit.keep_ending_card_open_description")}
+            />
             <AdvancedOptionToggle
               htmlId="randomizer"
               isChecked={randomizerToggle}

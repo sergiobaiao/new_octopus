@@ -1,9 +1,14 @@
 import { TOrganization } from "@formbricks/types/organizations";
 import { TSurvey, TSurveyCreateInputWithWorkspaceId } from "@formbricks/types/surveys/types";
 import { responses } from "@/app/lib/api/response";
+import { isDefaultEndingCardButtonLink } from "@/lib/survey/default-ending-card";
 import { getElementsFromBlocks } from "@/lib/survey/utils";
 import { getIsSpamProtectionEnabled } from "@/modules/ee/license-check/lib/utils";
 import { getSurveyFollowUpsPermission } from "@/modules/survey/follow-ups/lib/utils";
+import {
+  CUSTOM_HEAD_SCRIPTS_PERMISSION_MESSAGE,
+  canWriteCustomHeadScripts,
+} from "@/modules/survey/lib/custom-head-scripts-permission";
 import { getExternalUrlsPermission } from "@/modules/survey/lib/permission";
 
 export const checkFeaturePermissions = async (
@@ -32,7 +37,11 @@ export const checkFeaturePermissions = async (
       for (const newEnding of surveyData.endings) {
         const oldEnding = oldSurvey?.endings.find((e) => e.id === newEnding.id);
 
-        if (newEnding.type === "endScreen" && newEnding.buttonLink) {
+        if (
+          newEnding.type === "endScreen" &&
+          newEnding.buttonLink &&
+          !isDefaultEndingCardButtonLink(newEnding.buttonLink)
+        ) {
           if (!oldEnding || oldEnding.type !== "endScreen" || oldEnding.buttonLink !== newEnding.buttonLink) {
             return responses.forbiddenResponse(
               "External URLs are not enabled for this organization. Upgrade to use external button links."
@@ -67,4 +76,29 @@ export const checkFeaturePermissions = async (
   }
 
   return null;
+};
+
+/**
+ * Every permission a v1 survey write needs beyond the route's `workspace.write` check: the
+ * organization's feature entitlements, then `workspace.manage` for the API key when the write changes
+ * the survey's custom head scripts.
+ */
+export const checkSurveyWritePermissions = async (
+  surveyData: TSurveyCreateInputWithWorkspaceId,
+  organization: TOrganization,
+  apiKey: { apiKeyId: string; workspaceId: string },
+  oldSurvey?: TSurvey
+): Promise<Response | null> => {
+  const featureCheckResult = await checkFeaturePermissions(surveyData, organization, oldSurvey);
+  if (featureCheckResult) {
+    return featureCheckResult;
+  }
+
+  const canWriteScripts = await canWriteCustomHeadScripts(
+    { type: "apiKey", id: apiKey.apiKeyId },
+    apiKey.workspaceId,
+    surveyData,
+    oldSurvey ?? null
+  );
+  return canWriteScripts ? null : responses.forbiddenResponse(CUSTOM_HEAD_SCRIPTS_PERMISSION_MESSAGE);
 };

@@ -8,7 +8,7 @@ import {
   TSurveyPictureSelectionElement,
   TSurveyRatingElement,
 } from "@formbricks/types/surveys/elements";
-import { matchOptionByIdOrLabel } from "./matchers";
+import { matchOption } from "./matchers";
 import { parseCommaSeparated, parseNumber } from "./parsers";
 import { TValidationResult } from "./types";
 
@@ -32,8 +32,8 @@ export const validateMultipleChoiceSingle = (
 
   const hasOther = element.choices.at(-1)?.id === "other";
 
-  // Try matching by ID or label (new: supports both)
-  const matchedChoice = matchOptionByIdOrLabel(element.choices, answer, language);
+  // Try matching by ID, then label, then answer code
+  const matchedChoice = matchOption(element.choices, answer, language);
   if (matchedChoice) {
     return {
       isValid: true,
@@ -85,7 +85,7 @@ export const validateMultipleChoiceMulti = (
   let freeTextOtherCount = 0;
 
   for (const ans of answerChoices) {
-    const matchedChoice = matchOptionByIdOrLabel(element.choices, ans, language);
+    const matchedChoice = matchOption(element.choices, ans, language);
 
     if (matchedChoice) {
       const label = matchedChoice.label[language];
@@ -123,7 +123,7 @@ export const validateMultipleChoiceMulti = (
 
 export const validateNPS = (answer: string): TValidationResult => {
   const answerNumber = parseNumber(answer);
-  if (answerNumber === null || answerNumber < 0 || answerNumber > 10) {
+  if (answerNumber === null || !Number.isInteger(answerNumber) || answerNumber < 0 || answerNumber > 10) {
     return invalid(TSurveyElementTypeEnum.NPS);
   }
   return { isValid: true, type: TSurveyElementTypeEnum.NPS };
@@ -147,7 +147,12 @@ export const validateRating = (
   answer: string
 ): TValidationResult => {
   const answerNumber = parseNumber(answer);
-  if (answerNumber === null || answerNumber < 1 || answerNumber > (element.range ?? 5)) {
+  if (
+    answerNumber === null ||
+    !Number.isInteger(answerNumber) ||
+    answerNumber < 1 ||
+    answerNumber > (element.range ?? 5)
+  ) {
     return invalid(element.type);
   }
   return { isValid: true, type: element.type };

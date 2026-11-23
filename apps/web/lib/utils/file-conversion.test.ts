@@ -2,7 +2,7 @@ import { AsyncParser } from "@json2csv/node";
 import { describe, expect, test, vi } from "vitest";
 import * as xlsx from "xlsx";
 import { logger } from "@formbricks/logger";
-import { convertToCsv, convertToXlsxBuffer } from "./file-conversion";
+import { convertToCsv, convertToXlsxBuffer, toCsvLine } from "./file-conversion";
 
 // Mock the logger to capture error calls
 vi.mock("@formbricks/logger", () => ({
@@ -91,7 +91,7 @@ describe("convertToXlsxBuffer", () => {
   test("should convert JSON array to XLSX buffer and preserve data", () => {
     const buffer = convertToXlsxBuffer(fields, data);
     const wb = xlsx.read(buffer, { type: "buffer" });
-    const sheet = wb.Sheets["Sheet1"];
+    const sheet = wb.Sheets["Response Data"];
     // Skip header row (range:1) and remove internal row metadata
     const raw = xlsx.utils.sheet_to_json<Record<string, string | number>>(sheet, {
       header: fields,
@@ -114,7 +114,7 @@ describe("convertToXlsxBuffer", () => {
     const rows = payloads.map((p) => ({ name: p }));
     const buffer = convertToXlsxBuffer(["name"], rows);
     const wb = xlsx.read(buffer, { type: "buffer" });
-    const sheet = wb.Sheets["Sheet1"];
+    const sheet = wb.Sheets["Response Data"];
     payloads.forEach((p, i) => {
       const cell = sheet[`A${i + 2}`]; // row 1 is header
       // value stored as plain text, not as a formula (no `f` property)
@@ -126,7 +126,7 @@ describe("convertToXlsxBuffer", () => {
   test("should defang formula injection in xlsx header names", () => {
     const buffer = convertToXlsxBuffer(["=evil", "name"], [{ "=evil": "x", name: "Alice" }]);
     const wb = xlsx.read(buffer, { type: "buffer" });
-    const sheet = wb.Sheets["Sheet1"];
+    const sheet = wb.Sheets["Response Data"];
     const headerCell = sheet["A1"];
     expect(headerCell.f).toBeUndefined();
     expect(headerCell.v).toBe("'=evil");
@@ -142,10 +142,35 @@ describe("convertToXlsxBuffer", () => {
     // both cells survive instead of one overwriting the other.
     const buffer = convertToXlsxBuffer(["=field", "'=field"], [{ "=field": "a", "'=field": "b" }]);
     const wb = xlsx.read(buffer, { type: "buffer" });
-    const sheet = wb.Sheets["Sheet1"];
+    const sheet = wb.Sheets["Response Data"];
     expect(sheet["A1"].v).toBe("'=field");
     expect(sheet["B1"].v).toBe("'=field");
     expect(sheet["A2"].v).toBe("a");
     expect(sheet["B2"].v).toBe("b");
+  });
+});
+
+describe("toCsvLine", () => {
+  test("quotes strings, leaves numbers bare, and ends with CRLF", () => {
+    expect(toCsvLine(["run_1", 42, "surveys"])).toBe('"run_1",42,"surveys"\r\n');
+  });
+
+  test("doubles quotes inside a string so commas and quotes can't break the row", () => {
+    expect(toCsvLine(['He said "hi", then left'])).toBe('"He said ""hi"", then left"\r\n');
+  });
+
+  test("writes null and undefined as empty cells", () => {
+    expect(toCsvLine(["a", null, undefined, "b"])).toBe('"a",,,"b"\r\n');
+  });
+
+  test.each(["=SUM(A1)", "+1", "-1", "@cmd", "\tlead", "\rlead"])(
+    "defangs %j so a spreadsheet won't run it as a formula",
+    (value) => {
+      expect(toCsvLine([value])).toBe(`"'${value}"\r\n`);
+    }
+  );
+
+  test("keeps a newline inside a quoted cell", () => {
+    expect(toCsvLine(["line one\nline two"])).toBe('"line one\nline two"\r\n');
   });
 });

@@ -8,7 +8,7 @@ import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 import { ZUserPassword } from "@formbricks/types/user";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { disableTwoFactorAuthAction } from "@/modules/ee/two-factor-auth/actions";
 import { Button } from "@/modules/ui/components/button";
 import {
@@ -39,8 +39,8 @@ const ZDisableTwoFactorFormState = z
 type TDisableTwoFactorFormState = z.infer<typeof ZDisableTwoFactorFormState>;
 
 interface DisableTwoFactorModalProps {
-  open: boolean;
-  setOpen: (open: boolean) => void;
+  readonly open: boolean;
+  readonly setOpen: (open: boolean) => void;
 }
 
 export const DisableTwoFactorModal = ({ open, setOpen }: DisableTwoFactorModalProps) => {

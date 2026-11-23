@@ -9,7 +9,7 @@ import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TOrganizationRole } from "@formbricks/types/memberships";
 import { getAccessFlags } from "@/lib/membership/utils";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { updateTeamDetailsAction } from "@/modules/ee/teams/team-list/actions";
 import { DeleteTeam } from "@/modules/ee/teams/team-list/components/team-settings/delete-team";
 import { MemberRow } from "@/modules/ee/teams/team-list/components/team-settings/member-row";
@@ -42,14 +42,14 @@ import { TooltipRenderer } from "@/modules/ui/components/tooltip";
 import { Muted } from "@/modules/ui/components/typography";
 
 interface TeamSettingsModalProps {
-  open: boolean;
-  setOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  team: TTeamDetails;
-  orgMembers: TOrganizationMember[];
-  orgWorkspaces: TOrganizationWorkspace[];
-  membershipRole?: TOrganizationRole;
-  userTeamRole: TTeamRole | undefined;
-  currentUserId: string;
+  readonly open: boolean;
+  readonly setOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  readonly team: TTeamDetails;
+  readonly orgMembers: TOrganizationMember[];
+  readonly orgWorkspaces: TOrganizationWorkspace[];
+  readonly membershipRole?: TOrganizationRole;
+  readonly userTeamRole: TTeamRole | undefined;
+  readonly currentUserId: string;
 }
 
 export const TeamSettingsModal = ({

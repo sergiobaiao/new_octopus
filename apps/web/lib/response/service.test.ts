@@ -1,21 +1,38 @@
+import { createInMemoryResponseFindMany } from "./__mocks__/response-find-many.mock";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { TResponseUpdateInput } from "@formbricks/types/responses";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { deleteResponseFileUrls } from "@/modules/storage/lib/delete-response-files";
+import { enqueueReplacedSignatureFileCleanup } from "@/modules/storage/lib/replaced-signature-files";
 import { getOrganization } from "../organization/service";
-import { getResponseDownloadFile, responseSelection, updateResponse } from "./service";
+import { getSurvey } from "../survey/service";
+import { getSurveyFilteringValues } from "./filtering-values";
+import {
+  deleteResponse,
+  getResponseDownloadFile,
+  getResponseFilteringValues,
+  lockResponseForUpdate,
+  responseSelection,
+  updateResponse,
+} from "./service";
 import { calculateTtcTotal, getResponsesJson } from "./utils";
 
 vi.mock("@formbricks/database", () => ({
   prisma: {
+    $transaction: vi.fn(),
     response: {
       findMany: vi.fn(),
       findUnique: vi.fn(),
       update: vi.fn(),
     },
   },
+}));
+vi.mock("@/modules/email/lib/email-audit-maintenance", () => ({
+  requestEmailAuditErasureRequired: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/lib/utils/validate", () => ({
@@ -40,6 +57,10 @@ vi.mock("./utils", async (importOriginal) => {
     getResponsesJson: vi.fn(() => []),
   };
 });
+
+vi.mock("./filtering-values", () => ({
+  getSurveyFilteringValues: vi.fn(),
+}));
 
 vi.mock("../survey/service", () => ({
   getSurvey: vi.fn(() =>
@@ -68,6 +89,14 @@ vi.mock("../organization/service", () => ({
   getOrganization: vi.fn(),
 }));
 
+vi.mock("@/modules/storage/lib/delete-response-files", () => ({
+  deleteResponseFileUrls: vi.fn(),
+}));
+
+vi.mock("@/modules/storage/lib/replaced-signature-files", () => ({
+  enqueueReplacedSignatureFileCleanup: vi.fn(),
+}));
+
 vi.mock("../utils/file-conversion", () => ({
   convertToCsv: vi.fn(() => Promise.resolve("csv-content")),
   convertToXlsxBuffer: vi.fn(() => Buffer.from("xlsx-content")),
@@ -81,17 +110,17 @@ const mockResponseId = "response-123";
  * `vi.mocked(prisma.response.findUnique)` types `mockResolvedValue` against the method's default
  * instantiation, so the `select` at the call site is invisible to it and it asks for the **whole**
  * `Response` model — every scalar, not just the fourteen `responseSelection` names. That is what the
- * `as any` casts here were hiding, and it is why this is spelled as the selection plus the two
- * scalars it deliberately leaves out: `contactId`, and `ingestFlags`, which only `updateResponse`'s
- * pre-read selects (keeping it off every response the module returns). Together those are all
- * sixteen columns, and `responseSelection` carries the `contact` and `tags` relations the code under
- * test reads.
+ * `as any` casts here were hiding, and it is why this is spelled as the selection plus the three
+ * scalars it deliberately leaves out: `contactId`, `ingestFlags`, which only `updateResponse`'s
+ * pre-read selects (keeping it off every response the module returns), and `notShown` (ENG-6936),
+ * read only by the app's results. Together those are all seventeen columns, and `responseSelection`
+ * carries the `contact` and `tags` relations the code under test reads.
  *
  * Worth the indirection because it makes the fixture track the schema: add a column to the model and
  * these tests stop compiling, instead of a cast quietly supplying `undefined` for it.
  */
 type MockCurrentResponse = Prisma.ResponseGetPayload<{
-  select: typeof responseSelection & { contactId: true; ingestFlags: true };
+  select: typeof responseSelection & { contactId: true; ingestFlags: true; notShown: true };
 }>;
 
 const createMockCurrentResponse = (overrides: Partial<MockCurrentResponse> = {}): MockCurrentResponse => ({
@@ -109,10 +138,12 @@ const createMockCurrentResponse = (overrides: Partial<MockCurrentResponse> = {})
   singleUseId: null,
   language: "en",
   displayId: "display-123",
+  outcome: null,
   contact: null,
   tags: [],
   contactId: null,
   ingestFlags: null,
+  notShown: null,
   ...overrides,
 });
 
@@ -122,9 +153,99 @@ const createMockResponseInput = (overrides: Partial<TResponseUpdateInput> = {}):
   ...overrides,
 });
 
+describe("responseSelection", () => {
+  // The webhook body and the management sample route spread what this select returns, so a column left
+  // out of it is a key missing from the payload rather than a `null` (ENG-6780).
+  test("selects the outcome", () => {
+    expect(responseSelection.outcome).toBe(true);
+  });
+});
+
+describe("lockResponseForUpdate", () => {
+  // The lock mode, the workspace scope and the blocking behavior are proven against Postgres in
+  // response-concurrency.integration.test.ts; this covers the binding and the result mapping.
+  const lockingTx = (rows: { finished: boolean }[]) => ({ $queryRaw: vi.fn().mockResolvedValue(rows) });
+
+  test("binds the response and its workspace, and returns the finished flag", async () => {
+    const tx = lockingTx([{ finished: true }]);
+
+    await expect(
+      lockResponseForUpdate(tx as never, { responseId: "response-1", workspaceId: "workspace-1" })
+    ).resolves.toEqual({ finished: true });
+
+    const [, ...values] = tx.$queryRaw.mock.calls[0] as [TemplateStringsArray, ...unknown[]];
+    expect(values).toEqual(["response-1", "workspace-1"]);
+  });
+
+  test("returns null when the workspace has no such response", async () => {
+    await expect(
+      lockResponseForUpdate(lockingTx([]) as never, { responseId: "missing", workspaceId: "workspace-1" })
+    ).resolves.toBeNull();
+  });
+});
+
 describe("updateResponse", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  describe("replaced Signature images (ENG-6810)", () => {
+    const oldImage = "/storage/ws/private/surveys/survey-123/elements/sig/signature--fid--old.png";
+
+    test("queues the cleanup after the write, against the stored data and the merged data", async () => {
+      const currentResponse = createMockCurrentResponse({ data: { sig: oldImage, other: "kept" } });
+      vi.mocked(prisma.response.findUnique).mockResolvedValue(currentResponse);
+      vi.mocked(prisma.response.update).mockResolvedValue(currentResponse);
+
+      await updateResponse(mockResponseId, createMockResponseInput({ data: { sig: "" } }));
+
+      expect(enqueueReplacedSignatureFileCleanup).toHaveBeenCalledExactlyOnceWith(
+        prisma,
+        { surveyId: "survey-123", previousData: currentResponse.data, nextData: { sig: "", other: "kept" } },
+        { bestEffort: true }
+      );
+      expect(vi.mocked(prisma.response.update).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(enqueueReplacedSignatureFileCleanup).mock.invocationCallOrder[0]
+      );
+    });
+
+    test("queues on the caller's transaction, where a failure must propagate", async () => {
+      const currentResponse = createMockCurrentResponse({ data: { sig: oldImage } });
+      const tx = {
+        response: {
+          findUnique: vi.fn().mockResolvedValue(currentResponse),
+          update: vi.fn().mockResolvedValue(currentResponse),
+        },
+      };
+
+      await updateResponse(mockResponseId, createMockResponseInput({ data: { sig: "" } }), tx as never);
+
+      expect(enqueueReplacedSignatureFileCleanup).toHaveBeenCalledWith(tx, expect.anything(), {
+        bestEffort: false,
+      });
+    });
+
+    test("queues nothing when the update fails", async () => {
+      const currentResponse = createMockCurrentResponse({ data: { sig: oldImage } });
+      vi.mocked(prisma.response.findUnique).mockResolvedValue(currentResponse);
+      vi.mocked(prisma.response.update).mockRejectedValue(new Error("write failed"));
+
+      await expect(
+        updateResponse(mockResponseId, createMockResponseInput({ data: { sig: "" } }))
+      ).rejects.toThrow("write failed");
+
+      expect(enqueueReplacedSignatureFileCleanup).not.toHaveBeenCalled();
+    });
+
+    test("queues nothing for an update that carries no data", async () => {
+      const currentResponse = createMockCurrentResponse({ data: { sig: oldImage } });
+      vi.mocked(prisma.response.findUnique).mockResolvedValue(currentResponse);
+      vi.mocked(prisma.response.update).mockResolvedValue(currentResponse);
+
+      await updateResponse(mockResponseId, { finished: true });
+
+      expect(enqueueReplacedSignatureFileCleanup).not.toHaveBeenCalled();
+    });
   });
 
   describe("language canonicalization (ENG-1067)", () => {
@@ -547,6 +668,36 @@ describe("updateResponse", () => {
   });
 });
 
+describe("deleteResponse", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // The survey's only upload element was deleted, so no current element id matches the answer it left.
+  // Its key is filed under the response's own survey, which is what makes the file this response's to
+  // delete; matching on current element ids alone orphaned it in storage for good.
+  test("deletes an upload left by a removed element of the response's own survey", async () => {
+    const ownFile = "/storage/workspace-123/private/surveys/survey-123/elements/removed-upload/a.png";
+    const deletedRow = {
+      ...createMockCurrentResponse({ displayId: null, data: { "removed-upload": [ownFile] } }),
+      quotaLinks: [],
+    };
+    vi.mocked(prisma.$transaction).mockImplementation(async (callback) =>
+      callback({ response: { delete: vi.fn().mockResolvedValue(deletedRow) } } as never)
+    );
+    vi.mocked(getSurvey).mockResolvedValueOnce({
+      id: "survey-123",
+      workspaceId: "workspace-123",
+      blocks: [],
+      questions: [],
+    } as unknown as TSurvey);
+
+    await deleteResponse(mockResponseId);
+
+    expect(deleteResponseFileUrls).toHaveBeenCalledWith([ownFile], "workspace-123");
+  });
+});
+
 describe("getResponseDownloadFile", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -559,7 +710,6 @@ describe("getResponseDownloadFile", () => {
     await getResponseDownloadFile("survey-123", "csv");
 
     expect(getResponsesJson).toHaveBeenCalledWith(
-      expect.anything(),
       expect.anything(),
       expect.anything(),
       expect.anything(),
@@ -579,9 +729,67 @@ describe("getResponseDownloadFile", () => {
       expect.anything(),
       expect.anything(),
       expect.anything(),
-      expect.anything(),
       false,
       "UTC"
     );
+  });
+
+  test("exports every response once across batches when ids differ from createdAt order", async () => {
+    // 3,100 responses, so the export needs two 3,000-row batches. Ids follow insertion order but
+    // createdAt does not, as with imported responses.
+    const start = Date.UTC(2026, 0, 1);
+    const rows = Array.from({ length: 3100 }, (_, i) => ({
+      id: `response-${String(i).padStart(4, "0")}`,
+      createdAt: new Date(start + ((i * 7919) % 3100) * 1000),
+      contact: null,
+      tags: [],
+      quotaLinks: [],
+    }));
+    vi.mocked(prisma.response.findMany).mockImplementation(createInMemoryResponseFindMany(rows) as never);
+
+    await getResponseDownloadFile("survey-123", "csv");
+
+    const exportedIds = vi.mocked(getResponsesJson).mock.calls[0][1].map((response) => response.id);
+    expect(prisma.response.findMany).toHaveBeenCalledTimes(2);
+    expect(exportedIds).toHaveLength(rows.length);
+    expect(new Set(exportedIds).size).toBe(rows.length);
+  });
+});
+
+describe("getResponseFilteringValues", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test("derives the values from the loaded survey without reading every response (ENG-3755)", async () => {
+    const values = {
+      contactAttributes: {},
+      meta: {},
+      hiddenFields: {},
+      reservedValues: {},
+      variableValues: {},
+    };
+    vi.mocked(getSurveyFilteringValues).mockResolvedValue(values);
+
+    await expect(getResponseFilteringValues("survey-123")).resolves.toBe(values);
+
+    expect(getSurvey).toHaveBeenCalledWith("survey-123");
+    expect(getSurveyFilteringValues).toHaveBeenCalledWith(expect.objectContaining({ id: "survey-123" }));
+    expect(prisma.response.findMany).not.toHaveBeenCalled();
+  });
+
+  test("throws ResourceNotFoundError and queries nothing when the survey does not exist", async () => {
+    vi.mocked(getSurvey).mockResolvedValueOnce(null);
+
+    await expect(getResponseFilteringValues("survey-missing")).rejects.toThrow(ResourceNotFoundError);
+    expect(getSurveyFilteringValues).not.toHaveBeenCalled();
+  });
+
+  test("maps Prisma errors to DatabaseError", async () => {
+    vi.mocked(getSurveyFilteringValues).mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError("boom", { code: "P2010", clientVersion: "test" })
+    );
+
+    await expect(getResponseFilteringValues("survey-123")).rejects.toThrow(DatabaseError);
   });
 });

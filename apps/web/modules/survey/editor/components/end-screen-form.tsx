@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 import { TSurvey, TSurveyEndScreenCard, TSurveyRedirectUrlCard } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
 import { createI18nString, extractLanguageCodes, getLocalizedValue } from "@/lib/i18n/utils";
+import { DEFAULT_ENDING_CARD_BUTTON_LINK } from "@/lib/survey/default-ending-card";
 import { headlineToRecall, recallToHeadline } from "@/lib/utils/recall";
 import { ElementFormInput } from "@/modules/survey/components/element-form-input";
 import { RecallWrapper } from "@/modules/survey/components/element-form-input/components/recall-wrapper";
@@ -16,17 +17,17 @@ import { Label } from "@/modules/ui/components/label";
 import { Switch } from "@/modules/ui/components/switch";
 
 interface EndScreenFormProps {
-  localSurvey: TSurvey;
-  endingCardIndex: number;
-  isInvalid: boolean;
-  selectedLanguageCode: string;
-  updateSurvey: (
+  readonly localSurvey: TSurvey;
+  readonly endingCardIndex: number;
+  readonly isInvalid: boolean;
+  readonly selectedLanguageCode: string;
+  readonly updateSurvey: (
     input: Partial<TSurveyEndScreenCard & { _forceUpdate?: boolean }> | Partial<TSurveyRedirectUrlCard>
   ) => void;
-  endingCard: TSurveyEndScreenCard;
-  locale: TUserLocale;
-  isStorageConfigured: boolean;
-  isExternalUrlsAllowed: boolean;
+  readonly endingCard: TSurveyEndScreenCard;
+  readonly locale: TUserLocale;
+  readonly isStorageConfigured: boolean;
+  readonly isExternalUrlsAllowed: boolean;
 }
 
 export const EndScreenForm = ({
@@ -143,9 +144,11 @@ export const EndScreenForm = ({
                 updateSurvey({ buttonLabel: undefined, buttonLink: undefined });
               } else {
                 updateSurvey({
-                  buttonLabel: { default: t("workspace.surveys.edit.create_your_own_survey") },
-                  buttonLink:
-                    "https://formbricks.com?utm_source=formbricks-app&utm_medium=survey&utm_campaign=default_ending_cta",
+                  buttonLabel: createI18nString(
+                    t("workspace.surveys.edit.create_your_own_survey"),
+                    surveyLanguageCodes
+                  ),
+                  buttonLink: DEFAULT_ENDING_CARD_BUTTON_LINK,
                 });
               }
               setshowEndingCardCTA(!showEndingCardCTA);

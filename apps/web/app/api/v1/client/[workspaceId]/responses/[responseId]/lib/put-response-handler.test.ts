@@ -5,6 +5,7 @@ import {
   InvalidInputError,
   RESPONSE_ALREADY_FINISHED_ERROR_CODE,
   ResourceNotFoundError,
+  ResponseAlreadyFinishedError,
 } from "@formbricks/types/errors";
 import { responses } from "@/app/lib/api/response";
 import { putResponseHandler } from "./put-response-handler";
@@ -17,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   resolveClientApiIds: vi.fn(),
   sendToPipeline: vi.fn(),
   updateResponseWithQuotaEvaluation: vi.fn(),
+  getStoredResponseNotShown: vi.fn(),
   validateClientFileUploads: vi.fn(),
   validateOtherOptionLengthForMultipleChoice: vi.fn(),
   validateResponseData: vi.fn(),
@@ -54,6 +56,7 @@ vi.mock("@/modules/storage/utils", () => ({
 
 vi.mock("./response", () => ({
   updateResponseWithQuotaEvaluation: mocks.updateResponseWithQuotaEvaluation,
+  getStoredResponseNotShown: mocks.getStoredResponseNotShown,
 }));
 
 vi.mock("./validated-response-update-input", () => ({
@@ -141,6 +144,20 @@ describe("putResponseHandler", () => {
     mocks.validateOtherOptionLengthForMultipleChoice.mockReturnValue(null);
     mocks.validateResponseData.mockReturnValue(null);
     mocks.verifyLinkSurveyPinToken.mockReturnValue(true);
+  });
+
+  test("passes the stored response's survey for quota evaluation, never one from the request (ENG-3285)", async () => {
+    mocks.getValidatedResponseUpdateInput.mockResolvedValue({
+      responseUpdateInput: { ...getBaseResponseUpdateInput(), surveyId: "survey_of_another_tenant" },
+    });
+
+    const result = await putResponseHandler(createHandlerParams());
+
+    expect(result.response.status).toBe(200);
+    expect(mocks.getSurvey).toHaveBeenCalledWith(surveyId);
+    expect(mocks.updateResponseWithQuotaEvaluation).toHaveBeenCalledWith(
+      expect.objectContaining({ responseId, workspaceId, surveyId })
+    );
   });
 
   test("returns a bad request response when the response id is missing", async () => {
@@ -312,6 +329,21 @@ describe("putResponseHandler", () => {
       details: { code: RESPONSE_ALREADY_FINISHED_ERROR_CODE },
     });
     expect(mocks.updateResponseWithQuotaEvaluation).not.toHaveBeenCalled();
+  });
+
+  test("answers a response finished after the pre-check like one finished before it (ENG-6869)", async () => {
+    mocks.updateResponseWithQuotaEvaluation.mockRejectedValue(new ResponseAlreadyFinishedError(responseId));
+
+    const result = await putResponseHandler(createHandlerParams());
+
+    expect(result.response.status).toBe(400);
+    await expect(result.response.json()).resolves.toEqual({
+      code: "bad_request",
+      message: "Response is already finished",
+      details: { code: RESPONSE_ALREADY_FINISHED_ERROR_CODE },
+    });
+    expect(result.error).toBeUndefined();
+    expect(mocks.sendToPipeline).not.toHaveBeenCalled();
   });
 
   test("rejects updates when the survey is closed (not accepting submissions)", async () => {
@@ -606,8 +638,8 @@ describe("putResponseHandler", () => {
 
     /** What the handler actually persisted, and the flags it computed for it. */
     const persisted = () => {
-      const [, updateInput, ingestFlags] = mocks.updateResponseWithQuotaEvaluation.mock.calls[0];
-      return { data: updateInput.data, ingestFlags };
+      const [{ responseInput, ingestFlags }] = mocks.updateResponseWithQuotaEvaluation.mock.calls[0];
+      return { data: responseInput.data, ingestFlags };
     };
 
     test("drops a key no ingested field declares", async () => {

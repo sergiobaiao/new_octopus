@@ -1,5 +1,6 @@
 "use client";
 
+import { useQueryClient } from "@tanstack/react-query";
 import { CircleHelpIcon } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -16,10 +17,16 @@ import {
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { getTextContent } from "@formbricks/types/surveys/validation";
 import { createOrUpdateIntegrationAction } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/actions";
+import { integrationKeys } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/lib/query";
 import SlackLogo from "@/images/slacklogo.png";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { recallToHeadline } from "@/lib/utils/recall";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import {
+  RestrictedSurveyHint,
+  RestrictedSurveysNote,
+} from "@/modules/survey/visibility/components/restricted-survey-hint";
+import { isRestrictedSurveyPick } from "@/modules/survey/visibility/lib/outbound";
 import { AdditionalIntegrationSettings } from "@/modules/ui/components/additional-integration-settings";
 import { Button } from "@/modules/ui/components/button";
 import { Checkbox } from "@/modules/ui/components/checkbox";
@@ -38,6 +45,7 @@ import { Label } from "@/modules/ui/components/label";
 interface AddChannelMappingModalProps {
   workspaceId: string;
   surveys: TSurvey[];
+  surveyVisibilityEnabled: boolean;
   open: boolean;
   setOpen: (v: boolean) => void;
   slackIntegration: TIntegrationSlack;
@@ -48,14 +56,20 @@ interface AddChannelMappingModalProps {
 export const AddChannelMappingModal = ({
   workspaceId,
   surveys,
+  surveyVisibilityEnabled,
   open,
   setOpen,
   channels,
   slackIntegration,
   selectedIntegration,
-}: AddChannelMappingModalProps) => {
+}: Readonly<AddChannelMappingModalProps>) => {
   const { handleSubmit } = useForm();
+  // The mapping being edited keeps its survey selectable even if it has since been restricted.
+  const attachedSurveyIds = selectedIntegration ? [selectedIntegration.surveyId] : [];
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const refetchIntegration = () =>
+    queryClient.invalidateQueries({ queryKey: integrationKeys.byType(workspaceId, "slack") });
   const [selectedElements, setSelectedElements] = useState<string[]>([]);
   const [isLinkingChannel, setIsLinkingChannel] = useState(false);
   const [selectedSurvey, setSelectedSurvey] = useState<TSurvey | null>(null);
@@ -71,7 +85,8 @@ export const AddChannelMappingModal = ({
     type: "slack",
     config: {
       key: slackIntegration?.config?.key,
-      data: existingIntegrationData || [],
+      // A copy: the save and delete paths edit this array, and the original is the query cache's.
+      data: [...(existingIntegrationData ?? [])],
     },
   };
 
@@ -163,6 +178,7 @@ export const AddChannelMappingModal = ({
       }
       resetForm();
       setOpen(false);
+      void refetchIntegration();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Unknown error occurred");
     } finally {
@@ -202,6 +218,7 @@ export const AddChannelMappingModal = ({
       }
       toast.success(t("workspace.integrations.integration_removed_successfully"));
       setOpen(false);
+      void refetchIntegration();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Unknown error occurred");
     } finally {
@@ -280,6 +297,15 @@ export const AddChannelMappingModal = ({
                     selectedItem={selectedSurvey}
                     setSelectedItem={setSelectedSurvey}
                     disabled={surveys.length === 0}
+                    isItemDisabled={(survey: TSurvey) =>
+                      isRestrictedSurveyPick(surveyVisibilityEnabled, survey, attachedSurveyIds)
+                    }
+                    disabledItemHint={<RestrictedSurveyHint kind="restricted" />}
+                  />
+                  <RestrictedSurveysNote
+                    surveyVisibilityEnabled={surveyVisibilityEnabled}
+                    surveys={surveys}
+                    attachedSurveyIds={attachedSurveyIds}
                   />
                   <p className="m-1 text-xs text-slate-500">
                     {surveys.length === 0 && t("workspace.integrations.create_survey_warning")}

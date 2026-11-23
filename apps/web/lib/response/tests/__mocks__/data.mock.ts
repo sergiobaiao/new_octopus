@@ -79,6 +79,8 @@ export const mockResponse: ResponseMock = {
   endingId: null,
   displayId: null,
   ingestFlags: null,
+  notShown: null,
+  outcome: null,
 };
 
 const mockSurveyQuota: TSurveyQuota = {
@@ -152,6 +154,8 @@ export const mockResponses: ResponseMock[] = [
     endingId: null,
     displayId: null,
     ingestFlags: null,
+    notShown: null,
+    outcome: null,
   },
   {
     id: "clsk8db0r001kk8iujkn32q8g",
@@ -179,6 +183,8 @@ export const mockResponses: ResponseMock[] = [
     endingId: null,
     displayId: null,
     ingestFlags: null,
+    notShown: null,
+    outcome: null,
   },
   {
     id: "clsk7b15p001fk8iu04qpvo2f",
@@ -205,6 +211,8 @@ export const mockResponses: ResponseMock[] = [
     endingId: null,
     displayId: null,
     ingestFlags: null,
+    notShown: null,
+    outcome: null,
   },
   {
     id: "clsk6bk1l0017k8iut9dp0uxt",
@@ -231,6 +239,8 @@ export const mockResponses: ResponseMock[] = [
     endingId: null,
     displayId: null,
     ingestFlags: null,
+    notShown: null,
+    outcome: null,
   },
   {
     id: "clsk5tgkm000uk8iueqoficwc",
@@ -257,6 +267,8 @@ export const mockResponses: ResponseMock[] = [
     endingId: null,
     displayId: null,
     ingestFlags: null,
+    notShown: null,
+    outcome: null,
   },
 ];
 
@@ -390,6 +402,7 @@ export const mockSurveySummaryOutput = {
     {
       dropOffCount: 0,
       dropOffPercentage: 0,
+      notShownCount: 0,
       headline: "Question Text",
       elementType: "openText",
       elementId: "ars2tjk8hsi8oqk1uac00mo8",

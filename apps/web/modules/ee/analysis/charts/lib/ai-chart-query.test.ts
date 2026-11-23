@@ -1,15 +1,30 @@
+import { LEAKY_AI_ERRORS, findPlantedContent } from "@/lib/ai/__mocks__/leaky-ai-errors";
 import { NoObjectGeneratedError } from "ai";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { InvalidInputError } from "@formbricks/types/errors";
 import { AI_CHART_PROMPT_ERROR_CODE } from "./ai-chart-errors";
-import { ZAIQueryResponse, generateAIChartQuery } from "./ai-chart-query.server";
+import { ZAIQueryResponse, buildAIQueryResponseSchema, generateAIChartQuery } from "./ai-chart-query.server";
 
 const mocks = vi.hoisted(() => ({
   generateOrganizationAIObject: vi.fn(),
   getAIDataProfile: vi.fn(),
 }));
 
+const aiTimeoutEnv = vi.hoisted(() => ({ multiplier: 1 }));
+
 vi.mock("server-only", () => ({}));
+vi.mock("@/lib/env", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/lib/env")>();
+  return {
+    ...original,
+    env: {
+      ...original.env,
+      get AI_TIMEOUT_MULTIPLIER() {
+        return aiTimeoutEnv.multiplier;
+      },
+    },
+  };
+});
 
 vi.mock("@/lib/ai/service", () => ({
   generateOrganizationAIObject: mocks.generateOrganizationAIObject,
@@ -25,6 +40,7 @@ vi.mock("@/modules/ee/analysis/lib/ai-data-profile.server", () => ({
 
 describe("generateAIChartQuery", () => {
   beforeEach(() => {
+    aiTimeoutEnv.multiplier = 1;
     vi.clearAllMocks();
     mocks.getAIDataProfile.mockResolvedValue(null);
   });
@@ -33,9 +49,11 @@ describe("generateAIChartQuery", () => {
     vi.restoreAllMocks();
   });
 
-  test("returns the AI-generated chart type and normalized query for a clean response", async () => {
+  test.each([1, 3])("generates a chart with timeout multiplier %i", async (multiplier) => {
+    aiTimeoutEnv.multiplier = multiplier;
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: "Responses by Source Type",
         measures: ["FeedbackRecords.count"],
         dimensions: ["FeedbackRecords.sourceType"],
@@ -70,7 +88,7 @@ describe("generateAIChartQuery", () => {
         // Counts reasoning tokens too: at 1024 a thinking model spent the whole budget before
         // writing a field. Dropping this back below a few thousand reintroduces that failure.
         maxOutputTokens: 8192,
-        timeout: 30000,
+        timeout: 30_000 * multiplier,
       })
     );
   });
@@ -78,6 +96,7 @@ describe("generateAIChartQuery", () => {
   test("maps NPS score prompts to the NPS score measure", async () => {
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: null,
         measures: ["FeedbackRecords.npsScore"],
         dimensions: null,
@@ -104,6 +123,7 @@ describe("generateAIChartQuery", () => {
   test("strips a grouping the model put on a big number, which has no axis for it", async () => {
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: null,
         measures: ["FeedbackRecords.npsScore"],
         dimensions: ["FeedbackRecords.sourceName"],
@@ -143,6 +163,7 @@ describe("generateAIChartQuery", () => {
   test("falls back to the total count measure when the AI returns no measures", async () => {
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: null,
         measures: [],
         dimensions: null,
@@ -166,6 +187,7 @@ describe("generateAIChartQuery", () => {
   test("normalizes filters and time dimensions, dropping null-only optional fields", async () => {
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: null,
         measures: ["FeedbackRecords.count"],
         dimensions: null,
@@ -213,6 +235,7 @@ describe("generateAIChartQuery", () => {
 
   test("rejects value-based filters without a non-empty values array", () => {
     const result = ZAIQueryResponse.safeParse({
+      answerable: true,
       name: null,
       measures: ["FeedbackRecords.count"],
       dimensions: null,
@@ -230,6 +253,7 @@ describe("generateAIChartQuery", () => {
 
   test("rejects valueless filters that include values", () => {
     const result = ZAIQueryResponse.safeParse({
+      answerable: true,
       name: null,
       measures: ["FeedbackRecords.count"],
       dimensions: null,
@@ -245,6 +269,7 @@ describe("generateAIChartQuery", () => {
 
   test("allows valueless filters with omitted values", () => {
     const result = ZAIQueryResponse.safeParse({
+      answerable: true,
       name: null,
       measures: ["FeedbackRecords.count"],
       dimensions: null,
@@ -259,6 +284,7 @@ describe("generateAIChartQuery", () => {
   test("trims the AI-suggested name and caps it at 255 characters", async () => {
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: `  ${"a".repeat(300)}  `,
         measures: ["FeedbackRecords.count"],
         dimensions: null,
@@ -282,6 +308,7 @@ describe("generateAIChartQuery", () => {
   test("omits the name when the AI returns a blank name", async () => {
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: "   ",
         measures: ["FeedbackRecords.count"],
         dimensions: null,
@@ -336,6 +363,49 @@ describe("generateAIChartQuery", () => {
     });
   });
 
+  test("rejects a prompt the model flags as unanswerable instead of charting the default measure", async () => {
+    // What a model answers for "ASDASDSADASSADASD": a query shape filled in with the defaults,
+    // which used to render as a real-looking count chart.
+    mocks.generateOrganizationAIObject.mockResolvedValueOnce({
+      object: {
+        answerable: false,
+        name: "Total Feedback Records",
+        measures: ["FeedbackRecords.count"],
+        dimensions: null,
+        timeDimensions: null,
+        chartType: "big_number",
+        filters: null,
+      },
+    });
+
+    await expect(
+      generateAIChartQuery({
+        organizationId: "organization-1",
+        workspaceId: "workspace-1",
+        feedbackDirectoryId: "directory-1",
+        userId: "user-1",
+        prompt: "ASDASDSADASSADASD",
+      })
+    ).rejects.toMatchObject({
+      name: InvalidInputError.name,
+      message: AI_CHART_PROMPT_ERROR_CODE,
+    });
+  });
+
+  test("requires the model to state whether the prompt is answerable", () => {
+    const result = ZAIQueryResponse.safeParse({
+      name: null,
+      measures: ["FeedbackRecords.count"],
+      dimensions: null,
+      timeDimensions: null,
+      chartType: "bar",
+      filters: null,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0]?.path).toEqual(["answerable"]);
+  });
+
   test("does not convert provider failures", async () => {
     const providerError = new Error("billing disabled");
     mocks.generateOrganizationAIObject.mockRejectedValueOnce(providerError);
@@ -351,18 +421,41 @@ describe("generateAIChartQuery", () => {
     ).rejects.toBe(providerError);
   });
 
-  test("does not convert non-Error rejections", async () => {
-    mocks.generateOrganizationAIObject.mockRejectedValueOnce("string failure");
+  // ENG-3720: a rejection from here reaches the server action client, which writes a thrown error whole
+  // to the logs and to Sentry — and an AI SDK error carries the user's question and the model's answer.
+  test.each(LEAKY_AI_ERRORS)("rethrows a failure with %s without what the call carried", async (_, build) => {
+    mocks.generateOrganizationAIObject.mockRejectedValueOnce(build());
 
-    await expect(
-      generateAIChartQuery({
-        organizationId: "organization-1",
-        workspaceId: "workspace-1",
-        feedbackDirectoryId: "directory-1",
-        userId: "user-1",
-        prompt: "anything",
-      })
-    ).rejects.toBe("string failure");
+    const rejection = await generateAIChartQuery({
+      organizationId: "organization-1",
+      workspaceId: "workspace-1",
+      feedbackDirectoryId: "directory-1",
+      userId: "user-1",
+      prompt: "anything",
+    }).catch((thrown: unknown) => thrown);
+
+    expect(rejection).toBeInstanceOf(Error);
+    expect(findPlantedContent(rejection)).toBeUndefined();
+  });
+
+  // What the user sees: a non-Error rejection is not their prompt's fault, so it must not become the
+  // "could not be converted" prompt error — it stays an unexpected failure. And since the action client
+  // logs and reports that failure whole, it arrives redacted rather than as the raw value.
+  test("does not turn a non-Error rejection into a prompt error, and redacts it", async () => {
+    mocks.generateOrganizationAIObject.mockRejectedValueOnce({ error: { message: "string failure" } });
+
+    const rejection = await generateAIChartQuery({
+      organizationId: "organization-1",
+      workspaceId: "workspace-1",
+      feedbackDirectoryId: "directory-1",
+      userId: "user-1",
+      prompt: "anything",
+    }).catch((thrown: unknown) => thrown);
+
+    expect(rejection).not.toBeInstanceOf(InvalidInputError);
+    expect(rejection).toMatchObject({ name: "RedactedAIError", originalName: "object" });
+    expect(JSON.stringify(rejection)).not.toContain("string failure");
+    expect(String((rejection as Error).message)).not.toContain("string failure");
   });
 
   test("puts the directory's real sources and questions in the system prompt", async () => {
@@ -378,6 +471,7 @@ describe("generateAIChartQuery", () => {
     });
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: null,
         measures: ["FeedbackRecords.count"],
         dimensions: null,
@@ -404,6 +498,7 @@ describe("generateAIChartQuery", () => {
   test("turns an explicit window into the tuple the builder reads as a custom range", async () => {
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: null,
         measures: ["FeedbackRecords.count"],
         dimensions: null,
@@ -443,6 +538,7 @@ describe("generateAIChartQuery", () => {
   test("drops a date range the model could not express in the fields it was given", async () => {
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: null,
         measures: ["FeedbackRecords.count"],
         dimensions: null,
@@ -475,6 +571,7 @@ describe("generateAIChartQuery", () => {
     mocks.getAIDataProfile.mockResolvedValue(null);
     mocks.generateOrganizationAIObject.mockResolvedValueOnce({
       object: {
+        answerable: true,
         name: null,
         measures: ["FeedbackRecords.count"],
         dimensions: null,
@@ -493,5 +590,74 @@ describe("generateAIChartQuery", () => {
     });
 
     expect(mocks.generateOrganizationAIObject.mock.calls[0][0].system).toBe("schema context");
+  });
+});
+
+describe("AI chart generation for one dataset (ENG-6893, ENG-6894)", () => {
+  const dataset = {
+    embeddedFields: [{ name: "FeedbackRecords.ed_area_manager_1a2b3c4d", key: "Area Manager" }],
+    answerQuestions: [
+      {
+        id: "q_delivery",
+        label: "How was delivery?",
+        kind: "choice" as const,
+        options: [{ value: "opt_late", label: "Late" }],
+      },
+    ],
+  };
+  const output = (filters: unknown, dimensions: unknown = null) => ({
+    answerable: true,
+    name: null,
+    measures: ["FeedbackRecords.npsScore"],
+    dimensions,
+    timeDimensions: null,
+    chartType: "big_number",
+    filters,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getAIDataProfile.mockResolvedValue(null);
+  });
+
+  test("offers the dataset's embedded fields and the answer filter, and no other dataset's", () => {
+    const schema = buildAIQueryResponseSchema(dataset);
+    const answerRule = {
+      member: "FeedbackRecords.answer",
+      operator: "equals",
+      values: ["q_delivery:opt_late"],
+    };
+
+    expect(schema.safeParse(output([answerRule], ["FeedbackRecords.ed_area_manager_1a2b3c4d"])).success).toBe(
+      true
+    );
+    expect(schema.safeParse(output(null, ["FeedbackRecords.ed_other_99999999"])).success).toBe(false);
+    expect(ZAIQueryResponse.safeParse(output([answerRule])).success).toBe(false);
+    expect(buildAIQueryResponseSchema({ embeddedFields: [] }).safeParse(output([answerRule])).success).toBe(
+      false
+    );
+  });
+
+  test("turns 'NPS when delivery was late' into an answer rule the query keeps", async () => {
+    mocks.generateOrganizationAIObject.mockResolvedValueOnce({
+      object: output([
+        { member: "FeedbackRecords.fieldType", operator: "equals", values: ["nps"] },
+        { member: "FeedbackRecords.answer", operator: "equals", values: ["q_delivery:opt_late"] },
+      ]),
+    });
+
+    const result = await generateAIChartQuery({
+      organizationId: "organization-1",
+      workspaceId: "workspace-1",
+      feedbackDirectoryId: "directory-1",
+      userId: "user-1",
+      prompt: "NPS when delivery was late",
+      dataset,
+    });
+
+    expect(result.query.filters).toEqual([
+      { member: "FeedbackRecords.fieldType", operator: "equals", values: ["nps"] },
+      { member: "FeedbackRecords.answer", operator: "equals", values: ["q_delivery:opt_late"] },
+    ]);
   });
 });

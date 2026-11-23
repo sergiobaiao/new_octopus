@@ -12,7 +12,7 @@ import { getLanguageLabel, iso639Languages } from "@formbricks/i18n-utils/utils"
 import { TUserLocale } from "@formbricks/types/user";
 import type { TWorkspace } from "@formbricks/types/workspace";
 import { isWorkspaceDefaultSurveyLanguage } from "@/lib/i18n/default-survey-language";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { Alert, AlertDescription } from "@/modules/ui/components/alert";
 import { Button } from "@/modules/ui/components/button";
 import { ConfirmationModal } from "@/modules/ui/components/confirmation-modal";
@@ -36,9 +36,9 @@ import { LanguageLabels } from "./language-labels";
 import { LanguageRow } from "./language-row";
 
 interface EditLanguageProps {
-  workspace: TWorkspace;
-  locale: TUserLocale;
-  isReadOnly: boolean;
+  readonly workspace: TWorkspace;
+  readonly locale: TUserLocale;
+  readonly isReadOnly: boolean;
 }
 
 const checkIfDuplicateExists = (arr: string[]) => {

@@ -4,13 +4,15 @@ import { TEmbeddedDataType } from "@formbricks/types/embedded-data";
 import {
   RESERVED_FIELD_CATALOG,
   getComputedEmbeddedFields,
+  getIngestedEmbeddedFields,
   getSurveyEmbeddedFields,
   listShadowingNames,
 } from "@formbricks/types/embedded-data-resolver";
 import { InvalidInputError } from "@formbricks/types/errors";
-import { TResponseFilterCriteria } from "@formbricks/types/responses";
+import { TResponseFilterCriteria, TResponseStatusFilter } from "@formbricks/types/responses";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import { buildShownFilterClauses } from "./shown-filter";
 
 type TTypedFieldFilterCondition = NonNullable<TResponseFilterCriteria["reserved"]>[string];
 
@@ -46,6 +48,13 @@ export const RESERVED_FILTER_LOCATORS: Record<string, TReservedFilterLocator> = 
   viewportHeight: { kind: "meta", path: ["viewportHeight"] },
   timezone: { kind: "meta", path: ["timezone"] },
   locale: { kind: "meta", path: ["locale"] },
+  visitPagesViewed: { kind: "meta", path: ["visitPagesViewed"] },
+  visitUniquePagesViewed: { kind: "meta", path: ["visitUniquePagesViewed"] },
+  visitTimeOnSite: { kind: "meta", path: ["visitTimeOnSite"] },
+  visitEntryReferrer: { kind: "meta", path: ["visitEntryReferrer"] },
+  visitUrls: { kind: "meta", path: ["visitUrls"] },
+  openedByCreativeId: { kind: "meta", path: ["openedByCreativeId"] },
+  openedByCreativeName: { kind: "meta", path: ["openedByCreativeName"] },
   durationSeconds: { kind: "ttcTotalMs" },
 };
 
@@ -72,6 +81,45 @@ const COMPARISON_OP_TO_PRISMA: Record<string, string> = {
 };
 
 /**
+ * A half-open `[min, max)` window on a JSON path: what a date-only filter value means against a
+ * column that stores days and instants alike (ENG-3232). `notInRange` treats an absent value as a
+ * match, like `notEquals`.
+ *
+ * Date fields only. The bounds are strings — `ZResponseFilterCriteria` types them that way so an
+ * ISO day and an ISO instant compare lexicographically the way they do in time — and only
+ * `buildDateFieldCondition` ever produces this op, from a `date` field. A number stored in JSON
+ * would be compared against those strings across JSON types rather than by value, so a numeric
+ * range would quietly select the wrong rows; numbers filter through `gt`/`gte`/`lt`/`lte` instead,
+ * which `buildTypedFieldCondition` gives them with a real numeric operand. Anything else could only
+ * have been crafted by hand, so it fails closed.
+ */
+const buildJsonPathRangeCondition = (
+  column: "meta" | "variables",
+  path: string[],
+  val: Extract<TTypedFieldFilterCondition, { op: "inRange" | "notInRange" }>,
+  dataType: TEmbeddedDataType
+): Prisma.ResponseWhereInput | null => {
+  if (dataType !== "date") return null;
+
+  if (val.op === "inRange") {
+    return {
+      AND: [
+        mkJsonColumnFilter(column, { path, gte: val.min }),
+        mkJsonColumnFilter(column, { path, lt: val.max }),
+      ],
+    };
+  }
+
+  return {
+    OR: [
+      mkJsonColumnFilter(column, { path, lt: val.min }),
+      mkJsonColumnFilter(column, { path, gte: val.max }),
+      mkJsonColumnFilter(column, { path, equals: Prisma.DbNull }),
+    ],
+  };
+};
+
+/**
  * One typed condition → one Prisma JSON-path filter on `meta` or `variables`. `notEquals` and
  * `isNotSet` treat an absent value as a match (same stance as the `data` branch below). Ops that
  * don't fit the field's dataType — text ops on anything but a string, comparisons on a boolean or
@@ -95,8 +143,14 @@ const buildJsonPathCondition = (
     };
   }
 
+  if (val.op === "inRange" || val.op === "notInRange") {
+    return buildJsonPathRangeCondition(column, path, val, dataType);
+  }
+
+  if (!("value" in val)) return null;
+
   const textOp = TEXT_OP_TO_PRISMA[val.op];
-  if (textOp && "value" in val) {
+  if (textOp) {
     if (dataType !== "string") return null;
     // The dynamic Prisma key needs one cast; the three keys above are all valid string filters.
     const filter = mkJsonColumnFilter(column, {
@@ -107,15 +161,12 @@ const buildJsonPathCondition = (
   }
 
   const comparisonKey = COMPARISON_OP_TO_PRISMA[val.op];
-  if (comparisonKey && "value" in val) {
-    if (dataType !== "number" && dataType !== "date") return null;
-    return mkJsonColumnFilter(column, {
-      path,
-      [comparisonKey]: val.value,
-    } as Prisma.ResponseWhereInput["meta"]);
-  }
-
-  return null;
+  if (!comparisonKey) return null;
+  if (dataType !== "number" && dataType !== "date") return null;
+  return mkJsonColumnFilter(column, {
+    path,
+    [comparisonKey]: val.value,
+  } as Prisma.ResponseWhereInput["meta"]);
 };
 
 /**
@@ -209,6 +260,53 @@ const buildVariableConditions = (
 };
 
 /**
+ * The `data` keys a range may name: ingested **date** fields, for the reason
+ * {@link buildJsonPathRangeCondition} gives — string bounds cannot range a stored number.
+ *
+ * The group is shared. `processIngestedFilters` writes ingested storageKeys into it beside the
+ * element ids that have always lived there, so unlike `variables` it cannot simply drop keys it
+ * does not recognise — an element id is a legitimate key that no embedded field answers for.
+ */
+const rangeableIngestedDataKeys = (survey: TSurvey): ReadonlySet<string> =>
+  new Set(
+    getIngestedEmbeddedFields(survey)
+      .filter(({ field }) => field.dataType === "date")
+      .map(({ link }) => link.storageKey)
+  );
+
+/**
+ * A half-open `[min, max)` window on the `data` column, or nothing at all.
+ *
+ * Same rule as {@link buildJsonPathRangeCondition} on `meta` and `variables`: a range is only
+ * meaningful over an ordered type, and the real producer never asks for another — `inRange` and
+ * `notInRange` reach `data` only through `processIngestedFilters`, which builds them from
+ * `buildTypedFieldCondition`. So this answers crafted criteria, and it answers them by failing
+ * closed rather than by lexicographically ranging a string. `notInRange` lets an absent value
+ * match, like `notEquals` in the same switch.
+ */
+const buildDataRangeConditions = (
+  key: string,
+  val: Extract<NonNullable<TResponseFilterCriteria["data"]>[string], { op: "inRange" | "notInRange" }>,
+  rangeableKeys: ReadonlySet<string>
+): Prisma.ResponseWhereInput[] => {
+  if (!rangeableKeys.has(key)) return [];
+
+  if (val.op === "inRange") {
+    return [{ AND: [{ data: { path: [key], gte: val.min } }, { data: { path: [key], lt: val.max } }] }];
+  }
+
+  return [
+    {
+      OR: [
+        { data: { path: [key], lt: val.min } },
+        { data: { path: [key], gte: val.max } },
+        { data: { path: [key], equals: Prisma.DbNull } },
+      ],
+    },
+  ];
+};
+
+/**
  * The ENG-1848 criteria groups as ready-to-push clauses. Both branches live here rather than in
  * `buildWhereClause`, which sat exactly at the cognitive-complexity limit before this feature —
  * even two plain `if`s there tip it over.
@@ -245,6 +343,10 @@ const createFilterTags = (tags: TResponseFilterCriteria["tags"]) => {
       },
     }));
     filterTags.push(appliedTags);
+  }
+
+  if (tags?.appliedAny?.length) {
+    filterTags.push({ tags: { some: { tag: { name: { in: tags.appliedAny } } } } });
   }
 
   if (tags?.notApplied) {
@@ -317,6 +419,98 @@ const createClauseBudget = (): ((count: number) => void) => {
   };
 };
 
+/**
+ * "At least one entry of this multi answer is not one of `predefinedLabels`": the Other write-in, which
+ * is stored as the typed text. Prisma's JSON filters have no subset operator, so each array position
+ * is probed by numeric path segment (see the includesOne branch for why the probe has slack).
+ */
+const writeInEntryClause = (
+  key: string,
+  choiceCount: number,
+  predefinedLabels: readonly string[],
+  spend: (count: number) => void
+): Prisma.ResponseWhereInput => {
+  const positions = choiceCount + OTHER_WRITE_IN_PROBE_SLACK;
+  spend(positions * (predefinedLabels.length + 1));
+  return {
+    OR: Array.from({ length: positions }, (_unused, index) => ({
+      AND: [
+        { data: { path: [key, String(index)], not: Prisma.DbNull } },
+        ...predefinedLabels.map((label) => ({ data: { path: [key, String(index)], not: label } })),
+      ],
+    })),
+  };
+};
+
+/**
+ * "Includes all" of a multi answer. Other is never stored as such: the answer holds the typed text
+ * instead, so Other among the values means "has a write-in", next to the predefined values it must
+ * contain.
+ */
+const includesAllClauses = (
+  key: string,
+  element: ReturnType<typeof getElementsFromBlocks>[number] | undefined,
+  values: (string | number)[],
+  spend: (count: number) => void
+): Prisma.ResponseWhereInput[] => {
+  if (element?.type !== "multipleChoiceMulti") return [{ data: { path: [key], array_contains: values } }];
+  const otherChoice = element.choices.find((choice) => choice.id === "other");
+  const otherLabels = new Set(otherChoice ? Object.values(otherChoice.label) : []);
+  const predefined = values.filter((value) => !otherLabels.has(String(value)));
+  if (predefined.length === values.length) return [{ data: { path: [key], array_contains: values } }];
+
+  const predefinedLabels = [
+    ...new Set(
+      element.choices
+        .filter((choice) => choice.id !== "other")
+        .flatMap((choice) => Object.values(choice.label))
+    ),
+  ];
+  return [
+    ...(predefined.length > 0 ? [{ data: { path: [key], array_contains: predefined } }] : []),
+    writeInEntryClause(key, element.choices.length, predefinedLabels, spend),
+  ];
+};
+
+/** Whether the filter selects Low quality responses, by `outcome` or as one of several `statuses`. */
+export const selectsLowQuality = (filterCriteria: TResponseFilterCriteria | undefined): boolean =>
+  Boolean(filterCriteria?.outcome) || Boolean(filterCriteria?.statuses?.includes("lowQuality"));
+
+/**
+ * The outcome the filter selects, or (for the export) only responses without one. A filter that selects
+ * Low quality through `statuses` is not narrowed further: that choice wins over leaving them out.
+ */
+const buildOutcomeCondition = (
+  filterCriteria: TResponseFilterCriteria | undefined
+): Prisma.ResponseWhereInput | null => {
+  if (filterCriteria?.outcome) return { outcome: filterCriteria.outcome };
+  return filterCriteria?.excludeLowQuality && !selectsLowQuality(filterCriteria) ? { outcome: null } : null;
+};
+
+const STATUS_CONDITIONS: Record<TResponseStatusFilter, Prisma.ResponseWhereInput> = {
+  complete: { finished: true },
+  partial: { finished: false },
+  lowQuality: { outcome: "lowQuality" },
+};
+
+const buildStatusesCondition = (
+  filterCriteria: TResponseFilterCriteria | undefined
+): Prisma.ResponseWhereInput | null =>
+  filterCriteria?.statuses?.length
+    ? { OR: filterCriteria.statuses.map((status) => STATUS_CONDITIONS[status]) }
+    : null;
+
+/** The time range the filter selects: `max` is the latest, `min` the earliest creation time. */
+const buildCreatedAtCondition = (
+  filterCriteria: TResponseFilterCriteria | undefined
+): Prisma.ResponseWhereInput | null => {
+  if (!filterCriteria?.createdAt) return null;
+  const createdAt: { lte?: Date; gte?: Date } = {};
+  if (filterCriteria.createdAt.max) createdAt.lte = filterCriteria.createdAt.max;
+  if (filterCriteria.createdAt.min) createdAt.gte = filterCriteria.createdAt.min;
+  return { createdAt };
+};
+
 export const buildWhereClause = (survey: TSurvey, filterCriteria?: TResponseFilterCriteria) => {
   const whereClause: Prisma.ResponseWhereInput["AND"] = [];
 
@@ -328,18 +522,19 @@ export const buildWhereClause = (survey: TSurvey, filterCriteria?: TResponseFilt
     });
   }
 
-  if (filterCriteria?.createdAt) {
-    const createdAt: { lte?: Date; gte?: Date } = {};
-    if (filterCriteria?.createdAt?.max) {
-      createdAt.lte = filterCriteria?.createdAt?.max;
-    }
-    if (filterCriteria?.createdAt?.min) {
-      createdAt.gte = filterCriteria?.createdAt?.min;
-    }
+  const outcomeCondition = buildOutcomeCondition(filterCriteria);
+  if (outcomeCondition) {
+    whereClause.push(outcomeCondition);
+  }
 
-    whereClause.push({
-      createdAt,
-    });
+  const statusesCondition = buildStatusesCondition(filterCriteria);
+  if (statusesCondition) {
+    whereClause.push(statusesCondition);
+  }
+
+  const createdAtCondition = buildCreatedAtCondition(filterCriteria);
+  if (createdAtCondition) {
+    whereClause.push(createdAtCondition);
   }
 
   if (filterCriteria?.tags) {
@@ -488,6 +683,13 @@ export const buildWhereClause = (survey: TSurvey, filterCriteria?: TResponseFilt
             },
           });
           break;
+        case "in":
+          others.push({
+            [key.toLocaleLowerCase()]: {
+              in: val.value,
+            },
+          });
+          break;
       }
     });
     whereClause.push({
@@ -495,12 +697,21 @@ export const buildWhereClause = (survey: TSurvey, filterCriteria?: TResponseFilt
     });
   }
 
-  whereClause.push(...buildEmbeddedDataFilterClauses(survey, filterCriteria));
+  whereClause.push(
+    ...buildEmbeddedDataFilterClauses(survey, filterCriteria),
+    ...buildShownFilterClauses(survey, filterCriteria?.shown, spend)
+  );
 
-  if (filterCriteria?.data) {
+  // `dataAnd` carries further conditions on keys `data` already holds; every one of them must hold.
+  const dataEntries = [
+    ...Object.entries(filterCriteria?.data ?? {}),
+    ...(filterCriteria?.dataAnd ?? []).map(({ key, condition }) => [key, condition] as const),
+  ];
+  if (dataEntries.length > 0) {
     const data: Prisma.ResponseWhereInput[] = [];
+    const rangeableIngestedKeys = rangeableIngestedDataKeys(survey);
 
-    Object.entries(filterCriteria.data).forEach(([key, val]) => {
+    dataEntries.forEach(([key, val]) => {
       const elements = getElementsFromBlocks(survey.blocks);
       const element = elements.find((element) => element.id === key);
 
@@ -603,13 +814,12 @@ export const buildWhereClause = (survey: TSurvey, filterCriteria?: TResponseFilt
             },
           });
           break;
+        case "inRange":
+        case "notInRange":
+          data.push(...buildDataRangeConditions(key, val, rangeableIngestedKeys));
+          break;
         case "includesAll":
-          data.push({
-            data: {
-              path: [key],
-              array_contains: val.value,
-            },
-          });
+          data.push(...includesAllClauses(key, element, val.value, spend));
           break;
         case "includesOne": {
           const values = new Set(val.value.map((v) => v.toString()));
@@ -652,27 +862,16 @@ export const buildWhereClause = (survey: TSurvey, filterCriteria?: TResponseFilt
               // with the write-in at an unprobed index — silently narrowing what the pre-ENG-3161
               // predicate matched:
               //
-              //   - nothing enforces uniqueness (`ZResponseDataValue` is `z.array(z.string())` with
-              //     no cap), so `["A0","A0","A0","A0","write-in"]` is accepted on a 3-choice element;
+              //   - nothing enforces uniqueness (`ZResponseDataValue` is `z.array(z.string())`; some
+              //     write paths cap its length, none its contents), so
+              //     `["A0","A0","A0","A0","write-in"]` is accepted on a 3-choice element;
               //   - deleting choices from a running survey shrinks `choices.length` while the already
               //     collected answers keep their original length.
               //
               // The slack covers both at realistic sizes. It cannot close the class — an array with
               // more than SLACK duplicates still escapes — because a positional probe cannot bound an
               // unbounded array. Bounding the stored array on write is the real fix and its own ticket.
-              const positions = element.choices.length + OTHER_WRITE_IN_PROBE_SLACK;
-              spend(positions * (predefinedLabels.length + 1));
-
-              data.push({
-                OR: Array.from({ length: positions }, (_unused, index) => ({
-                  AND: [
-                    { data: { path: [key, String(index)], not: Prisma.DbNull } },
-                    ...predefinedLabels.map((label) => ({
-                      data: { path: [key, String(index)], not: label },
-                    })),
-                  ],
-                })),
-              });
+              data.push(writeInEntryClause(key, element.choices.length, predefinedLabels, spend));
             } else {
               // A single answer is a scalar string, so "not any predefined label" is directly
               // expressible and stays linear in the label count.
@@ -766,13 +965,11 @@ export const buildWhereClause = (survey: TSurvey, filterCriteria?: TResponseFilt
           });
           break;
         case "matrix": {
-          const rowLabel = Object.keys(val.value)[0];
-          data.push({
-            data: {
-              path: [key, rowLabel],
-              equals: val.value[rowLabel],
-            },
-          });
+          const rows = Object.entries(val.value);
+          spend(rows.length);
+          for (const [rowLabel, column] of rows) {
+            data.push({ data: { path: [key, rowLabel], equals: column } });
+          }
           break;
         }
         // Text ops for string-typed ingested Embedded Data fields (ENG-1848).

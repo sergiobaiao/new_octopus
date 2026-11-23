@@ -1,13 +1,26 @@
-import { render } from "@react-email/render";
+import { render } from "react-email";
+import { AccountDeletedEmail } from "../../emails/auth/account-deleted-email";
 import { DeleteAccountEmail } from "../../emails/auth/delete-account-email";
 import { ForgotPasswordEmail } from "../../emails/auth/forgot-password-email";
 import { NewEmailVerification } from "../../emails/auth/new-email-verification";
 import { PasswordResetNotifyEmail } from "../../emails/auth/password-reset-notify-email";
 import { SsoRecoveryFactorsRemovedEmail } from "../../emails/auth/sso-recovery-factors-removed-email";
+import { SsoSignInHintEmail } from "../../emails/auth/sso-sign-in-hint-email";
 import { VerificationEmail } from "../../emails/auth/verification-email";
 import { EmailCustomizationPreviewEmail } from "../../emails/general/email-customization-preview-email";
 import { InviteAcceptedEmail } from "../../emails/invite/invite-accepted-email";
 import { InviteEmail } from "../../emails/invite/invite-email";
+import { MemberRetentionNoticeEmail } from "../../emails/retention/member-retention-notice-email";
+import {
+  SurveyRetentionNoticeEmail,
+  type TRetentionNoticeArchivedSurvey,
+  type TRetentionNoticeResponseDeletion,
+} from "../../emails/retention/survey-retention-notice-email";
+import {
+  AttachmentExportFailedEmail,
+  type TAttachmentExportFailureReason,
+} from "../../emails/survey/attachment-export-failed-email";
+import { AttachmentExportReadyEmail } from "../../emails/survey/attachment-export-ready-email";
 import { EmbedSurveyPreviewEmail } from "../../emails/survey/embed-survey-preview-email";
 import { FollowUpEmail, FollowUpEmailProps } from "../../emails/survey/follow-up-email";
 import { LinkSurveyEmail } from "../../emails/survey/link-survey-email";
@@ -63,15 +76,84 @@ export async function renderPasswordResetNotifyEmail(
   return await render(PasswordResetNotifyEmail(props));
 }
 
+export async function renderAccountDeletedEmail(
+  props: { t: TFunction } & TEmailTemplateLegalProps
+): Promise<string> {
+  return await render(AccountDeletedEmail(props));
+}
+
 export async function renderSsoRecoveryFactorsRemovedEmail(
   props: {
     passwordRemoved: boolean;
     twoFactorRemoved: boolean;
+    apiKeysRemoved: boolean;
     securitySettingsLink: string;
     t: TFunction;
   } & TEmailTemplateLegalProps
 ): Promise<string> {
   return await render(SsoRecoveryFactorsRemovedEmail(props));
+}
+
+export async function renderSsoSignInHintEmail(
+  props: {
+    providerNames: string[];
+    loginLink: string;
+    t: TFunction;
+  } & TEmailTemplateLegalProps
+): Promise<string> {
+  return await render(SsoSignInHintEmail(props));
+}
+
+export async function renderSurveyRetentionNoticeEmail(
+  props: {
+    organizationName: string;
+    archivedSurveys: readonly TRetentionNoticeArchivedSurvey[];
+    responseDeletions: readonly TRetentionNoticeResponseDeletion[];
+    settingsLink: string;
+    t: TFunction;
+  } & TEmailTemplateLegalProps
+): Promise<string> {
+  return await render(SurveyRetentionNoticeEmail(props));
+}
+
+export async function renderMemberRetentionNoticeEmail(
+  props: {
+    organizationName: string;
+    deactivateDate: string;
+    loginLink: string;
+    t: TFunction;
+  } & TEmailTemplateLegalProps
+): Promise<string> {
+  return await render(MemberRetentionNoticeEmail(props));
+}
+
+export async function renderAttachmentExportReadyEmail(
+  props: {
+    surveyName: string;
+    archiveSize: string;
+    fileCount: string;
+    includedFileCount: string;
+    sizeLimit: string;
+    retentionMonths: string;
+    expiryDate: string;
+    truncated: boolean;
+    downloadLink: string;
+    t: TFunction;
+  } & TEmailTemplateLegalProps
+): Promise<string> {
+  return await render(AttachmentExportReadyEmail(props));
+}
+
+export async function renderAttachmentExportFailedEmail(
+  props: {
+    surveyName: string;
+    reason: TAttachmentExportFailureReason;
+    maxFiles: string;
+    responsesLink: string;
+    t: TFunction;
+  } & TEmailTemplateLegalProps
+): Promise<string> {
+  return await render(AttachmentExportFailedEmail(props));
 }
 
 export async function renderInviteEmail(

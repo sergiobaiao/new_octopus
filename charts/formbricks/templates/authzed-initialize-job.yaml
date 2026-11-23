@@ -1,3 +1,4 @@
+{{- if ne .Values.upgrade.mode "online" }}
 {{- if and .Values.authzed.enabled .Values.authzed.initialization.enabled (or .Release.IsInstall (and .Release.IsUpgrade .Values.authzed.migrationAcknowledged)) }}
 ---
 apiVersion: batch/v1
@@ -48,12 +49,14 @@ spec:
         - name: initialize
           image: {{ include "formbricks.deploymentImage" . }}
           imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+          {{- $securityContext := dict "allowPrivilegeEscalation" false "capabilities" (dict "drop" (list "ALL")) "readOnlyRootFilesystem" true "runAsNonRoot" true }}
+          {{- $podSecurityContext := .Values.deployment.securityContext | default dict }}
+          {{- /* Preserve an existing Pod UID; otherwise the image's named USER nextjs needs UID 1001. */}}
+          {{- if eq $podSecurityContext.runAsUser nil }}
+          {{- $_ := set $securityContext "runAsUser" 1001 }}
+          {{- end }}
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
+            {{- mergeOverwrite $securityContext (.Values.authzed.initialization.securityContext | default dict) | toYaml | nindent 12 }}
           command: ["sh", "-ec"]
           args:
             - |
@@ -134,4 +137,6 @@ spec:
               value: {{ include "formbricks.authzedInsecure" . | quote }}
             - name: AUTHZED_CONSISTENCY
               value: fully_consistent
+{{- end }}
+
 {{- end }}

@@ -3,7 +3,11 @@ import { prisma } from "@formbricks/database";
 import { reconcileApiKeyRelationships } from "./api-key";
 import { isAuthzedEnabled } from "./config";
 import { reconcileFeedbackDirectoryRelationships } from "./feedback-directory";
-import { recordAuthzedRevocationDelivery } from "./metrics";
+import {
+  observeAuthzedOutboxStatus,
+  recordAuthzedOutboxDrain,
+  recordAuthzedRevocationDelivery,
+} from "./metrics";
 import {
   deleteOrganizationRelationships,
   deleteUserOrganizationRelationships,
@@ -11,6 +15,7 @@ import {
 } from "./organization-membership";
 import {
   drainAuthzedOutbox,
+  observeAuthzedOutboxHealth,
   processAuthzedOutboxBatch,
   processAuthzedProjectionDeliveryJob,
 } from "./outbox-processor";
@@ -22,6 +27,7 @@ import {
 } from "./outbox-repository";
 import type { TAuthzedOutboxEvent, TAuthzedOutboxTargetType } from "./outbox-types";
 import type { TAuthzedProjectionResult } from "./projection";
+import { reconcileSurveyRelationships } from "./survey";
 import { deleteUserTeamRelationships, reconcileTeamWorkspaceRelationships } from "./team-workspace";
 
 vi.mock("@formbricks/database", () => ({
@@ -35,8 +41,9 @@ vi.mock("./api-key", () => ({ reconcileApiKeyRelationships: vi.fn() }));
 vi.mock("./config", () => ({ isAuthzedEnabled: vi.fn() }));
 vi.mock("./feedback-directory", () => ({ reconcileFeedbackDirectoryRelationships: vi.fn() }));
 vi.mock("./metrics", () => ({
+  observeAuthzedOutboxStatus: vi.fn(),
   recordAuthzedOutboxDelivery: vi.fn(),
-  recordAuthzedOutboxStatus: vi.fn(),
+  recordAuthzedOutboxDrain: vi.fn(),
   recordAuthzedRevocationDelivery: vi.fn(),
 }));
 vi.mock("./organization-membership", () => ({
@@ -52,6 +59,7 @@ vi.mock("./outbox-repository", () => ({
   markAuthzedOutboxEventsDelivered: vi.fn(),
   markAuthzedOutboxEventsFailed: vi.fn(),
 }));
+vi.mock("./survey", () => ({ reconcileSurveyRelationships: vi.fn() }));
 vi.mock("./team-workspace", () => ({
   deleteUserTeamRelationships: vi.fn(),
   reconcileTeamWorkspaceRelationships: vi.fn(),
@@ -95,6 +103,7 @@ const everyTarget = (): ReadonlyArray<TAuthzedOutboxEvent> => [
   event("api_key_workspace", "key", "workspace"),
   event("feedback_directory", "directory"),
   event("feedback_directory_assignment", "directory", "workspace"),
+  event("survey", "survey"),
 ];
 
 const sorted = (ids: ReadonlyArray<string>): ReadonlyArray<string> =>
@@ -115,6 +124,7 @@ describe("AuthZed projection outbox processor", () => {
     vi.mocked(reconcileTeamWorkspaceRelationships).mockResolvedValue(projected);
     vi.mocked(reconcileApiKeyRelationships).mockResolvedValue(projected);
     vi.mocked(reconcileFeedbackDirectoryRelationships).mockResolvedValue(projected);
+    vi.mocked(reconcileSurveyRelationships).mockResolvedValue(projected);
     vi.mocked(prisma.organization.findMany).mockResolvedValue([]);
     vi.mocked(prisma.user.findMany).mockResolvedValue([]);
     vi.mocked(markAuthzedOutboxEventsFailed).mockResolvedValue(0);
@@ -133,9 +143,9 @@ describe("AuthZed projection outbox processor", () => {
     vi.mocked(claimAuthzedOutboxEvents).mockResolvedValue(events);
 
     await expect(processAuthzedOutboxBatch("lease")).resolves.toEqual({
-      claimed: 11,
+      claimed: 12,
       deadLettered: 0,
-      delivered: 11,
+      delivered: 12,
       failed: 0,
     });
 
@@ -159,6 +169,7 @@ describe("AuthZed projection outbox processor", () => {
       assignments: [{ feedbackDirectoryId: "directory", workspaceId: "workspace" }],
       feedbackDirectoryIds: ["directory"],
     });
+    expect(reconcileSurveyRelationships).toHaveBeenCalledWith(["survey"]);
     expect(deliveredIds()).toEqual(sorted(events.map(({ id }) => id)));
   });
 
@@ -168,7 +179,7 @@ describe("AuthZed projection outbox processor", () => {
     vi.mocked(reconcileApiKeyRelationships).mockResolvedValue(failed("authzed_internal", false));
 
     await expect(processAuthzedOutboxBatch("lease")).resolves.toMatchObject({
-      delivered: 9,
+      delivered: 10,
       failed: 2,
     });
 
@@ -189,7 +200,7 @@ describe("AuthZed projection outbox processor", () => {
     // The membership group runs first, so a retryable failure there must release the rest untried.
     vi.mocked(reconcileOrganizationMemberships).mockResolvedValue(failed("authzed_unavailable", true));
 
-    await expect(processAuthzedOutboxBatch("lease")).resolves.toMatchObject({ delivered: 0, failed: 11 });
+    await expect(processAuthzedOutboxBatch("lease")).resolves.toMatchObject({ delivered: 0, failed: 12 });
 
     expect(reconcileTeamWorkspaceRelationships).not.toHaveBeenCalled();
     expect(reconcileApiKeyRelationships).not.toHaveBeenCalled();
@@ -370,5 +381,23 @@ describe("AuthZed projection outbox processor", () => {
     vi.mocked(isAuthzedEnabled).mockReturnValue(false);
     await processAuthzedProjectionDeliveryJob();
     expect(claimAuthzedOutboxEvents).not.toHaveBeenCalled();
+  });
+
+  test("records a drain heartbeat once the drain completes, even when nothing was claimed", async () => {
+    vi.mocked(claimAuthzedOutboxEvents).mockResolvedValue([]);
+
+    await drainAuthzedOutbox(10);
+
+    expect(recordAuthzedOutboxDrain).toHaveBeenCalledOnce();
+  });
+
+  test("reports outbox health from the status read only when AuthZed is enabled", () => {
+    observeAuthzedOutboxHealth();
+    expect(observeAuthzedOutboxStatus).toHaveBeenCalledExactlyOnceWith(getAuthzedOutboxStatus);
+
+    vi.mocked(observeAuthzedOutboxStatus).mockClear();
+    vi.mocked(isAuthzedEnabled).mockReturnValue(false);
+    observeAuthzedOutboxHealth();
+    expect(observeAuthzedOutboxStatus).not.toHaveBeenCalled();
   });
 });

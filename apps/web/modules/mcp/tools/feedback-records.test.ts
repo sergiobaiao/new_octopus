@@ -1,4 +1,3 @@
-import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { z } from "zod";
 import { ApiKeyPermission } from "@formbricks/database/prisma";
@@ -25,6 +24,7 @@ import {
 import { UNKNOWN_DATA } from "@/modules/ee/audit-logs/types/audit-log";
 import { registerFeedbackRecordTools } from "./feedback-records";
 import { ZMcpUpdateFeedbackRecordInput } from "./schemas";
+import { type ToolCallEra, callToolOverHttp, errorText } from "./test-utils";
 
 // Asserted as a shape, not by calling getMcpResourceUrl() here: comparing production's value with
 // itself would still pass if it regressed to the bare path "/api/mcp" — the ENG-2173 bug. The
@@ -138,6 +138,8 @@ describe("feedback-record tool input schemas", () => {
       "source_type",
       "submission_id",
       "until",
+      "updated_since",
+      "updated_until",
       "user_id",
       "value_date_max",
       "value_date_min",
@@ -199,73 +201,8 @@ describe("feedback-record tool input schemas", () => {
  * covers a plain `z.object` schema, where removing `.strict()` does fail.
  */
 describe("tool arguments are validated by the SDK (ENG-2256)", () => {
-  type ToolCallOutcome = {
-    error?: { code: number; message: string };
-    result?: { isError?: boolean; content?: { type: string; text?: string }[] };
-  };
-
-  /**
-   * `era` picks which protocol leg serves the call. Both are exercised because the one endpoint answers
-   * both (`mcp-handler` serves with `legacy: "stateless"`), and validation must not differ between them.
-   * A 2026-07-28 request carries the `Mcp-Method`/`Mcp-Name` headers and the `_meta` envelope the
-   * revision requires; a legacy one is a plain JSON-RPC POST and comes back SSE-framed.
-   */
-  const callTool = async (
-    name: string,
-    args: Record<string, unknown>,
-    era: "modern" | "legacy" = "modern"
-  ): Promise<ToolCallOutcome> => {
-    const handler = createMcpHandler(() => {
-      const server = new McpServer({ name: "test", version: "0.0.0" });
-      registerFeedbackRecordTools(server);
-      return server;
-    });
-
-    const modern = era === "modern";
-    const response = await handler.fetch(
-      new Request("https://formbricks.test/api/mcp", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          ...(modern ? { "Mcp-Method": "tools/call", "Mcp-Name": name } : {}),
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "tools/call",
-          params: {
-            name,
-            arguments: args,
-            ...(modern
-              ? {
-                  _meta: {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                  },
-                }
-              : {}),
-          },
-        }),
-      }),
-      { authInfo }
-    );
-
-    const text = await response.text();
-    // The legacy leg answers text/event-stream, the modern one application/json.
-    const payload = response.headers.get("content-type")?.includes("text/event-stream")
-      ? text
-          .split("\n")
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice("data:".length).trim())
-          .join("")
-      : text;
-
-    return JSON.parse(payload) as ToolCallOutcome;
-  };
-
-  const errorText = (outcome: ToolCallOutcome) =>
-    outcome.result?.content?.map((block) => block.text ?? "").join("") ?? "";
+  const callTool = (name: string, args: Record<string, unknown>, era?: ToolCallEra) =>
+    callToolOverHttp({ registerTools: registerFeedbackRecordTools, authInfo, name, args, era });
 
   test.each(["modern", "legacy"] as const)(
     "rejects a misspelled filter instead of running the query unfiltered (%s era)",
@@ -457,19 +394,41 @@ describe("list_feedback_records", () => {
 });
 
 describe("get_feedback_record", () => {
-  test("delegates to getV3FeedbackRecord with the record id", async () => {
+  test("delegates to getV3FeedbackRecord and returns its taxonomy projection", async () => {
     vi.mocked(getV3FeedbackRecord).mockResolvedValue(
-      successResponse({ id: "rec-1" }, { requestId: "req_tool" })
+      successResponse(
+        { id: "rec-1", taxonomy: { status: "classified", run_id: "run-1", path: [] } },
+        { requestId: "req_tool" }
+      )
     );
     const { tools } = createToolServer();
 
-    await tools
+    const result = await tools
       .get("get_feedback_record")!
       .handler({ workspaceId, feedbackRecordId: recordId }, { http: { authInfo } });
 
     expect(getV3FeedbackRecord).toHaveBeenCalledWith(
       expect.objectContaining({ workspaceId, feedbackRecordId: recordId })
     );
+    expect(result.structuredContent.data.taxonomy).toEqual({
+      status: "classified",
+      run_id: "run-1",
+      path: [],
+    });
+  });
+
+  test("returns null taxonomy without failing when the Hub cannot supply it", async () => {
+    vi.mocked(getV3FeedbackRecord).mockResolvedValue(
+      successResponse({ id: "rec-1", taxonomy: null }, { requestId: "req_tool" })
+    );
+    const { tools } = createToolServer();
+
+    const result = await tools
+      .get("get_feedback_record")!
+      .handler({ workspaceId, feedbackRecordId: recordId }, { http: { authInfo } });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent.data.taxonomy).toBeNull();
   });
 });
 
@@ -885,5 +844,58 @@ describe("update_feedback_record round-trip", () => {
     // The same edit with provenance stripped is accepted, so those keys are the only reason for the
     // rejection above — without this the assertion would hold even if the schema were broken some other way.
     expect(ZMcpUpdateFeedbackRecordInput.safeParse(mutableEdit).success).toBe(true);
+  });
+});
+
+/**
+ * ENG-2119 moved the scope gate out of the two shared handler factories and into `registerScopedTool`,
+ * which turned one gate shared by all ten tools into ten independent per-tool arguments. Nothing pinned
+ * those arguments: reverting a tool to a raw `server.registerTool` left the suite green, and so did
+ * gating a read tool on the write scope. Both are exactly the mistakes the refactor makes easy.
+ *
+ * Driving each tool with the *opposite* feedback scope catches both in one assertion. An unguarded
+ * registration produces no error at all; a tool wired to the wrong scope accepts the scope it should
+ * refuse. Asserting the detail rather than `isError` alone is what stops a handler that fails for some
+ * unrelated reason — a missing operation mock, say — from passing this as a scope denial.
+ */
+describe("every feedback-record tool is gated on its own scope", () => {
+  const TOOL_SCOPES = [
+    ["list_feedback_datasets", "read"],
+    ["list_feedback_records", "read"],
+    ["count_feedback_records", "read"],
+    ["get_feedback_record", "read"],
+    ["search_feedback_records", "read"],
+    ["find_similar_feedback_records", "read"],
+    ["create_feedback_record", "write"],
+    ["create_feedback_records", "write"],
+    ["update_feedback_record", "write"],
+    ["delete_feedback_record", "write"],
+  ] as const;
+
+  /**
+   * The roster has to be exhaustive or the check above is only as good as someone remembering to extend
+   * it: an eleventh tool registered with a raw `server.registerTool` would be both ungated and absent
+   * from `TOOL_SCOPES`, so every case below would still pass. Comparing against what the module actually
+   * registers is what makes "every tool" true rather than "every tool we listed". A removed tool left
+   * behind here fails the same assertion, from the other side.
+   */
+  test("the roster covers exactly the tools the module registers", () => {
+    const { tools } = createToolServer();
+
+    expect([...tools.keys()].sort()).toEqual(TOOL_SCOPES.map(([tool]) => tool).sort());
+  });
+
+  test.each(TOOL_SCOPES)("%s refuses a token holding only the other scope", async (tool, kind) => {
+    const { tools } = createToolServer();
+    const other = kind === "read" ? "feedbackRecords:write" : "feedbackRecords:read";
+
+    const result = await tools
+      .get(tool)!
+      .handler({ workspaceId }, { http: { authInfo: { ...authInfo, scopes: [other] } } });
+
+    expect(result.isError).toBe(true);
+    expect((result.structuredContent as { error: { detail: string } }).error.detail).toBe(
+      `OAuth token does not include the required MCP scope: feedbackRecords:${kind}`
+    );
   });
 });

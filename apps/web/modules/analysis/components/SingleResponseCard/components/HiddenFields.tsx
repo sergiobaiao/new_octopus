@@ -2,8 +2,10 @@
 
 import { EyeOffIcon } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { labelEmbeddedFields } from "@formbricks/types/embedded-data-label";
 import { type TLinkedEmbeddedField } from "@formbricks/types/embedded-data-resolver";
 import { TResponseData } from "@formbricks/types/responses";
+import { displayEmbeddedFieldValue } from "@/modules/embedded-data/lib/value-display";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/modules/ui/components/tooltip";
 
 interface HiddenFieldsProps {
@@ -13,19 +15,25 @@ interface HiddenFieldsProps {
 }
 
 export const HiddenFields = ({ hiddenFields, responseData }: Readonly<HiddenFieldsProps>) => {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage ?? i18n.language ?? "en-US";
 
-  // `storageKey` is the React key: it is unique per survey by `@@unique([surveyId, storageKey])`,
-  // whereas a field's display name carries no uniqueness constraint.
-  let hiddenFieldsData: { storageKey: string; label: string; value: string }[] = [];
+  // ENG-3233: labelled over the survey's whole field list, *before* the empty-value filter below.
+  // Allocating over the filtered list instead would make a label depend on which fields this one
+  // response happened to capture, so the card would name a field differently from the table header
+  // above it. `storageKey` stays the React key: it is unique per survey by `@@unique([surveyId,
+  // storageKey])`, whereas a display name carries no uniqueness constraint.
+  const hiddenFieldsData: { storageKey: string; label: string; value: string; title?: string }[] = [];
 
-  hiddenFields.forEach(({ field, link }) => {
-    const value = responseData[link.storageKey];
-    if (value) {
+  labelEmbeddedFields(hiddenFields).forEach(({ field, link, label }) => {
+    // A date field reads in the app's date format (P65), with the stored value as its tooltip.
+    const shown = displayEmbeddedFieldValue(responseData[link.storageKey], field.dataType, locale);
+    if (shown?.text) {
       hiddenFieldsData.push({
         storageKey: link.storageKey,
-        label: field.name,
-        value: typeof value === "string" ? value : "",
+        label,
+        value: shown.text,
+        title: shown.title,
       });
     }
   });
@@ -54,7 +62,9 @@ export const HiddenFields = ({ hiddenFields, responseData }: Readonly<HiddenFiel
                 </TooltipProvider>
               </div>
             </div>
-            <p className="ph-no-capture mt-2 font-semibold text-slate-700">{fieldData.value}</p>
+            <p className="ph-no-capture mt-2 font-semibold text-slate-700" title={fieldData.title}>
+              {fieldData.value}
+            </p>
           </div>
         );
       })}

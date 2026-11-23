@@ -5,6 +5,7 @@ import {
   Building2Icon,
   ChevronRightIcon,
   FoldersIcon,
+  LayoutTemplateIcon,
   Loader2,
   MessageCircle,
   MessageSquareTextIcon,
@@ -31,9 +32,13 @@ import { useLatestStableRelease } from "@/app/(app)/workspaces/[workspaceId]/lib
 import { cn } from "@/lib/cn";
 import { getBillingFallbackPath } from "@/lib/membership/navigation";
 import { getAccessFlags } from "@/lib/membership/utils";
-import { SwitcherDropdownBody } from "@/modules/settings/components/switcher-dropdown-body";
+import {
+  SWITCHER_DROPDOWN_CONTENT_CLASS_NAME,
+  SwitcherDropdownBody,
+} from "@/modules/settings/components/switcher-dropdown-body";
 import { UserDropdown } from "@/modules/settings/components/user-dropdown";
 import { useSwitcherData } from "@/modules/settings/hooks/use-switcher-data";
+import { getOrganizationSwitchPath, getWorkspaceHomePath } from "@/modules/settings/lib/organization-switch";
 import { Badge } from "@/modules/ui/components/badge";
 import {
   DropdownMenu,
@@ -53,25 +58,26 @@ interface NavigationProps {
   isFormbricksCloud: boolean;
   isDevelopment: boolean;
   membershipRole?: TOrganizationRole;
-  publicDomain: string;
   organizationWorkspacesLimit: number;
   isLicenseActive: boolean;
+  isNoLicense: boolean;
   isAccessControlAllowed: boolean;
   responseCount: number;
-  newTrialBannerVariant: string | boolean;
   isFormbricksSurveysConfigured: boolean;
   // Whole days left in the trial, or null when there is no trial to count down. Computed by the
   // server layout: deriving it here would mean reading `Date.now()` during render, which diverges
   // between the server pass and hydration and then goes stale as the tab sits open (ENG-2366).
   trialDaysRemaining: number | null;
+  // The workspace's Creatives access is `full` or `windDown` (ENG-6602). Hidden otherwise, with no
+  // upgrade notice: Creatives doesn't exist for that workspace.
+  isCreativesVisible: boolean;
 }
 
 /**
  * A nav section header carrying a Beta badge.
  *
- * Analyze and Act are both pre-1.0 surfaces, and the badge is what tells someone the difference
- * between "this is finished" and "this is early". Extracted rather than duplicated so the two
- * sections cannot drift into looking subtly different from each other.
+ * Act is still a pre-1.0 surface, and the badge is what tells someone the difference between
+ * "this is finished" and "this is early". Analyze graduated out of beta and no longer carries it.
  */
 const sectionLabelWithBeta = (label: React.ReactNode) => (
   <span className="inline-flex items-center gap-2">
@@ -131,14 +137,14 @@ export const MainNavigation = ({
   membershipRole,
   isFormbricksCloud,
   isDevelopment,
-  publicDomain,
   organizationWorkspacesLimit,
   isLicenseActive,
+  isNoLicense,
   isAccessControlAllowed,
   responseCount,
-  newTrialBannerVariant,
   isFormbricksSurveysConfigured,
   trialDaysRemaining,
+  isCreativesVisible,
 }: Readonly<NavigationProps>) => {
   const router = useRouter();
   const pathname = usePathname();
@@ -147,7 +153,7 @@ export const MainNavigation = ({
   const [isTextVisible, setIsTextVisible] = useState(true);
 
   const [isPending, startTransition] = useTransition();
-  const { isManager, isOwner, isBilling } = getAccessFlags(membershipRole);
+  const { isManager, isOwner, isBilling, isDashboardViewer } = getAccessFlags(membershipRole);
   const isMembershipPending = membershipRole === undefined;
   const disabledNavigationMessage = isMembershipPending
     ? t("common.loading")
@@ -175,6 +181,11 @@ export const MainNavigation = ({
     return () => clearTimeout(timeoutId);
   }, [isCollapsed]);
 
+  // Billing and Dashboard viewer both lose most of the navigation, differently on purpose (U17). Billing
+  // keeps the items disabled with a tooltip: it is a full organization member whose access is paused
+  // while it only manages billing, and the greyed items say what the organization has. A Dashboard viewer
+  // never had any of it — no route behind those items is reachable for it (ADR-0025) — so they are hidden,
+  // and a section left with nothing loses its header too.
   const mainNavigationSections = useMemo(
     () => [
       {
@@ -187,7 +198,15 @@ export const MainNavigation = ({
             href: `/workspaces/${workspace.id}/surveys`,
             icon: MessageCircle,
             isActive: pathname?.includes("/surveys"),
-            isHidden: false,
+            isHidden: isDashboardViewer,
+            disabled: isMembershipPending || isBilling,
+          },
+          {
+            name: t("common.creatives"),
+            href: `/workspaces/${workspace.id}/creatives`,
+            icon: LayoutTemplateIcon,
+            isActive: pathname?.includes("/creatives"),
+            isHidden: !isCreativesVisible || isDashboardViewer,
             disabled: isMembershipPending || isBilling,
           },
           {
@@ -198,6 +217,7 @@ export const MainNavigation = ({
               pathname?.includes("/contacts") ||
               pathname?.includes("/segments") ||
               pathname?.includes("/attributes"),
+            isHidden: isDashboardViewer,
             disabled: isMembershipPending || isBilling,
           },
         ],
@@ -206,18 +226,19 @@ export const MainNavigation = ({
         id: "unify-feedback",
         // Same policy as "Ask" above: product section labels stay English in every locale.
         // Was "Unify" until ENG-2742 settled on Ask / Analyze / Act as the three pillars.
-        name: sectionLabelWithBeta("Analyze"),
+        name: "Analyze",
         items: [
           {
             name: t("workspace.unify.feedback_data"),
             href: `/workspaces/${workspace.id}/unify/sources`,
             icon: MessageSquareTextIcon,
             isActive: pathname?.includes("/unify/"),
-            isHidden: false,
+            isHidden: isDashboardViewer,
             disabled: isMembershipPending || isBilling,
           },
           {
-            name: t("common.analysis"),
+            // A Dashboard viewer has Dashboards and nothing else of Analysis (ADR-0025).
+            name: isDashboardViewer ? t("common.dashboards") : t("common.analysis"),
             href: `/workspaces/${workspace.id}/dashboards`,
             icon: BarChart3Icon,
             isActive: pathname?.includes("/dashboards") || pathname?.includes("/charts"),
@@ -239,13 +260,18 @@ export const MainNavigation = ({
             href: `/workspaces/${workspace.id}/workflows`,
             icon: WorkflowIcon,
             isActive: pathname?.startsWith(`/workspaces/${workspace.id}/workflows`),
-            isHidden: false,
+            isHidden: isDashboardViewer,
             disabled: isMembershipPending || isBilling,
           },
         ],
       },
     ],
-    [t, workspace.id, pathname, isMembershipPending, isBilling]
+    [t, workspace.id, pathname, isMembershipPending, isBilling, isCreativesVisible, isDashboardViewer]
+  );
+
+  // A section whose items are all hidden (Ask and Act for a Dashboard viewer) loses its header too.
+  const visibleNavigationSections = mainNavigationSections.filter((section) =>
+    section.items.some((item) => !item.isHidden)
   );
 
   const settingsNavigationItem = useMemo(
@@ -263,11 +289,15 @@ export const MainNavigation = ({
   const [isOrganizationDropdownOpen, setIsOrganizationDropdownOpen] = useState(false);
   const workspaceSwitcher = useSwitcherData(
     () => getWorkspacesForSwitcherAction({ organizationId: organization.id }),
-    t("common.failed_to_load_workspaces")
+    t("common.failed_to_load_workspaces"),
+    undefined,
+    workspace.name
   );
   const organizationSwitcher = useSwitcherData(
-    () => getOrganizationsForSwitcherAction({ organizationId: organization.id }),
-    t("common.failed_to_load_organizations")
+    () => getOrganizationsForSwitcherAction(),
+    t("common.failed_to_load_organizations"),
+    undefined,
+    organization.name
   );
   const { load: loadWorkspaces } = workspaceSwitcher;
   const { load: loadOrganizations } = organizationSwitcher;
@@ -287,13 +317,14 @@ export const MainNavigation = ({
     }
   }, [isOrganizationDropdownOpen, loadOrganizations]);
 
-  const mainNavigationLink = isBilling
-    ? getBillingFallbackPath(organization.id, isFormbricksCloud)
-    : `/workspaces/${workspace.id}/surveys/`;
+  const getMainNavigationLink = () => {
+    if (isBilling) return getBillingFallbackPath(organization.id, isFormbricksCloud);
+    return getWorkspaceHomePath(membershipRole, workspace.id);
+  };
+  const mainNavigationLink = getMainNavigationLink();
 
   const handleWorkspaceChange = (workspaceId: string) => {
-    const targetPath =
-      workspaceId === workspace.id ? `/workspaces/${workspace.id}/surveys` : `/workspaces/${workspaceId}/`;
+    const targetPath = getWorkspaceHomePath(membershipRole, workspaceId);
     startTransition(() => {
       setIsWorkspaceDropdownOpen(false);
       router.push(targetPath);
@@ -301,10 +332,11 @@ export const MainNavigation = ({
   };
 
   const handleOrganizationChange = (organizationId: string) => {
-    const targetPath =
-      organizationId === organization.id
-        ? `/organizations/${organization.id}/settings/general`
-        : `/organizations/${organizationId}/`;
+    const targetPath = getOrganizationSwitchPath({
+      organizationId,
+      currentOrganizationId: organization.id,
+      membershipRole,
+    });
     startTransition(() => {
       setIsOrganizationDropdownOpen(false);
       router.push(targetPath);
@@ -364,14 +396,16 @@ export const MainNavigation = ({
   const handleSettingsOrganizationChange = useCallback(
     (id: string) => {
       startTransition(() => {
-        if (id === organization.id) {
-          router.push(`/organizations/${organization.id}/settings/general`);
-        } else {
-          router.push(`/organizations/${id}/`);
-        }
+        router.push(
+          getOrganizationSwitchPath({
+            organizationId: id,
+            currentOrganizationId: organization.id,
+            membershipRole,
+          })
+        );
       });
     },
-    [router, organization.id]
+    [router, organization.id, membershipRole]
   );
 
   const switcherTriggerClasses = cn(
@@ -440,7 +474,7 @@ export const MainNavigation = ({
 
               {/* Main Nav */}
               <ul className="space-y-2">
-                {mainNavigationSections.map((section) => (
+                {visibleNavigationSections.map((section) => (
                   <li key={section.id}>
                     {!isCollapsed && !isTextVisible && (
                       <p className="px-4 pt-2 pb-1 text-xs font-semibold tracking-wide text-slate-400 uppercase">
@@ -469,22 +503,25 @@ export const MainNavigation = ({
                   </li>
                 ))}
 
-                <li className={cn("mt-2 border-t border-slate-100 pt-2", isCollapsed && "border-t-0 pt-0")}>
-                  <ul>
-                    <NavigationLink
-                      href={settingsNavigationItem.href}
-                      isActive={settingsNavigationItem.isActive}
-                      isCollapsed={isCollapsed}
-                      isTextVisible={isTextVisible}
-                      disabled={settingsNavigationItem.disabled}
-                      disabledMessage={
-                        settingsNavigationItem.disabled ? disabledNavigationMessage : undefined
-                      }
-                      linkText={settingsNavigationItem.name}>
-                      <settingsNavigationItem.icon className={mainNavIconClassName} strokeWidth={1.5} />
-                    </NavigationLink>
-                  </ul>
-                </li>
+                {/* No settings for a Dashboard viewer; Profile and Notifications stay in the user menu. */}
+                {!isDashboardViewer && (
+                  <li className={cn("mt-2 border-t border-slate-100 pt-2", isCollapsed && "border-t-0 pt-0")}>
+                    <ul>
+                      <NavigationLink
+                        href={settingsNavigationItem.href}
+                        isActive={settingsNavigationItem.isActive}
+                        isCollapsed={isCollapsed}
+                        isTextVisible={isTextVisible}
+                        disabled={settingsNavigationItem.disabled}
+                        disabledMessage={
+                          settingsNavigationItem.disabled ? disabledNavigationMessage : undefined
+                        }
+                        linkText={settingsNavigationItem.name}>
+                        <settingsNavigationItem.icon className={mainNavIconClassName} strokeWidth={1.5} />
+                      </NavigationLink>
+                    </ul>
+                  </li>
+                )}
               </ul>
             </div>
           )}
@@ -498,7 +535,6 @@ export const MainNavigation = ({
                 isDevelopment={isDevelopment}
                 latestVersion={latestVersion}
                 trialDaysRemaining={trialDaysRemaining}
-                newTrialBannerVariant={newTrialBannerVariant}
                 organization={organization}
                 responseCount={responseCount}
               />
@@ -528,7 +564,12 @@ export const MainNavigation = ({
                         />
                       </button>
                     </DropdownMenuTrigger>
-                    <DropdownMenuContent side="right" sideOffset={10} alignOffset={5} align="end">
+                    <DropdownMenuContent
+                      side="right"
+                      sideOffset={10}
+                      alignOffset={5}
+                      align="end"
+                      className={SWITCHER_DROPDOWN_CONTENT_CLASS_NAME}>
                       <SwitcherDropdownBody
                         type="workspace"
                         isLoading={workspaceSwitcher.isLoading || isInitialWorkspacesLoading}
@@ -570,7 +611,12 @@ export const MainNavigation = ({
                         />
                       </button>
                     </DropdownMenuTrigger>
-                    <DropdownMenuContent side="right" sideOffset={10} alignOffset={5} align="end">
+                    <DropdownMenuContent
+                      side="right"
+                      sideOffset={10}
+                      alignOffset={5}
+                      align="end"
+                      className={SWITCHER_DROPDOWN_CONTENT_CLASS_NAME}>
                       <SwitcherDropdownBody
                         type="organization"
                         isLoading={organizationSwitcher.isLoading}
@@ -588,7 +634,6 @@ export const MainNavigation = ({
               <UserDropdown
                 user={user}
                 organizationId={organization.id}
-                publicDomain={publicDomain}
                 isCollapsed={isCollapsed}
                 isTextVisible={isTextVisible}
                 className="rounded-br-xl"
@@ -604,6 +649,7 @@ export const MainNavigation = ({
           setOpen={setOpenWorkspaceLimitModal}
           buttons={workspaceLimitModalButtons()}
           workspaceLimit={organizationWorkspacesLimit}
+          showLiteLicenseTip={!isFormbricksCloud && isNoLicense}
         />
       )}
       {openCreateWorkspaceModal && (

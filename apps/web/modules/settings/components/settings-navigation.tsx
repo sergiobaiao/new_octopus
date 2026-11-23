@@ -12,6 +12,7 @@ import {
 import { SettingsSidebarContent } from "@/app/(app)/workspaces/[workspaceId]/components/SettingsSidebarContent";
 import { UserDropdown } from "@/modules/settings/components/user-dropdown";
 import { useSwitcherData } from "@/modules/settings/hooks/use-switcher-data";
+import { getOrganizationSwitchPath } from "@/modules/settings/lib/organization-switch";
 import { GoBackButton } from "@/modules/ui/components/go-back-button";
 
 interface SettingsNavigationProps {
@@ -22,7 +23,6 @@ interface SettingsNavigationProps {
   organizationName: string;
   membershipRole?: TOrganizationRole;
   isFormbricksCloud: boolean;
-  publicDomain: string;
   isFormbricksSurveysConfigured: boolean;
   // Where the back arrow returns to (the surveys list of the current workspace).
   backUrl: string;
@@ -39,7 +39,6 @@ export const SettingsNavigation = ({
   organizationName,
   membershipRole,
   isFormbricksCloud,
-  publicDomain,
   isFormbricksSurveysConfigured,
   backUrl,
 }: Readonly<SettingsNavigationProps>) => {
@@ -49,11 +48,15 @@ export const SettingsNavigation = ({
 
   const workspaceSwitcher = useSwitcherData(
     () => getWorkspacesForSwitcherAction({ organizationId }),
-    t("common.failed_to_load_workspaces")
+    t("common.failed_to_load_workspaces"),
+    undefined,
+    workspaceName
   );
   const organizationSwitcher = useSwitcherData(
-    () => getOrganizationsForSwitcherAction({ organizationId }),
-    t("common.failed_to_load_organizations")
+    () => getOrganizationsForSwitcherAction(),
+    t("common.failed_to_load_organizations"),
+    undefined,
+    organizationName
   );
 
   const handleWorkspaceChange = useCallback(
@@ -69,11 +72,15 @@ export const SettingsNavigation = ({
     (id: string) => {
       startTransition(() => {
         router.push(
-          id === organizationId ? `/organizations/${id}/settings/general` : `/organizations/${id}/`
+          getOrganizationSwitchPath({
+            organizationId: id,
+            currentOrganizationId: organizationId,
+            membershipRole,
+          })
         );
       });
     },
-    [router, organizationId]
+    [router, organizationId, membershipRole]
   );
 
   return (
@@ -113,7 +120,6 @@ export const SettingsNavigation = ({
       <UserDropdown
         user={user}
         organizationId={organizationId}
-        publicDomain={publicDomain}
         isFormbricksSurveysConfigured={isFormbricksSurveysConfigured}
       />
     </aside>

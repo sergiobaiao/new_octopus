@@ -75,6 +75,9 @@ export const ZUser = z.object({
     | "teamUsers"
     | "role" //doesn't satisfy the type because we remove the billing role
     | "deprecatedRole"
+    | "isBootstrapAdmin" // internal sign-up serialization marker (ENG-2247), not part of the public user
+    | "reactivatedAt" // internal data retention clock (ENG-3713); retention has no public API surface
+    | "lastActiveAt" // internal data retention clock (ENG-3713), as above
   >
 >;
 

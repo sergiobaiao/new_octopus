@@ -10,11 +10,11 @@ import { DeleteWorkspace } from "./components/delete-workspace";
 import { EditCooldownPeriodForm } from "./components/edit-cooldown-period-form";
 import { EditWorkspaceNameForm } from "./components/edit-workspace-name-form";
 
-export const GeneralSettingsPage = async (props: { params: Promise<{ workspaceId: string }> }) => {
+export const GeneralSettingsPage = async (props: { readonly params: Promise<{ workspaceId: string }> }) => {
   const params = await props.params;
   const t = await getTranslate();
 
-  const { isReadOnly, isOwner, isManager, workspace, organization } = await getWorkspaceAuth(
+  const { canManage, isOwner, isManager, workspace, organization } = await getWorkspaceAuth(
     params.workspaceId
   );
 
@@ -26,12 +26,12 @@ export const GeneralSettingsPage = async (props: { params: Promise<{ workspaceId
       <SettingsCard
         title={t("common.workspace_name")}
         description={t("workspace.general.workspace_name_settings_description")}>
-        <EditWorkspaceNameForm workspace={workspace} isReadOnly={isReadOnly} />
+        <EditWorkspaceNameForm workspace={workspace} isReadOnly={!canManage} />
       </SettingsCard>
       <SettingsCard
         title={t("workspace.general.recontact_cooldown_period")}
         description={t("workspace.general.recontact_cooldown_period_settings_description")}>
-        <EditCooldownPeriodForm workspace={workspace} isReadOnly={isReadOnly} />
+        <EditCooldownPeriodForm workspace={workspace} isReadOnly={!canManage} />
       </SettingsCard>
       {!IS_FORMBRICKS_CLOUD && (
         <SettingsCard

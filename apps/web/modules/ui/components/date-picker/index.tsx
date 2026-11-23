@@ -5,7 +5,7 @@ import { useState } from "react";
 import { type Matcher } from "react-day-picker";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/cn";
-import { formatDateForDisplay } from "@/lib/utils/datetime";
+import { DATE_DISPLAY_OPTIONS, formatDateForDisplay } from "@/lib/utils/datetime";
 import { Button } from "@/modules/ui/components/button";
 import { Calendar } from "@/modules/ui/components/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/modules/ui/components/popover";
@@ -13,7 +13,7 @@ import { type TDateRangeBound, type TDateRangeValue, applyRangeClick, applyRange
 
 export type { TDateRangeValue } from "./lib/range";
 
-const DISPLAY_OPTIONS: Intl.DateTimeFormatOptions = { day: "numeric", month: "short", year: "numeric" };
+const DISPLAY_OPTIONS = DATE_DISPLAY_OPTIONS;
 
 /** `disabled` matchers for react-day-picker, built from the optional bounds. */
 const getDisabledMatchers = (minDate?: Date, maxDate?: Date): Matcher[] | undefined => {
@@ -24,6 +24,8 @@ const getDisabledMatchers = (minDate?: Date, maxDate?: Date): Matcher[] | undefi
 };
 
 interface DatePickerProps {
+  /** The trigger's id, so a `<Label htmlFor>` names the picker. */
+  id?: string;
   value: Date | null;
   onChange: (date: Date) => void;
   /** App locale code — pass `i18n.resolvedLanguage ?? i18n.language ?? "en-US"`, never a browser default. */
@@ -40,9 +42,18 @@ interface DatePickerProps {
   onClear?: () => void;
   clearButtonId?: string;
   clearButtonLabel?: string;
+  /**
+   * The clear button's own classes. Its `outline` variant draws a border, which is a second hairline
+   * when this picker is embedded inside a control that already has one.
+   */
+  clearButtonClassName?: string;
+  /** Links the trigger to a field's description or error, e.g. from a form. */
+  "aria-describedby"?: string;
+  "aria-invalid"?: boolean;
 }
 
 export const DatePicker = ({
+  id,
   value,
   onChange,
   locale,
@@ -56,6 +67,9 @@ export const DatePicker = ({
   onClear,
   clearButtonId,
   clearButtonLabel,
+  clearButtonClassName,
+  "aria-describedby": ariaDescribedBy,
+  "aria-invalid": ariaInvalid,
 }: Readonly<DatePickerProps>) => {
   const { t } = useTranslation();
   const [isOpen, setIsOpen] = useState(false);
@@ -67,9 +81,12 @@ export const DatePicker = ({
       <Popover open={isOpen} onOpenChange={setIsOpen}>
         <PopoverTrigger asChild>
           <Button
+            id={id}
             type="button"
             variant="outline"
             disabled={disabled}
+            aria-describedby={ariaDescribedBy}
+            aria-invalid={ariaInvalid || undefined}
             className={cn("w-[280px] justify-start bg-white text-left font-normal", triggerClassName)}>
             <CalendarIcon className="mr-2 size-4 shrink-0" />
             <span className={cn("truncate", !label && "text-slate-500")}>
@@ -103,7 +120,7 @@ export const DatePicker = ({
           size="sm"
           disabled={disabled}
           onClick={onClear}
-          className="size-8 shrink-0 p-0">
+          className={cn("size-8 shrink-0 p-0", clearButtonClassName)}>
           <XIcon className="size-4" />
         </Button>
       )}

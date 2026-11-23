@@ -32,6 +32,13 @@ export interface AIEnvironment {
   AI_OPENAI_COMPATIBLE_SUPPORTS_STRUCTURED_OUTPUTS?: string;
   AI_OPENAI_COMPATIBLE_HEADERS_JSON?: string;
   AI_OPENAI_COMPATIBLE_QUERY_PARAMS_JSON?: string;
+  AI_OPENAI_COMPATIBLE_AUTH_MODE?: string;
+  AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL?: string;
+  AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID?: string;
+  AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET?: string;
+  AI_OPENAI_COMPATIBLE_OAUTH_SCOPE?: string;
+  AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE?: string;
+  AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON?: string;
 }
 
 export type AIProviderStatusErrorCode = "missingCredentials" | "invalidCredentials" | "missingModel";
@@ -69,6 +76,14 @@ export type TGenerateObjectOptions<T = unknown> = Omit<
   schemaName?: string;
   schemaDescription?: string;
   output?: "object";
+  /**
+   * `false` lets the model leave out a field the schema gives a default. A provider that decodes against
+   * the JSON schema strictly (OpenAI's structured outputs, on Azure or an OpenAI-compatible endpoint)
+   * needs every property required, which a defaulted one is not; this turns strict decoding off for
+   * whichever provider is configured. The answer is still validated against `schema`. Default: the
+   * provider's own behaviour.
+   */
+  strictSchema?: boolean;
 };
 export interface TGenerateObjectResult<T = unknown> {
   readonly object: T;

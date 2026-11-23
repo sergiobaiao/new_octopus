@@ -303,7 +303,7 @@ Now, visit the [Validate Your Setup](#validate-your-setup) section to verify you
 ## React Native
 
 <Info>
-  **Interaction-based Segments:** targeting users by whether they have seen, started or completed a survey requires **@formbricks/react-native 3.1.0** or higher. See [Survey Display Logic](/surveys/website-app-surveys/survey-display-logic#level-4-interaction-based-segments).
+  **Interaction-based Segments:** targeting users by whether they have seen, started or completed a survey requires **@formbricks/react-native 3.1.0** or higher. See [Survey Display Logic](/surveys/website-app-surveys/survey-display-logic#level-4-—-interaction-based-segments).
 </Info>
 
 Install the Formbricks React Native SDK using one of the package managers, i.e., npm, pnpm, or yarn.
@@ -370,40 +370,48 @@ Now, visit the [Validate Your Setup](#validate-your-setup) section to verify you
 <Info>**Minimum iOS Version:** The Formbricks iOS SDK requires **iOS 16.4** or higher.</Info>
 
 <Info>
-  **Interaction-based Segments:** targeting users by whether they have seen, started or completed a survey requires **FormbricksSDK 2.1.0** or higher. See [Survey Display Logic](/surveys/website-app-surveys/survey-display-logic#level-4-interaction-based-segments).
+  **Interaction-based Segments:** targeting users by whether they have seen, started or completed a survey requires **FormbricksSDK 2.1.0** or higher. See [Survey Display Logic](/surveys/website-app-surveys/survey-display-logic#level-4-—-interaction-based-segments).
 </Info>
 
-Install the Formbricks iOS SDK using the following steps:
+Install the Formbricks iOS SDK using Swift Package Manager:
 
 **Swift Package Manager**
 
 1. In Xcode choose **File → Add Packages…**
-2. Enter your repo URL (e.g. `https://github.com/formbricks/ios.git`)
-3. Choose version rule (e.g. "Up to Next Major" starting at `2.1.0`).
-4. Import in your code:
+2. Enter `https://github.com/formbricks/ios.git`.
+3. Choose a version rule (e.g. "Up to Next Major" starting at `2.3.0`).
+4. Add the **FormbricksSDK** library product to your app target.
+5. Import in your code:
 
    ```swift
    import FormbricksSDK
    ```
 
-**CocoaPods**
+<Note>
+  New FormbricksSDK releases are distributed through Swift Package Manager only.
+  [CocoaPods Trunk is becoming read-only](https://blog.cocoapods.org/CocoaPods-Specs-Repo/), with a test
+  period on November 1–7, 2026 and a permanent switch on December 2, 2026. Previously published pod
+  versions remain available; migrate to receive future SDK updates.
+</Note>
 
-1. Add the following to your `Podfile`:
+### Migrate from CocoaPods
 
-   ```ruby
-   platform :ios, '16.4'
-   use_frameworks! :linkage => :static
+<Steps>
+  <Step title="Remove the FormbricksSDK pod">
+    Remove the `pod 'FormbricksSDK', ...` entry from every target in your `Podfile`, then run `pod install`
+    to update the workspace and lockfile. Keep any other pods your app uses.
+  </Step>
+  <Step title="Add the Swift package">
+    Follow the Swift Package Manager instructions above and add **FormbricksSDK** to each app target
+    that uses it. Do not link both the pod and the Swift package in the same target.
+  </Step>
+  <Step title="Build and test your app">
+    Keep `import FormbricksSDK` and your existing SDK calls. Build and test your app after switching.
+    If you also upgrade the SDK version, review its [release notes](https://github.com/formbricks/ios/releases).
+  </Step>
+</Steps>
 
-   target 'YourTargetName' do
-     pod 'FormbricksSDK', '~> 2.1'
-   end
-   ```
-
-2. Run `pod install` in your app directory
-3. Import in your code:
-   ```swift
-   import FormbricksSDK
-   ```
+### Initialize the SDK
 
 Now start using FormbricksSDK
 
@@ -471,7 +479,7 @@ Now, visit the [Validate Your Setup](#validate-your-setup) section to verify you
 </Info>
 
 <Info>
-  **Interaction-based Segments:** targeting users by whether they have seen, started or completed a survey requires **com.formbricks:android 2.1.0** or higher. See [Survey Display Logic](/surveys/website-app-surveys/survey-display-logic#level-4-interaction-based-segments).
+  **Interaction-based Segments:** targeting users by whether they have seen, started or completed a survey requires **com.formbricks:android 2.1.0** or higher. See [Survey Display Logic](/surveys/website-app-surveys/survey-display-logic#level-4-—-interaction-based-segments).
 </Info>
 
 Install the Formbricks Android SDK using the following steps:
@@ -558,7 +566,7 @@ Formbricks.logout()
 </Info>
 
 <Info>
-  **Interaction-based Segments:** targeting users by whether they have seen, started or completed a survey requires **formbricks 1.1.0** or higher. See [Survey Display Logic](/surveys/website-app-surveys/survey-display-logic#level-4-interaction-based-segments).
+  **Interaction-based Segments:** targeting users by whether they have seen, started or completed a survey requires **formbricks 1.1.0** or higher. See [Survey Display Logic](/surveys/website-app-surveys/survey-display-logic#level-4-—-interaction-based-segments).
 </Info>
 
 Install the Formbricks Flutter SDK from [pub.dev](https://pub.dev/packages/formbricks):
@@ -663,9 +671,38 @@ To this:
 
 ![The Connection status card, green, reading "Receiving data" and "Formbricks SDK is connected"](/images/surveys/website-app-surveys/framework-guides/widget-status-connected.webp)
 
+## Dark Mode
+
+Surveys render light unless your app asks for something else. Tell the SDK which appearance to use, either when you set it up or whenever your app's own theme changes:
+
+```javascript Setting the survey appearance
+formbricks.setup({
+  workspaceId: "<workspace-id>",
+  appUrl: "<app-url>",
+  appearance: "dark", // "light" (default), "dark" or "system"
+});
+
+// Later, when the user switches your app's theme:
+formbricks.setAppearance("light");
+```
+
+<Note>
+  Dark mode needs the script-tag SDK for now. The `@formbricks/js` npm package does not yet pass
+  `appearance` through `setup` or expose `setAppearance`, so with it surveys stay light.
+</Note>
+
+- `"system"` follows the visitor's browser setting and updates if it changes. If your app has its own light/dark toggle, pass `"light"` or `"dark"` from that toggle instead, because the SDK cannot see your app's theme.
+- A survey that is already open switches in place. Answers, progress and focus are kept.
+- `setAppearance` can be called before `setup`. The value is kept for the page session and survives `logout`.
+- The dark colors are derived from your brand color, which is the same in light and dark. Override any other color in **Look & Feel** (or a survey's **Styling** tab) with the **Light / Dark** toggle at the top of the styling settings.
+- Link surveys always render light: they do not follow dark mode. For a dark link survey, design it dark in the light theme: pick a dark color in **Background styling**, set light text, input and button colors, and use the **Cardless** card arrangement so the background fills the page.
+- `setAppearance` needs a recent SDK. If you support older SDK versions, check `typeof formbricks.setAppearance === "function"` before calling it.
+
+The iOS, Android, React Native and Flutter SDKs offer the same appearance setting and also apply your [Custom CSS](/surveys/general-features/custom-css). See [SDK Compatibility](/surveys/website-app-surveys/sdk-compatibility) for the versions, how `"system"` is resolved on each platform, and what respondents see while versions are mixed.
+
 ## Content Security Policy
 
-If your app serves a strict `Content-Security-Policy` header, the browser can block the Formbricks widget before anything renders. Three directives are involved.
+If your app serves a strict `Content-Security-Policy` header, the browser can block the Formbricks widget before anything renders. Allow the scripts, client connections, and survey styles as described below.
 
 <Note>
   This applies to the JavaScript SDK only. Link surveys are served by Formbricks itself, and the mobile
@@ -674,7 +711,7 @@ If your app serves a strict `Content-Security-Policy` header, the browser can bl
 
 ### Allowing scripts and API calls
 
-The SDK loads two scripts from your Formbricks instance: `formbricks.umd.cjs` (the SDK) and `surveys.umd.cjs` (the survey renderer, fetched the first time a survey is shown). It then talks to the client API on the same host. Both directives need to point at your `appUrl`:
+The SDK loads two scripts from your Formbricks instance: `formbricks.umd.cjs` (the SDK) and `surveys.umd.cjs` (the survey renderer). By default, setup adds a prefetch hint so the browser can fetch the renderer early; the renderer executes when a survey is first triggered. The SDK also talks to the client API on the same host. Both directives need to point at your `appUrl`:
 
 ```text
 script-src 'self' https://app.formbricks.com;
@@ -682,6 +719,28 @@ connect-src 'self' https://app.formbricks.com;
 ```
 
 The SDK does not put a nonce on the script tags it creates, so allowlisting the host is what makes them load. `'strict-dynamic'` works instead of a host allowlist, but only if the script that loads the SDK carries a matching nonce or hash of its own — both bundles are inserted programmatically, so they inherit trust from that root. Without a trusted root, `'strict-dynamic'` blocks the SDK before it ever reaches `surveys.umd.cjs`.
+
+### Disabling survey prefetch on strict host pages
+
+By default, SDK setup adds a `<link rel="prefetch">` to warm the survey renderer cache. Browsers can check this resource hint against `default-src`, even when `script-src-elem` and `connect-src` allow your Formbricks host. With `default-src 'none'`, this can produce a CSP violation while surveys still display through the allowed script load.
+
+For the script-tag SDK, disable the hint instead of broadening `default-src`:
+
+```javascript
+window.formbricks.setup({
+  workspaceId: "<workspace-id>",
+  appUrl: "<app-url>",
+  prefetch: false,
+});
+```
+
+The renderer then loads when a survey is triggered. Omitting `prefetch` or setting it to `true` keeps prefetch enabled. Pass the option on each page's setup; it is not saved in local storage. Scripts, API connections, and styles still need their respective CSP permissions.
+
+<Note>
+  The separately published `@formbricks/js` npm wrapper currently forwards only the app URL and
+  workspace/environment ID through setup. It does not forward `prefetch`; use the script-tag
+  integration for this option until the wrapper supports it.
+</Note>
 
 ### Passing a nonce for survey styles
 

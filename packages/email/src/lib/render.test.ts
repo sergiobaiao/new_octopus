@@ -9,7 +9,10 @@ import {
   Tailwind,
   Text,
   render,
+  renderAccountDeletedEmail,
   renderAccountDeletionEmail,
+  renderAttachmentExportFailedEmail,
+  renderAttachmentExportReadyEmail,
   renderEmailCustomizationPreviewEmail,
   renderEmbedSurveyPreviewEmail,
   renderFollowUpEmail,
@@ -17,10 +20,13 @@ import {
   renderInviteAcceptedEmail,
   renderInviteEmail,
   renderLinkSurveyEmail,
+  renderMemberRetentionNoticeEmail,
   renderNewEmailVerification,
   renderPasswordResetNotifyEmail,
   renderResponseFinishedEmail,
   renderSsoRecoveryFactorsRemovedEmail,
+  renderSsoSignInHintEmail,
+  renderSurveyRetentionNoticeEmail,
   renderVerificationEmail,
 } from "../index";
 import { exampleData } from "./example-data";
@@ -59,6 +65,7 @@ const renderers: [string, () => Promise<string>][] = [
     () => renderNewEmailVerification({ ...exampleData.newEmailVerification, ...legal, t }),
   ],
   ["renderPasswordResetNotifyEmail", () => renderPasswordResetNotifyEmail({ ...legal, t })],
+  ["renderAccountDeletedEmail", () => renderAccountDeletedEmail({ ...legal, t })],
   [
     "renderSsoRecoveryFactorsRemovedEmail",
     () =>
@@ -67,6 +74,26 @@ const renderers: [string, () => Promise<string>][] = [
         ...legal,
         t,
       }),
+  ],
+  [
+    "renderSsoSignInHintEmail",
+    () => renderSsoSignInHintEmail({ ...exampleData.ssoSignInHintEmail, ...legal, t }),
+  ],
+  [
+    "renderSurveyRetentionNoticeEmail",
+    () => renderSurveyRetentionNoticeEmail({ ...exampleData.surveyRetentionNoticeEmail, ...legal, t }),
+  ],
+  [
+    "renderAttachmentExportReadyEmail",
+    () => renderAttachmentExportReadyEmail({ ...exampleData.attachmentExportReadyEmail, ...legal, t }),
+  ],
+  [
+    "renderAttachmentExportFailedEmail",
+    () => renderAttachmentExportFailedEmail({ ...exampleData.attachmentExportFailedEmail, ...legal, t }),
+  ],
+  [
+    "renderMemberRetentionNoticeEmail",
+    () => renderMemberRetentionNoticeEmail({ ...exampleData.memberRetentionNoticeEmail, ...legal, t }),
   ],
   ["renderInviteEmail", () => renderInviteEmail({ ...exampleData.inviteEmail, ...legal, t })],
   [
@@ -159,6 +186,105 @@ describe("translation threading", () => {
 
     expect(html).toContain("View survey summary");
     expect(html).not.toContain("more responses");
+  });
+
+  test("points both opt-out links at the account notifications page", async () => {
+    const { WEBAPP_URL, survey, organization, workspaceId } = exampleData.responseFinishedEmail;
+    const html = await renderResponseFinishedEmail({
+      ...exampleData.responseFinishedEmail,
+      elements: responseFinishedElements,
+      t,
+    });
+
+    expect(html).toContain(
+      `${WEBAPP_URL}/account/settings/notifications?type=alert&amp;elementId=${survey.id}`
+    );
+    expect(html).toContain(
+      `${WEBAPP_URL}/account/settings/notifications?type=unsubscribedOrganizationIds&amp;elementId=${organization.id}`
+    );
+    expect(html).not.toContain(`/workspaces/${workspaceId}/settings/notifications`);
+    expect(html).toContain(`${WEBAPP_URL}/workspaces/${workspaceId}/surveys/${survey.id}/responses`);
+  });
+});
+
+describe("Signature response", () => {
+  const signatureUrl = "/storage/ws1/private/surveys/s1/elements/e1/signature--fid--abc.png";
+  const elements = [
+    { element: "Please sign", response: signatureUrl, type: TSurveyElementTypeEnum.Signature },
+  ];
+
+  test("the response notification names the signature without carrying its link", async () => {
+    const html = await renderResponseFinishedEmail({
+      ...exampleData.responseFinishedEmail,
+      elements,
+      t,
+    });
+
+    expect(html).toContain("Link to the signature is not included for data privacy reasons");
+    expect(html).not.toContain("signature--fid--abc");
+  });
+
+  test("the follow-up email does not carry the link either", async () => {
+    const html = await renderFollowUpEmail({
+      ...exampleData.followUpEmail,
+      responseData: elements,
+      t,
+    });
+
+    expect(html).toContain("Link to the signature is not included for data privacy reasons");
+    expect(html).not.toContain("signature--fid--abc");
+  });
+});
+
+describe("survey retention notice", () => {
+  const notice = exampleData.surveyRetentionNoticeEmail;
+
+  test("opens by naming only the policy whose list the email carries", async () => {
+    const responsesOnly = await renderSurveyRetentionNoticeEmail({
+      ...notice,
+      archivedSurveys: [],
+      ...legal,
+      t,
+    });
+    const surveysOnly = await renderSurveyRetentionNoticeEmail({
+      ...notice,
+      responseDeletions: [],
+      ...legal,
+      t,
+    });
+    const both = await renderSurveyRetentionNoticeEmail({ ...notice, ...legal, t });
+
+    expect(responsesOnly).toContain("Acme automatically deletes responses after a set time. The following");
+    expect(responsesOnly).not.toContain("archives surveys");
+    expect(surveysOnly).toContain("Acme automatically archives surveys");
+    expect(surveysOnly).not.toContain("deletes responses");
+    expect(both).toContain("deletes responses after a set time and archives surveys");
+  });
+});
+
+describe("SSO sign-in hint", () => {
+  test("names every provider the account signs in with and links to the login page", async () => {
+    const html = await renderSsoSignInHintEmail({
+      providerNames: ["Microsoft", "Acme SSO"],
+      loginLink: "https://app.formbricks.com/auth/login",
+      t,
+    });
+
+    expect(html).toContain(">Microsoft<");
+    expect(html).toContain(">Acme SSO<");
+    expect(html).toContain('href="https://app.formbricks.com/auth/login"');
+  });
+
+  test("sends the reader to their administrator, with no login button, when no provider is offered", async () => {
+    const html = await renderSsoSignInHintEmail({
+      providerNames: [],
+      loginLink: "https://app.formbricks.com/auth/login",
+      t,
+    });
+
+    expect(html).toContain("Contact your administrator to get access again.");
+    expect(html).not.toContain("https://app.formbricks.com/auth/login");
+    expect(html).not.toContain("You sign in with:");
   });
 });
 
@@ -335,8 +461,8 @@ describe("follow-up email direction", () => {
 });
 
 describe("Tailwind render engine", () => {
-  // `@react-email/tailwind` — not anything configured in this package — decides which
-  // Tailwind version compiles the template classes. Pin that contract: these utilities
+  // `react-email`'s own `Tailwind` component — not anything configured in this package — decides
+  // which Tailwind version compiles the template classes. Pin that contract: these utilities
   // exist only in v4, so a downgrade would drop the declarations silently.
   test("compiles Tailwind v4 utilities", async () => {
     const html = await render(

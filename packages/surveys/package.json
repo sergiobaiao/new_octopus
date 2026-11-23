@@ -10,7 +10,9 @@
     "type": "git",
     "url": "https://github.com/formbricks/formbricks"
   },
-  "sideEffects": false,
+  "sideEffects": [
+    "./src/lib/zod-jitless.ts"
+  ],
   "source": "./src/index.ts",
   "main": "./dist/index.umd.cjs",
   "module": "./dist/index.js",
@@ -36,8 +38,8 @@
     "build:dev": "cross-env NODE_OPTIONS=--max-old-space-size=8192 vite build --mode dev && cross-env NODE_OPTIONS=--max-old-space-size=8192 tsc --project tsconfig.build.json",
     "go": "concurrently -n \"ESM,UMD\" \"vite build --watch --mode dev\" \"BUILD_UMD=true vite build --watch --mode dev\"",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src",
-    "lint:fix": "eslint src --fix",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "preview": "vite preview",
     "clean": "rimraf .turbo node_modules dist",
     "test": "vitest run",
@@ -59,6 +61,7 @@
     "@formbricks/config-typescript": "workspace:*",
     "@formbricks/i18n-utils": "workspace:*",
     "@formbricks/types": "workspace:*",
+    "@formbricks/vite-plugins": "workspace:*",
     "@preact/preset-vite": "2.10.5",
     "@tailwindcss/postcss": "catalog:",
     "@testing-library/preact": "3.2.4",
@@ -69,7 +72,7 @@
     "cross-env": "catalog:",
     "dotenv-cli": "catalog:",
     "fake-indexeddb": "6.2.5",
-    "happy-dom": "20.8.9",
+    "happy-dom": "21.0.4",
     "postcss": "catalog:",
     "rollup-plugin-visualizer": "7.0.1",
     "tailwindcss": "catalog:",

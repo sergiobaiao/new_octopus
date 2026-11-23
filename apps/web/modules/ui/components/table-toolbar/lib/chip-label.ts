@@ -1,0 +1,90 @@
+import type { TFunction } from "i18next";
+import { formatDateForDisplay } from "@/lib/utils/datetime";
+import { getTranslatedDatePresetLabel } from "@/modules/ee/analysis/lib/schema-definition";
+import { parseCalendarDay } from "./date-filter";
+import { getOperatorLabel, operatorTakesValue, operatorTakesValues } from "./operators";
+import type { TFilterProperty, TTableFilter } from "./types";
+import { datePresetFromSlug } from "./url-codec";
+
+const DAY_FORMAT: Intl.DateTimeFormatOptions = { day: "numeric", month: "short", year: "numeric" };
+
+export type TChipParts = {
+  /** The property, followed by the operator for a rule: `Status:`, `Responses >`. */
+  label: string;
+  /** The value pill; empty for `isSet` / `isNotSet`. */
+  value: string;
+  /** What a screen reader hears: "Filter Status: Draft, In progress". */
+  accessibleName: string;
+};
+
+const formatValue = (property: TFilterProperty, value: string, locale: string): string => {
+  if (property.valueType === "date") return formatDateForDisplay(parseCalendarDay(value), locale, DAY_FORMAT);
+  return (
+    property.options?.find((option) => option.value === value)?.label ??
+    property.valueLabels?.[value] ??
+    value
+  );
+};
+
+/**
+ * A rule's operator as its chip reads it. Wording follows the values: "is" one value, "is any of"
+ * several, and "is not" one, "is none of" several; "contains" one, "contains any of" several, and "does
+ * not contain" one, "contains none of" several.
+ */
+const ruleOperatorLabel = (filter: TTableFilter, t: TFunction): string => {
+  if (filter.values.length > 1 && filter.operator === "contains") {
+    return t("common.table_toolbar.operator_contains_any_of");
+  }
+  if (filter.values.length > 1 && filter.operator === "doesNotContain") {
+    return t("common.table_toolbar.operator_contains_none_of");
+  }
+  if (filter.values.length > 1 && filter.operator === "equals") {
+    return t("common.table_toolbar.operator_is_any_of");
+  }
+  if (filter.values.length > 1 && filter.operator === "notEquals") {
+    return t("common.table_toolbar.operator_is_none_of");
+  }
+  return getOperatorLabel(filter.operator, t);
+};
+
+/** How a filter chip reads. Quick filters read `Property: values`; rules read `Property operator value`. */
+export const getChipParts = (
+  filter: TTableFilter,
+  property: TFilterProperty,
+  t: TFunction,
+  locale: string
+): TChipParts => {
+  let label: string;
+  let value: string;
+
+  switch (filter.operator) {
+    case "in":
+      label = `${property.label}:`;
+      value = filter.values.map((v) => formatValue(property, v, locale)).join(", ");
+      break;
+    case "preset": {
+      const preset = datePresetFromSlug(filter.values[0]);
+      label = `${property.label}:`;
+      value = preset ? getTranslatedDatePresetLabel(preset, t) : filter.values[0];
+      break;
+    }
+    case "between":
+      label = `${property.label}:`;
+      value = `${formatValue(property, filter.values[0], locale)} – ${formatValue(property, filter.values[1], locale)}`;
+      break;
+    default:
+      label = `${property.label} ${ruleOperatorLabel(filter, t)}`;
+      if (operatorTakesValues(filter.operator, property)) {
+        value = filter.values.map((v) => formatValue(property, v, locale)).join(", ");
+      } else if (operatorTakesValue(filter.operator)) {
+        value = formatValue(property, filter.values[0] ?? "", locale);
+      } else {
+        value = "";
+      }
+  }
+
+  const accessibleName = t("common.table_toolbar.chip_accessible_name", {
+    filter: value ? `${label} ${value}` : label,
+  });
+  return { label, value, accessibleName };
+};

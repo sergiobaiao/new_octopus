@@ -15,7 +15,7 @@ partOfOverride: ""
 ##########################################################
 formbricks:
   # REQUIRED: Base URL of the site (e.g., https://formbricks.example.com)
-  # This is used for WEBAPP_URL and NEXTAUTH_URL
+  # This is used for WEBAPP_URL and BETTER_AUTH_URL
   webappUrl: ""
 
   # Optional: Public URL for surveys (defaults to webappUrl if not set)
@@ -202,10 +202,19 @@ deployment:
       memory: 1Gi
       cpu: "1"
 
-  # Container security context
+  # Container security context for the web container. The image's `nextjs` user is UID 1001;
+  # the kubelet needs a numeric UID to enforce runAsNonRoot.
+  # Container-level fields win over deployment.securityContext. With readOnlyRootFilesystem, the chart mounts
+  # emptyDir volumes on /tmp, the Next.js cache, and (when startup migrations run) the Prisma migration
+  # staging directory. The migration Job retains a writable root and uses deployment.securityContext only.
   containerSecurityContext:
     readOnlyRootFilesystem: true
     runAsNonRoot: true
+    runAsUser: 1001
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
 
   # Pod security context
   securityContext: {}
@@ -360,7 +369,7 @@ taxonomy:
 
   image:
     repository: "ghcr.io/formbricks/taxonomy"
-    tag: "v0.1.0"
+    tag: "0.1.15"
     digest: ""
     pullPolicy: IfNotPresent
 
@@ -371,6 +380,21 @@ taxonomy:
     port: 8000
     annotations: {}
     additionalLabels: {}
+
+  # Dedicated ServiceAccount for the taxonomy pod, so a cloud workload identity (EKS Pod Identity,
+  # IRSA, GKE Workload Identity) can be bound to taxonomy alone instead of to rbac.serviceAccount,
+  # which the web app and migration job share.
+  serviceAccount:
+    # Create `name`, or `<nameOverride or chart name>-taxonomy` (formbricks-taxonomy by default).
+    # When false, `name` selects an existing ServiceAccount; leaving both unset keeps the
+    # namespace default ServiceAccount.
+    create: false
+    name: ""
+    # Applied only when create=true, e.g. eks.amazonaws.com/role-arn for IRSA.
+    annotations: {}
+    additionalLabels: {}
+    # Taxonomy does not call the Kubernetes API. IRSA and Pod Identity project their own token.
+    automountServiceAccountToken: false
 
   auth:
     # Existing secret must contain serviceTokenKey and hubInternalApiTokenKey.
@@ -417,6 +441,8 @@ taxonomy:
       project: ""
       location: ""
       thinkingBudget: "0"
+      # Optional thinking level; when set, replaces thinkingBudget in the request.
+      thinkingLevel: ""
       # Existing secret must contain credentialsJsonSecretKey.
       existingSecret: ""
       credentialsJsonSecretKey: TAXONOMY_GOOGLE_CLOUD_CREDENTIALS_JSON
@@ -436,13 +462,16 @@ taxonomy:
   heartbeatIntervalSeconds: "30"
   runDeadlineSeconds: "900"
   # Keep this compatible with the default v0.1.0 image, which does not heartbeat through
-  # terminal Hub callbacks. It can be lowered after pinning a heartbeat-capable image.
+  # terminal Hub callbacks. The chart requires it to exceed runDeadlineSeconds while that
+  # image is pinned; relax that guard when moving to a heartbeat-capable image.
   hubStaleRunTimeoutSeconds: "1800"
   hubReaperIntervalSeconds: "60"
   terminationGracePeriodSeconds: 930
 
   envFrom: []
-  env: {}
+  # The v0.1.0 image runs uv at startup, which needs a writable cache as a non-root user.
+  env:
+    UV_CACHE_DIR: /tmp/uv-cache
 
   resources:
     requests:
@@ -507,8 +536,19 @@ taxonomy:
 
   podAnnotations: {}
   podLabels: {}
-  podSecurityContext: {}
-  securityContext: {}
+  podSecurityContext:
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -625,7 +665,7 @@ externalSecret:
   files: {}
 
 ##########################################################
-# AuthZed / SpiceDB Authorization Configuration
+# SpiceDB Authorization Configuration
 ##########################################################
 authzed:
   # Formbricks v6 uses SpiceDB as its sole authorization decision engine.
@@ -640,6 +680,11 @@ authzed:
     # Set this to false only when an operator performs the same guarded cutover externally, and set
     # migrationAcknowledged=true only after that preparation has completed successfully.
     enabled: true
+    # Container-only overrides for the initialization / upgrade-check hook, not the web or migration Job.
+    # Defaults keep non-root enforcement, a read-only root, no privilege escalation, and all capabilities dropped.
+    # UID precedence: this runAsUser override > deployment.securityContext.runAsUser > 1001 (official image).
+    # Custom images using another UID must set it here or in deployment.securityContext.
+    securityContext: {}
 
   # selfHosted creates a SpiceDBCluster. external only configures the app client.
   mode: selfHosted
@@ -670,7 +715,7 @@ authzed:
 
   cluster:
     name: ""
-    version: v1.52.0
+    version: v1.56.2
     channel: stable
     replicas: 2
     config:
@@ -690,7 +735,7 @@ authzed:
   # PostgreSQL dependency is enabled and no datastore secret is supplied.
   bundledPostgresqlBootstrap:
     enabled: true
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     backoffLimit: 10
     # The administrative role the bootstrap Job connects as to create the
     # dedicated `spicedb` role and database. It needs CREATEROLE and CREATEDB,
@@ -703,19 +748,26 @@ authzed:
     # unsupported case is a `spicedb` role someone else already created. See the
     # chart README.
     #
-    # Defaults to the `postgres` superuser the bundled subchart creates. An
-    # existing PostgreSQL that was installed without one (see
-    # postgresql.auth.enablePostgresUser) would otherwise fail this Job, so point
-    # these at whichever role does hold those privileges instead of disabling
-    # bootstrap wholesale.
-    adminUsername: postgres
-    adminDatabase: postgres
-    # Where that role's password lives. Both default to the bundled PostgreSQL
-    # admin credentials, so overriding adminUsername alone is not enough — set
-    # these too whenever the role is not the bundled `postgres` superuser.
-    # Setting the name without the key is refused as well: the key would
-    # otherwise fall back to the subchart's own key name and be looked up inside
-    # your Secret, which fails only once the Pod is created.
+    # Leave all four admin* values empty to connect as the role the bundled
+    # server was initialised with: postgresql.auth.username on
+    # postgresql.auth.database, with the password the server reads
+    # (postgresql.auth.existingSecret / secretKeys.userPasswordKey). The bundled
+    # pgvector/pgvector image is the official PostgreSQL image, which makes that
+    # role a superuser and creates no `postgres` role. When the data directory
+    # was initialised by a Bitnami image instead, that role is not a superuser,
+    # so the Job falls back to the `postgres` superuser and its admin password.
+    #
+    # Setting any of them selects an explicit administrator, with the previous
+    # defaults for the rest: `postgres` on the `postgres` database with the
+    # bundled admin password. Point them at whichever role holds the privileges
+    # above instead of disabling bootstrap wholesale.
+    adminUsername: ""
+    adminDatabase: ""
+    # Where that role's password lives. With an explicit adminUsername other
+    # than `postgres`, both are required. Setting the name without the key is
+    # refused as well: the key would otherwise fall back to the subchart's own
+    # key name and be looked up inside your Secret, which fails only once the
+    # Pod is created.
     adminPasswordSecretName: ""
     adminPasswordKey: ""
 
@@ -724,7 +776,7 @@ authzed:
   # Its URL must explicitly set sslmode=require, verify-ca, or verify-full.
   externalPostgresqlBootstrap:
     enabled: false
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     backoffLimit: 10
     adminSecretName: ""
     adminUrlKey: DATABASE_URL
@@ -775,8 +827,10 @@ envoy:
   controller:
     enabled: false
 
-  # Install the Gateway API and Envoy Gateway CRDs bundled with the controller.
-  # Set this to false when the platform manages both CRD sets separately.
+  # The Envoy v1.8.4 dependency installs Gateway API v1.5.1 Experimental and Envoy Gateway CRDs together.
+  # false omits BOTH CRD sets and bundled Gateway API safe-upgrade admission resources.
+  # If the platform owns only Gateway API, install matching Envoy Gateway v1.8.4 CRDs separately first.
+  # The controller and Formbricks Gateway/routes/policies remain enabled independently.
   crds:
     enabled: true
     gatewayAPI:
@@ -981,7 +1035,7 @@ redis:
   image:
     repository: "valkey/valkey"
     tag: ""
-    digest: "sha256:e0eb7c480958d32bdc4357a74bdd70653ae15f2f9b4c93c4a5a9fad1dc471c84"
+    digest: "sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd"
     pullPolicy: IfNotPresent
   architecture: standalone
   commonConfiguration: |-
@@ -1050,9 +1104,12 @@ cube:
   enabled: true
   replicas: 1
 
+  # Formbricks' distroless Cube build (docker/cube-image), without a shell or Cube Store. Pointing
+  # repository and tag back at an upstream "cubejs/cube" release is supported.
   image:
-    repository: "cubejs/cube"
-    tag: "v1.6.6"
+    repository: "ghcr.io/formbricks/cube"
+    tag: "1.8.8-3"
+    digest: ""
     pullPolicy: IfNotPresent
 
   imagePullSecrets: []
@@ -1064,8 +1121,18 @@ cube:
     port: 4000
 
   # The generated app secret supplies CUBEJS_API_SECRET when secret.enabled=true.
-  # Secret values such as CUBEJS_DB_* should be supplied through envFrom or another secret-management
-  # flow.
+  #
+  # With the bundled PostgreSQL (postgresql.enabled=true) the chart connects Cube to it:
+  # CUBEJS_DB_HOST, _PORT, _NAME and _USER are rendered from the postgresql values, and CUBEJS_DB_PASS
+  # references the Secret and key the server reads its password from. A name set in cube.env replaces
+  # that default; the user and password are dropped together when cube.env sets CUBEJS_DB_HOST,
+  # CUBEJS_DB_USER or CUBEJS_DB_PASS. Kubernetes gives env precedence over envFrom, so override these
+  # in cube.env (valueFrom maps are accepted), not through envFrom.
+  #
+  # With an external database (postgresql.enabled=false) nothing is rendered: set CUBEJS_DB_HOST,
+  # CUBEJS_DB_PORT, CUBEJS_DB_NAME, CUBEJS_DB_USER and CUBEJS_DB_PASS (plus CUBEJS_DB_SSL=true for TLS)
+  # in cube.env or through envFrom. Cube's Postgres driver has no URL variable, so DATABASE_URL is not
+  # reused.
   envFrom: []
 
   env:
@@ -1081,11 +1148,22 @@ cube:
     CUBEJS_CACHE_AND_QUEUE_DRIVER: "memory"
     CUBEJS_JWT_ISSUER: "formbricks-web"
     CUBEJS_JWT_AUDIENCE: "formbricks-cube"
+    # Cube sets it as each query's Postgres statement_timeout (Cube's default is 10 minutes), so one
+    # dashboard cannot hold database connections busy for long.
+    CUBEJS_DB_QUERY_TIMEOUT: "60s"
 
+  # Cube writes nothing to its own filesystem without Cube Store (in-memory cache and queue driver), so
+  # the root filesystem is read-only and no writable mounts are needed. docker/cube-image/smoke-test.sh
+  # runs the bundled image this way. CUBEJS_DEV_MODE on an upstream image starts an embedded Cube Store
+  # that writes under /cube/conf, and needs readOnlyRootFilesystem: false.
   containerSecurityContext:
-    readOnlyRootFilesystem: false
+    readOnlyRootFilesystem: true
     runAsNonRoot: true
     runAsUser: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
 
   livenessProbe:
     httpGet:
@@ -1131,10 +1209,10 @@ hub:
     # Pinned by digest for immutable, reproducible deployments. When digest is set it takes
     # precedence over tag, and deployment, init container, and migration job all resolve to the
     # same immutable image. Update on each Hub release.
-    # Current digest corresponds to ghcr.io/formbricks/hub:0.8.5.
-    digest: "sha256:9f4c109e6589993ef15708f834d57241ed3a73e3246e3565620777a66a231b59"
+    # Current digest corresponds to ghcr.io/formbricks/hub:0.14.3.
+    digest: "sha256:63b85da9a0eb4346dd9350cd2bc82e9fe00b195756ad9a4bd50195ba874d10bc"
     # Tag is a fallback for dev/non-prod when digest is cleared; keep aligned with the digest above.
-    tag: "0.8.5"
+    tag: "0.14.3"
     pullPolicy: IfNotPresent
 
   # Optional override for the secret Hub reads from.
@@ -1278,8 +1356,11 @@ hub:
     topologySpreadConstraints: []
 
   embeddings:
-    # Optional self-hosted OpenAI-compatible embeddings runtime for Hub.
+    # Optional OpenAI-compatible embeddings integration for Hub.
     enabled: false
+    # Deploy the bundled TEI workloads. Set false when baseUrl points to an
+    # externally managed runtime. Embedding env wiring remains enabled.
+    deployRuntime: true
     runtime: tei
     model: Alibaba-NLP/gte-multilingual-base
     revision: ""
@@ -1364,7 +1445,11 @@ hub:
     extraArgs:
       - --dtype
       - float16
-    env: {}
+    # TEI 1.9 includes parsed arguments in INFO startup logs. Keep the secure
+    # default below so API_KEY is not copied into container logs. Override only
+    # when the selected runtime is known to redact credentials.
+    env:
+      RUST_LOG: warn
 
     port: 8080
     prometheusPort: 9000
@@ -1533,8 +1618,11 @@ postgresql:
     repository: pgvector/pgvector
     tag: pg17
   auth:
-    # The bundled AuthZed bootstrap creates a dedicated role and database and
-    # therefore requires the PostgreSQL administrator account.
+    # The bundled pgvector/pgvector image is the official PostgreSQL image: it
+    # makes `username` its superuser and ignores the Bitnami-only
+    # POSTGRES_POSTGRES_PASSWORD this enables, so no `postgres` role exists. It
+    # stays true for servers a Bitnami image initialised, where the AuthZed
+    # bootstrap falls back to `postgres` with the admin password.
     enablePostgresUser: true
     username: formbricks
     database: formbricks
@@ -1566,3 +1654,26 @@ postgresql:
       enabled: true
       runAsUser: 1001
       readOnlyRootFilesystem: false
+
+# Online upgrades remain opt-in until the release acceptance matrix is complete.
+upgrade:
+  mode: maintenance
+  online:
+    # Argo renders Helm charts as installs; select its explicit existing-installation path.
+    controller: helm
+    existingInstallation: false
+    sourceVersion: "6.0.2"
+    sessionAffinity: false
+    # Abort without source termination if active BullMQ jobs exceed this deadline.
+    jobDrainTimeoutSeconds: 180
+    timeoutSeconds: 900
+    # Exact immutable images for every app writer/worker. The web Deployment is added automatically.
+    workloads: []
+    # Paired Hub/Cube and datastores must already run these compatible immutable images.
+    dependencies: []
+    ingress:
+      selector: ""
+      adminPort: 19000
+      # Exact Kubernetes proxy resource names, e.g. envoy-abc-xyz:19000. No wildcard proxy access.
+      proxyResourceNames: []
+      cluster: ""

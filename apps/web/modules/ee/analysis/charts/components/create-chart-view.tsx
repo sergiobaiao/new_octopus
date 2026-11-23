@@ -59,6 +59,8 @@ export function CreateChartView({
     initialQuery,
     isLoadingChart,
     chartLoadError,
+    isChartLoaded,
+    canSaveDetailsOnly,
     chartName,
     setChartName,
     selectedChartType,
@@ -92,7 +94,7 @@ export function CreateChartView({
     if (!open) adoptedChartRef.current = null;
   }, [open]);
 
-  const isReady = open && !isLoadingChart && (!isEditing || Boolean(chartData));
+  const isReady = open && !isLoadingChart && (!isEditing || Boolean(chartData) || canSaveDetailsOnly);
   const { confirmDiscard, isConfirmingDiscard, setIsConfirmingDiscard, runPendingDiscard } =
     useChartDirtyState({ open, isReady, isSaving, chartName, chartData, chartConfig });
 
@@ -111,7 +113,8 @@ export function CreateChartView({
     return <ChartDialogLoadingView open={open} onClose={handleClose} />;
   }
 
-  if (isEditing && !isLoadingChart && !chartData && !initialChart && chartLoadError) {
+  // Only when the chart itself failed to load: one whose data alone failed still opens.
+  if (isEditing && !isLoadingChart && !chartData && !isChartLoaded && chartLoadError) {
     return <ChartLoadErrorDialog open={open} message={chartLoadError} onClose={handleClose} />;
   }
 
@@ -119,7 +122,8 @@ export function CreateChartView({
   // the preview starts at the default and the user changes it whenever they like.
   const chartType = selectedChartType ?? initialChart?.type ?? DEFAULT_CHART_TYPE;
 
-  const canSave = Boolean(chartData) && !queryState.error;
+  // A saved chart whose data could not load can still be renamed.
+  const canSave = (Boolean(chartData) && !queryState.error) || canSaveDetailsOnly;
   const saveLabel = autoAddToDashboardId
     ? t("workspace.analysis.charts.save_and_add_to_dashboard")
     : t("workspace.analysis.charts.save_chart");
@@ -127,10 +131,14 @@ export function CreateChartView({
     ? {
         title: t("workspace.analysis.charts.edit_chart_title"),
         description: t("workspace.analysis.charts.edit_chart_description"),
+        discardTitle: t("workspace.analysis.charts.discard_chart_changes_title"),
+        discardBody: t("workspace.analysis.charts.discard_chart_changes_body"),
       }
     : {
         title: t("workspace.analysis.charts.create_chart"),
         description: t("workspace.analysis.charts.create_chart_description"),
+        discardTitle: t("workspace.analysis.charts.discard_chart_title"),
+        discardBody: t("workspace.analysis.charts.discard_chart_body"),
       };
 
   return (
@@ -177,6 +185,7 @@ export function CreateChartView({
                 queryState={queryState}
                 isLoadingChart={isLoadingChart}
                 chartLoadError={chartLoadError}
+                renameOnly={canSaveDetailsOnly}
               />
             ) : (
               <NoFeedbackDirectoryAlert organizationId={workspace?.organizationId} />
@@ -198,8 +207,8 @@ export function CreateChartView({
       <ConfirmationModal
         open={isConfirmingDiscard}
         setOpen={setIsConfirmingDiscard}
-        title={t("workspace.analysis.charts.discard_chart_title")}
-        body={t("workspace.analysis.charts.discard_chart_body")}
+        title={copy.discardTitle}
+        body={copy.discardBody}
         buttonText={t("workspace.surveys.ai_create.discard")}
         buttonVariant="destructive"
         cancelButtonText={t("workspace.surveys.ai_create.keep_editing")}

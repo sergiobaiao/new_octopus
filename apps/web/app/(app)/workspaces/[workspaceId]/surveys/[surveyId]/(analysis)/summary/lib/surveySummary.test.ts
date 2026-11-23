@@ -1,11 +1,22 @@
+import { createInMemoryResponseFindMany } from "@/lib/response/__mocks__/response-find-many.mock";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
-import { deriveLegacyEmbeddedData } from "@formbricks/types/embedded-data-resolver";
+import { embeddedFieldsFromLegacyInput } from "@formbricks/types/embedded-data-mapping";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { TResponseFilterCriteria } from "@formbricks/types/responses";
 import { TSurveyElement, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
-import { TSurvey, TSurveySummary } from "@formbricks/types/surveys/types";
+import {
+  SURVEY_FLOW_FIXTURE_IDS,
+  surveyFlowFixture,
+  surveyFlowFixtureNotShown,
+} from "@formbricks/types/surveys/test-fixtures/survey-flow-fixture";
+import {
+  TSurvey,
+  TSurveyElementSummaryRanking,
+  TSurveyElementSummarySignature,
+  TSurveySummary,
+} from "@formbricks/types/surveys/types";
 import { TLanguage } from "@formbricks/types/workspace";
 import { getQuotasSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/lib/survey";
 import { getDisplayCountBySurveyId } from "@/lib/display/service";
@@ -491,7 +502,7 @@ describe("getQuestionSummary", () => {
     questions: [],
     hiddenFields: { enabled: true, fieldIds: ["hidden1"] },
     // The rows are what the accessors read since ENG-2412; a real survey read carries both.
-    embeddedFields: deriveLegacyEmbeddedData({ hiddenFields: { enabled: true, fieldIds: ["hidden1"] } }),
+    embeddedFields: embeddedFieldsFromLegacyInput({ hiddenFields: { enabled: true, fieldIds: ["hidden1"] } }),
   };
   const responses = [
     {
@@ -639,6 +650,50 @@ describe("getQuestionSummary", () => {
     expect(hiddenFieldSummary?.samples[0].value).toBe("Hidden val");
   });
 
+  /**
+   * ENG-3233. The card is titled by `label`; `id` stays the storage key the samples were read from,
+   * because that is what addresses `response.data`. Red on main, where there was no `label` and the
+   * card showed `utm_campaign`.
+   */
+  test("titles a hidden-field summary by the field's name, keeping the storage key on id", async () => {
+    const renamedSurvey = {
+      ...survey,
+      embeddedFields: [
+        {
+          field: {
+            name: "Campaign",
+            key: null,
+            source: "ingested",
+            dataType: "string",
+            defaultValue: null,
+            locked: false,
+          },
+          link: { storageKey: "utm_campaign" },
+        },
+      ],
+    };
+    const renamedResponses = [
+      { ...responses[0], data: { utm_campaign: "spring_sale" } },
+    ] as unknown as typeof responses;
+
+    const summary = await getElementSummary(
+      renamedSurvey as unknown as TSurvey,
+      getElementsFromBlocks((renamedSurvey as unknown as TSurvey).blocks),
+      renamedResponses,
+      mockDropOff
+    );
+
+    const hiddenFieldSummary = summary.find((s) => s.type === "hiddenField");
+    // `samples` as well as the metadata: the point of the rename is that the *label* changed while
+    // the key the value is read by did not, so an implementation that looked values up by label
+    // would still produce this id and label — with an empty sample list.
+    expect(hiddenFieldSummary).toMatchObject({
+      id: "utm_campaign",
+      label: "Campaign",
+      samples: [expect.objectContaining({ value: "spring_sale" })],
+    });
+  });
+
   describe("Ranking question type tests", () => {
     test("getQuestionSummary correctly processes ranking question with default language responses", async () => {
       const question = {
@@ -726,6 +781,170 @@ describe("getQuestionSummary", () => {
       );
       expect(item3.count).toBe(2);
       expect(item3.avgRanking).toBe(3);
+    });
+
+    test("getQuestionSummary aggregates a ranked Other with its average rank and typed values", async () => {
+      const question = {
+        id: "ranking-q1",
+        type: TSurveyElementTypeEnum.Ranking,
+        headline: { default: "Rank these items" },
+        required: true,
+        choices: [
+          { id: "item1", label: { default: "Item 1" } },
+          { id: "item2", label: { default: "Item 2" } },
+          { id: "other", label: { default: "Other" } },
+        ],
+      };
+
+      const survey = {
+        id: "survey-1",
+        blocks: [{ id: "block1", name: "Block 1", elements: [question] }],
+        questions: [],
+        languages: [],
+        welcomeCard: { enabled: false },
+      } as unknown as TSurvey;
+
+      const buildResponse = (id: string, answer: string[]) => ({
+        id,
+        data: { "ranking-q1": answer },
+        updatedAt: new Date(),
+        contact: null,
+        contactAttributes: {},
+        language: null,
+        ttc: {},
+        finished: true,
+      });
+
+      const responses = [
+        buildResponse("response-1", ["Integrations", "Item 1", "Item 2"]),
+        buildResponse("response-2", ["Item 2", "Item 1", "Self-hosting"]),
+        buildResponse("response-3", ["Item 1", "Item 2"]),
+      ];
+
+      const dropOff = [
+        { elementId: "ranking-q1", impressions: 3, dropOffCount: 0, dropOffPercentage: 0 },
+      ] as unknown as TSurveySummary["dropOff"];
+
+      const summary = await getElementSummary(
+        survey,
+        getElementsFromBlocks(survey.blocks),
+        responses,
+        dropOff
+      );
+
+      const choices = (summary[0] as TSurveyElementSummaryRanking).choices;
+      expect(choices.map((c) => c.value)).toEqual(["Item 1", "Item 2", "Other"]);
+
+      const other = choices[2];
+      // Ranked 1st once and 3rd once
+      expect(other.count).toBe(2);
+      expect(other.avgRanking).toBe(2);
+      expect(other.others?.map((o) => o.value)).toEqual(["Integrations", "Self-hosting"]);
+
+      // The typed text never counts toward a regular choice
+      expect(choices[0]).toMatchObject({ value: "Item 1", count: 3 });
+    });
+
+    test.each([
+      {
+        name: "counts an Other ranked with no text but lists no value, falling back to the Other label",
+        otherLabel: "",
+        answer: ["", "Item 1"],
+        expected: { value: "Other", count: 1, avgRanking: 1, others: [] },
+      },
+      {
+        name: "reports an unranked Other with a zero count and average",
+        otherLabel: "Something else",
+        answer: ["Item 1"],
+        expected: { value: "Something else", count: 0, avgRanking: 0, others: [] },
+      },
+    ])("getQuestionSummary $name", async ({ otherLabel, answer, expected }) => {
+      const survey = {
+        id: "survey-1",
+        blocks: [
+          {
+            id: "block1",
+            name: "Block 1",
+            elements: [
+              {
+                id: "ranking-q1",
+                type: TSurveyElementTypeEnum.Ranking,
+                headline: { default: "Rank these items" },
+                required: true,
+                choices: [
+                  { id: "item1", label: { default: "Item 1" } },
+                  { id: "other", label: { default: otherLabel } },
+                ],
+              },
+            ],
+          },
+        ],
+        questions: [],
+        languages: [],
+        welcomeCard: { enabled: false },
+      } as unknown as TSurvey;
+
+      const responses = [
+        {
+          id: "response-1",
+          data: { "ranking-q1": answer },
+          updatedAt: new Date(),
+          contact: null,
+          contactAttributes: {},
+          language: null,
+          ttc: {},
+          finished: true,
+        },
+      ];
+
+      const summary = await getElementSummary(survey, getElementsFromBlocks(survey.blocks), responses, [
+        { elementId: "ranking-q1", impressions: 1, dropOffCount: 0, dropOffPercentage: 0 },
+      ] as unknown as TSurveySummary["dropOff"]);
+
+      const other = (summary[0] as TSurveyElementSummaryRanking).choices.at(-1);
+      expect(other).toEqual(expected);
+    });
+
+    test("getQuestionSummary ignores unmatched ranking entries when there is no Other option", async () => {
+      const question = {
+        id: "ranking-q1",
+        type: TSurveyElementTypeEnum.Ranking,
+        headline: { default: "Rank these items" },
+        required: true,
+        choices: [
+          { id: "item1", label: { default: "Item 1" } },
+          { id: "item2", label: { default: "Item 2" } },
+        ],
+      };
+
+      const survey = {
+        id: "survey-1",
+        blocks: [{ id: "block1", name: "Block 1", elements: [question] }],
+        questions: [],
+        languages: [],
+        welcomeCard: { enabled: false },
+      } as unknown as TSurvey;
+
+      const responses = [
+        {
+          id: "response-1",
+          data: { "ranking-q1": ["Renamed item", "Item 1"] },
+          updatedAt: new Date(),
+          contact: null,
+          contactAttributes: {},
+          language: null,
+          ttc: {},
+          finished: true,
+        },
+      ];
+
+      const summary = await getElementSummary(survey, getElementsFromBlocks(survey.blocks), responses, [
+        { elementId: "ranking-q1", impressions: 1, dropOffCount: 0, dropOffPercentage: 0 },
+      ] as unknown as TSurveySummary["dropOff"]);
+
+      const choices = (summary[0] as TSurveyElementSummaryRanking).choices;
+      expect(choices.map((c) => c.value)).toEqual(["Item 1", "Item 2"]);
+      expect(choices[0].avgRanking).toBe(2);
     });
 
     test("getQuestionSummary correctly processes ranking question with non-default language responses", async () => {
@@ -1140,14 +1359,12 @@ describe("getResponsesForSummary", () => {
 
   test("fetches and transforms responses", async () => {
     const limit = 2;
-    const offset = 0;
-    const result = await getResponsesForSummary(mockSurveyId, limit, offset);
+    const result = await getResponsesForSummary(mockSurveyId, limit);
 
     expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
     expect(prisma.response.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         take: limit,
-        skip: offset,
         where: { surveyId: mockSurveyId }, // buildWhereClause is mocked to return {}
       })
     );
@@ -1158,13 +1375,13 @@ describe("getResponsesForSummary", () => {
 
   test("returns empty array if survey not found", async () => {
     vi.mocked(getSurvey).mockResolvedValue(null);
-    const result = await getResponsesForSummary(mockSurveyId, 10, 0);
+    const result = await getResponsesForSummary(mockSurveyId, 10);
     expect(result).toEqual([]);
   });
 
   test("throws DatabaseError on prisma failure", async () => {
     vi.mocked(prisma.response.findMany).mockRejectedValue(new Error("DB error"));
-    await expect(getResponsesForSummary(mockSurveyId, 10, 0)).rejects.toThrow("DB error");
+    await expect(getResponsesForSummary(mockSurveyId, 10)).rejects.toThrow("DB error");
   });
 
   test("getResponsesForSummary handles null contact properly", async () => {
@@ -1186,6 +1403,8 @@ describe("getResponsesForSummary", () => {
       personAttributes: {},
       singleUseId: null,
       ingestFlags: null,
+      notShown: null,
+      outcome: null,
       isFinished: true,
       displayId: "display-1",
       endingId: null,
@@ -1194,7 +1413,7 @@ describe("getResponsesForSummary", () => {
     vi.mocked(getSurvey).mockResolvedValue(mockSurvey);
     vi.mocked(prisma.response.findMany).mockResolvedValue([mockResponse]);
 
-    const result = await getResponsesForSummary("survey-1", 10, 0);
+    const result = await getResponsesForSummary("survey-1", 10);
 
     expect(result).toHaveLength(1);
     expect(result[0].contact).toBeNull();
@@ -1230,6 +1449,8 @@ describe("getResponsesForSummary", () => {
       personAttributes: {},
       singleUseId: null,
       ingestFlags: null,
+      notShown: null,
+      outcome: null,
       isFinished: true,
       displayId: "display-1",
       endingId: null,
@@ -1238,7 +1459,7 @@ describe("getResponsesForSummary", () => {
     vi.mocked(getSurvey).mockResolvedValue(mockSurvey);
     vi.mocked(prisma.response.findMany).mockResolvedValue([mockResponse]);
 
-    const result = await getResponsesForSummary("survey-1", 10, 0);
+    const result = await getResponsesForSummary("survey-1", 10);
 
     expect(result).toHaveLength(1);
     expect(result[0].contact).toEqual({
@@ -1269,6 +1490,8 @@ describe("getResponsesForSummary", () => {
       personAttributes: {},
       singleUseId: null,
       ingestFlags: null,
+      notShown: null,
+      outcome: null,
       isFinished: true,
       displayId: "display-1",
       endingId: null,
@@ -1277,7 +1500,7 @@ describe("getResponsesForSummary", () => {
     vi.mocked(getSurvey).mockResolvedValue(mockSurvey);
     vi.mocked(prisma.response.findMany).mockResolvedValue([mockResponse]);
 
-    const result = await getResponsesForSummary("survey-1", 10, 0);
+    const result = await getResponsesForSummary("survey-1", 10);
 
     expect(result).toHaveLength(1);
     expect(result[0].contact).toEqual({
@@ -1296,8 +1519,8 @@ describe("getResponsesForSummary", () => {
 
     vi.mocked(prisma.response.findMany).mockRejectedValue(prismaError);
 
-    await expect(getResponsesForSummary("survey-1", 10, 0)).rejects.toThrow(DatabaseError);
-    await expect(getResponsesForSummary("survey-1", 10, 0)).rejects.toThrow("Database connection error");
+    await expect(getResponsesForSummary("survey-1", 10)).rejects.toThrow(DatabaseError);
+    await expect(getResponsesForSummary("survey-1", 10)).rejects.toThrow("Database connection error");
   });
 
   test("getResponsesForSummary rethrows non-Prisma errors", async () => {
@@ -1306,9 +1529,9 @@ describe("getResponsesForSummary", () => {
     const genericError = new Error("Something else went wrong");
     vi.mocked(prisma.response.findMany).mockRejectedValue(genericError);
 
-    await expect(getResponsesForSummary("survey-1", 10, 0)).rejects.toThrow("Something else went wrong");
-    await expect(getResponsesForSummary("survey-1", 10, 0)).rejects.toThrow(Error);
-    await expect(getResponsesForSummary("survey-1", 10, 0)).rejects.not.toThrow(DatabaseError);
+    await expect(getResponsesForSummary("survey-1", 10)).rejects.toThrow("Something else went wrong");
+    await expect(getResponsesForSummary("survey-1", 10)).rejects.toThrow(Error);
+    await expect(getResponsesForSummary("survey-1", 10)).rejects.not.toThrow(DatabaseError);
   });
 
   test("getSurveySummary throws DatabaseError when Prisma throws PrismaClientKnownRequestError from getDisplayCountBySurveyId", async () => {
@@ -1360,7 +1583,7 @@ describe("getResponsesForSummary", () => {
     await expect(getSurveySummary("survey-1")).rejects.not.toThrow(DatabaseError);
   });
 
-  test("getSurveySummary handles multiple batches when responses exceed batchSize", async () => {
+  test("getSurveySummary counts every response once across batches when ids differ from createdAt order", async () => {
     vi.mocked(getSurvey).mockResolvedValue({
       id: "survey-1",
       blocks: [],
@@ -1369,62 +1592,38 @@ describe("getResponsesForSummary", () => {
       languages: [],
     } as unknown as TSurvey);
 
-    // Create mock responses for two batches
-    // First batch: 5000 responses (exactly batchSize, triggers continuation)
-    // Second batch: 100 responses (less than batchSize, stops loop)
-    const createMockResponses = (count: number, startIdx: number) =>
-      Array.from({ length: count }, (_, i) => ({
-        id: `response-${startIdx + i}`,
-        data: {},
-        updatedAt: new Date(),
-        contact: null,
-        contactAttributes: {},
-        language: "en",
-        ttc: {},
-        finished: true,
-        createdAt: new Date(),
-        meta: {},
-        variables: {},
-        surveyId: "survey-1",
-        contactId: null,
-        personAttributes: {},
-        singleUseId: null,
-        ingestFlags: null,
-        isFinished: true,
-        displayId: "display-1",
-        endingId: null,
-      }));
-
-    const firstBatch = createMockResponses(5000, 0);
-    const secondBatch = createMockResponses(100, 5000);
-
-    // First call returns 5000, second call returns 100
-    vi.mocked(prisma.response.findMany).mockResolvedValueOnce(firstBatch).mockResolvedValueOnce(secondBatch);
-
+    // 5,100 responses, so the summary needs two 5,000-row batches. Ids follow insertion order but
+    // createdAt does not, as with imported responses, and every timestamp is shared by three responses,
+    // so the batch boundary falls inside a tie.
+    const start = Date.UTC(2026, 0, 1);
+    const rows = Array.from({ length: 5100 }, (_, i) => ({
+      id: `response-${String(i).padStart(4, "0")}`,
+      createdAt: new Date(start + ((i * 7919) % 1700) * 1000),
+      data: {},
+      updatedAt: new Date(start),
+      contact: null,
+      contactAttributes: {},
+      language: "en",
+      ttc: {},
+      finished: true,
+    }));
+    vi.mocked(prisma.response.findMany).mockImplementation(createInMemoryResponseFindMany(rows) as never);
     vi.mocked(getDisplayCountBySurveyId).mockResolvedValue(5100);
     vi.mocked(getQuotasSummary).mockResolvedValue([]);
 
     const result = await getSurveySummary("survey-1");
 
-    // Verify that prisma.response.findMany was called twice (two batches)
-    expect(prisma.response.findMany).toHaveBeenCalledTimes(2);
-
-    // Second call should have cursor set to last response ID of first batch
-    expect(prisma.response.findMany).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        where: expect.objectContaining({
-          surveyId: "survey-1",
-          id: { lt: "response-4999" }, // Last ID from first batch
-        }),
-      })
+    const batches = await Promise.all(
+      vi.mocked(prisma.response.findMany).mock.results.map((call) => call.value as Promise<typeof rows>)
     );
-
-    // Result should contain data from all responses
+    const fetchedIds = batches.flat().map((response) => response.id);
+    expect(batches).toHaveLength(2);
+    expect(fetchedIds).toHaveLength(rows.length);
+    expect(new Set(fetchedIds).size).toBe(rows.length);
     expect(result.meta.totalResponses).toBe(5100);
   });
 
-  test("getResponsesForSummary applies cursor-based pagination when cursor is provided", async () => {
+  test("getResponsesForSummary applies cursor-based pagination without replacing the filter", async () => {
     const mockSurvey = { id: "survey-1" } as unknown as TSurvey;
     const mockResponse = {
       id: "response-2",
@@ -1443,6 +1642,8 @@ describe("getResponsesForSummary", () => {
       personAttributes: {},
       singleUseId: null,
       ingestFlags: null,
+      notShown: null,
+      outcome: null,
       isFinished: true,
       displayId: "display-1",
       endingId: null,
@@ -1451,18 +1652,19 @@ describe("getResponsesForSummary", () => {
     vi.mocked(getSurvey).mockResolvedValue(mockSurvey);
     vi.mocked(prisma.response.findMany).mockResolvedValue([mockResponse]);
 
-    const result = await getResponsesForSummary("survey-1", 10, 0, undefined, "cursor-response-id");
+    const result = await getResponsesForSummary("survey-1", 10, undefined, {
+      id: "cursor-response-id",
+      createdAt: new Date(Date.UTC(2026, 0, 1)),
+    });
 
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("response-2");
 
-    // Verify that prisma.response.findMany was called with cursor condition
+    // The cursor condition is ANDed with the filter's where instead of overwriting part of it.
     expect(prisma.response.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({
-          surveyId: "survey-1",
-          id: { lt: "cursor-response-id" },
-        }),
+        where: { AND: [{ surveyId: "survey-1" }, expect.anything()] },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       })
     );
   });
@@ -4406,6 +4608,54 @@ describe("FileUpload question type tests", () => {
   });
 });
 
+describe("Signature question type tests", () => {
+  test("getElementSummary counts signed and skipped answers and lists the signed ones", async () => {
+    const element = {
+      id: "sig-q1",
+      type: TSurveyElementTypeEnum.Signature,
+      headline: { default: "Sign here" },
+      required: false,
+      allowTypedSignature: true,
+    };
+    const survey = {
+      id: "survey-1",
+      blocks: [{ id: "block1", name: "Block 1", elements: [element] }],
+      questions: [],
+      languages: [],
+      welcomeCard: { enabled: false },
+    } as unknown as TSurvey;
+    const url = "/storage/ws/private/surveys/survey-1/elements/sig-q1/signature--fid--abc.png";
+    const base = {
+      updatedAt: new Date(),
+      contact: null,
+      contactAttributes: {},
+      language: null,
+      finished: true,
+    };
+    const responses = [
+      { ...base, id: "r1", data: { "sig-q1": url }, ttc: {} },
+      { ...base, id: "r2", data: { "sig-q1": "" }, ttc: {} },
+      { ...base, id: "r3", data: {}, ttc: {} },
+    ];
+
+    const summary = (await getElementSummary(
+      survey,
+      getElementsFromBlocks(survey.blocks),
+      responses,
+      [] as unknown as TSurveySummary["dropOff"]
+    )) as TSurveyElementSummarySignature[];
+
+    expect(summary).toHaveLength(1);
+    expect(summary[0]).toMatchObject({
+      type: TSurveyElementTypeEnum.Signature,
+      signedCount: 1,
+      skippedCount: 1,
+      responseCount: 2,
+    });
+    expect(summary[0].signatures).toEqual([expect.objectContaining({ id: "r1", value: url })]);
+  });
+});
+
 describe("Cal question type tests", () => {
   test("getQuestionSummary correctly processes Cal with valid responses", async () => {
     const question = {
@@ -5206,5 +5456,233 @@ describe("CES question type tests", () => {
     expect(summary[0].responseCount).toBe(0);
     expect(summary[0].average).toBe(0);
     expect(summary[0].choices.every((c: any) => c.count === 0)).toBe(true);
+  });
+});
+
+describe("not shown (ENG-6936)", () => {
+  const ids = SURVEY_FLOW_FIXTURE_IDS;
+  const survey = surveyFlowFixture;
+  const elements = getElementsFromBlocks(survey.blocks);
+  const dropOffOf = (dropOff: TSurveySummary["dropOff"], elementId: string) =>
+    dropOff.find((entry) => entry.elementId === elementId)!;
+
+  let sequence = 0;
+  const response = (overrides: Record<string, unknown>) => {
+    sequence += 1;
+    return {
+      id: `resp-${sequence}`,
+      updatedAt: new Date(),
+      contact: null,
+      contactAttributes: {},
+      language: null,
+      finished: true,
+      data: {},
+      ttc: {},
+      ...overrides,
+    } as any;
+  };
+
+  // Netflix only: the "Heavy users" block and the Apple TV+ follow-up were not shown.
+  const netflixOnly = response({
+    data: { services: ["Netflix"], fav: "Netflix" },
+    ttc: { services: 1000, fav: 800 },
+    notShown: surveyFlowFixtureNotShown,
+  });
+  const bigThree = response({
+    data: { services: ["Netflix", "Disney+", "Prime Video"], hours: "12", fav: "Apple TV+" },
+    ttc: { services: 1000, hours: 700, fav: 800, apple_reason: 300 },
+    notShown: {},
+  });
+  // From before 6.2: no record, read as today.
+  const legacy = response({ data: { services: ["Netflix"] }, ttc: { services: 900 }, notShown: null });
+
+  test("each element reports how many respondents it was not shown to", () => {
+    const dropOff = getSurveySummaryDropOff(survey, elements, [netflixOnly, bigThree, legacy], 3);
+
+    expect(dropOffOf(dropOff, "hours").notShownCount).toBe(1);
+    expect(dropOffOf(dropOff, "apple_reason").notShownCount).toBe(1);
+    expect(dropOffOf(dropOff, "services").notShownCount).toBe(0);
+  });
+
+  test("an element not shown is neither an impression nor a drop-off, even with time left on it", () => {
+    // Answered "Heavy users", then went Back, changed services and left: the stale timing on `hours`
+    // must not make it the last element seen.
+    const leftAfterBack = response({
+      finished: false,
+      data: { services: ["Netflix"] },
+      ttc: { services: 1000, hours: 700 },
+      notShown: { blocks: [ids.blocks.heavyUsers] },
+    });
+
+    const dropOff = getSurveySummaryDropOff(survey, elements, [leftAfterBack], 1);
+
+    expect(dropOffOf(dropOff, "hours")).toMatchObject({ impressions: 0, dropOffCount: 0, notShownCount: 1 });
+    expect(dropOffOf(dropOff, "services").dropOffCount).toBe(1);
+  });
+
+  test("a respondent who was not shown a question is outside its base, never skipped", async () => {
+    // Time on `sat_netflix` without an answer reads as skipped, unless the record lists its block.
+    const skipped = response({ ttc: { sat_netflix: 500 }, notShown: {} });
+    const notShown = response({ ttc: { sat_netflix: 500 }, notShown: { blocks: [ids.blocks.ratings] } });
+    const rated = response({ data: { sat_netflix: 5 }, ttc: { sat_netflix: 500 }, notShown: {} });
+    const responses = [skipped, notShown, rated];
+    const dropOff = getSurveySummaryDropOff(survey, elements, responses, 3);
+
+    const summary = await getElementSummary(survey, elements, responses, dropOff);
+    const rating = summary.find((entry) => "element" in entry && entry.element.id === "sat_netflix") as any;
+
+    expect(rating.dismissed.count).toBe(1);
+    expect(rating.responseCount).toBe(1);
+  });
+
+  test("changing a show-if after responses exist leaves their not-shown results unchanged", () => {
+    // After both responses came in, the block's show-if is removed and another block gains one.
+    const edited: TSurvey = {
+      ...survey,
+      blocks: survey.blocks.map((block) => {
+        if (block.id === ids.blocks.heavyUsers) return { ...block, showIf: undefined };
+        if (block.id === ids.blocks.concept) {
+          return { ...block, showIf: { id: "showifconcept", connector: "or", conditions: [] } };
+        }
+        return block;
+      }),
+    };
+
+    const before = getSurveySummaryDropOff(survey, elements, [netflixOnly, bigThree], 2);
+    const after = getSurveySummaryDropOff(
+      edited,
+      getElementsFromBlocks(edited.blocks),
+      [netflixOnly, bigThree],
+      2
+    );
+
+    expect(after.map((entry) => entry.notShownCount)).toEqual(before.map((entry) => entry.notShownCount));
+    expect(dropOffOf(after, "hours").notShownCount).toBe(1);
+    expect(dropOffOf(after, "concept").notShownCount).toBe(0);
+  });
+});
+
+describe("option bases (ENG-6937)", () => {
+  const survey = surveyFlowFixture;
+  const elements = getElementsFromBlocks(survey.blocks);
+
+  let sequence = 0;
+  const response = (data: Record<string, unknown>, notShown: Record<string, unknown> | null) => {
+    sequence += 1;
+    return {
+      id: `option-base-${sequence}`,
+      updatedAt: new Date(),
+      contact: null,
+      contactAttributes: {},
+      language: null,
+      finished: true,
+      data,
+      ttc: {},
+      notShown,
+    } as any;
+  };
+
+  const summaryOf = async (responses: any[], elementId: string) => {
+    const dropOff = getSurveySummaryDropOff(survey, elements, responses, responses.length);
+    const summary = await getElementSummary(survey, elements, responses, dropOff);
+    return summary.find((entry) => "element" in entry && entry.element.id === elementId) as any;
+  };
+
+  // "Apple TV+" in `fav` is offered only to who uses Apple TV+; "Netflix + Apple TV+" in `bundle` is Hidden.
+  const netflixOnly = response(
+    { fav: "Netflix", bundle: "No bundle" },
+    { options: { fav: ["apple"], bundle: ["netflix_apple"] } }
+  );
+  const appleUser = response(
+    { fav: "Apple TV+", bundle: "Netflix + Disney+" },
+    { options: { bundle: ["netflix_apple"] } }
+  );
+  const disneyFan = response({ fav: "Disney+" }, {});
+  // From before 6.2: no record, so every option counts as shown, as today.
+  const legacy = response({ fav: "Netflix", bundle: "Netflix + Apple TV+" }, null);
+
+  test("an option's percentage is over the respondents shown it, with 'shown to N' next to it", async () => {
+    const fav = await summaryOf([netflixOnly, appleUser, disneyFan, legacy], "fav");
+    const choice = (label: string) => fav.choices.find((entry: any) => entry.value === label);
+
+    expect(fav.responseCount).toBe(4);
+    expect(choice("Apple TV+")).toMatchObject({ count: 1, shownCount: 3, percentage: 33.33 });
+    // Shown to everyone who answered: the base is the question's, and no "shown to N".
+    expect(choice("Netflix")).toEqual({ value: "Netflix", count: 2, percentage: 50 });
+  });
+
+  test("a Hidden option stays in results, marked Hidden, with the answers given before it was hidden", async () => {
+    const bundle = await summaryOf([netflixOnly, appleUser, legacy], "bundle");
+    const hidden = bundle.choices.find((entry: any) => entry.value === "Netflix + Apple TV+");
+
+    expect(hidden).toEqual({
+      value: "Netflix + Apple TV+",
+      count: 1,
+      shownCount: 1,
+      percentage: 100,
+      hidden: true,
+    });
+  });
+
+  test("picture choices, ranking options and matrix rows report their base too", async () => {
+    const responses = [
+      response(
+        { ad_pick: ["poster_a"], brand_rank: ["Netflix", "Disney+"], brand_grid: { Netflix: "Good" } },
+        {
+          options: { ad_pick: ["poster_b"], brand_rank: ["prime"] },
+          rows: { brand_grid: ["row_disney"] },
+        }
+      ),
+      response(
+        {
+          ad_pick: ["poster_b"],
+          brand_rank: ["Prime Video", "Netflix"],
+          brand_grid: { Netflix: "Poor", "Disney+": "Good" },
+        },
+        {}
+      ),
+    ];
+
+    const picture = await summaryOf(responses, "ad_pick");
+    expect(picture.choices.find((entry: any) => entry.id === "poster_b")).toMatchObject({
+      count: 1,
+      shownCount: 1,
+      percentage: 100,
+    });
+
+    const ranking = await summaryOf(responses, "brand_rank");
+    expect(ranking.choices.find((entry: any) => entry.value === "Prime Video")).toMatchObject({
+      count: 1,
+      shownCount: 1,
+    });
+
+    const matrix = await summaryOf(responses, "brand_grid");
+    expect(matrix.data.find((row: any) => row.rowLabel === "Disney+")).toMatchObject({
+      totalResponsesForRow: 1,
+      shownCount: 1,
+    });
+    expect(matrix.data.find((row: any) => row.rowLabel === "Netflix")).not.toHaveProperty("shownCount");
+  });
+
+  test("a stored pick of an option the respondent wasn't shown is left out, as the export blanks it (P51)", async () => {
+    // The record says Apple TV+ was not shown, yet the stored answer still names it.
+    const stalePick = response({ fav: "Apple TV+" }, { options: { fav: ["apple"] } });
+    const fav = await summaryOf([stalePick, appleUser], "fav");
+    const apple = fav.choices.find((entry: any) => entry.value === "Apple TV+");
+
+    expect(apple.count).toBe(1);
+    expect(apple.percentage).toBeLessThanOrEqual(100);
+
+    const picture = await summaryOf(
+      [response({ ad_pick: ["poster_b"] }, { options: { ad_pick: ["poster_b"] } })],
+      "ad_pick"
+    );
+    expect(picture.choices.find((entry: any) => entry.id === "poster_b").count).toBe(0);
+
+    const matrix = await summaryOf(
+      [response({ brand_grid: { "Disney+": "Good" } }, { rows: { brand_grid: ["row_disney"] } })],
+      "brand_grid"
+    );
+    expect(matrix.data.find((row: any) => row.rowLabel === "Disney+").totalResponsesForRow).toBe(0);
   });
 });

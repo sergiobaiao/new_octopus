@@ -6,7 +6,11 @@ import {
   listDisplayableReservedFields,
 } from "@formbricks/types/embedded-data-resolver";
 import { TResponse } from "@formbricks/types/responses";
-import { RESERVED_FIELD_ICONS, getReservedFieldLabel } from "@/modules/analysis/lib/reserved-field-display";
+import {
+  RESERVED_FIELD_ICONS,
+  formatReservedFieldValue,
+  getReservedFieldLabel,
+} from "@/modules/embedded-data/lib/field-display";
 
 export const getAddressFieldLabel = (field: string, t: TFunction) => {
   switch (field) {
@@ -83,16 +87,28 @@ const PERSISTED_RESERVED_COLUMN_NAMES: Record<string, string> = {
 export const reservedColumnId = (name: string): string =>
   `${METADATA_COLUMN_PREFIX}${PERSISTED_RESERVED_COLUMN_NAMES[name] ?? name}`;
 
+/** What about a survey changes which reserved columns its table shows by default. */
+export interface TReservedColumnDefaultsContext {
+  /** Any non-archived creative opens the survey (its linked creatives). */
+  isOpenedByCreatives: boolean;
+}
+
 /**
  * Which reserved columns start visible for an author who has never touched this table's settings.
  *
- * `primary` only — exactly the fields the table already showed, so the default view is unchanged.
+ * `primary` ones — exactly the fields the table already showed, so the default view is unchanged.
  * The `secondary` ones exist as columns and appear in the settings modal, but unchecked: a survey's
  * table must not silently grow thirteen columns, several of which are empty for every response
- * collected before ENG-1841.
+ * collected before ENG-1841. One exception: on a survey that creatives open, the
+ * "Opened by creative" column (the creative's name) starts visible too, since it says which of them
+ * brought each response; its ID column stays hidden. The catalog's `display` is unchanged, so every
+ * other survey keeps it hidden.
  */
-export const isReservedColumnVisibleByDefault = (display: TReservedFieldDisplay): boolean =>
-  display === "primary";
+export const isReservedColumnVisibleByDefault = (
+  { name, display }: { name: string; display: TReservedFieldDisplay },
+  context?: TReservedColumnDefaultsContext
+): boolean =>
+  display === "primary" || (context?.isOpenedByCreatives === true && name === "openedByCreativeName");
 
 /** The label a reserved column's header shows: the product's own wording, or one derived from the name. */
 export const getReservedColumnLabel = (name: string, t: TFunction): string => getReservedFieldLabel(name, t);
@@ -104,11 +120,16 @@ export const getReservedColumnIcon = (name: string) => RESERVED_FIELD_ICONS[name
  * Every reserved value a response carries, keyed by column id — one pass over the catalog per row
  * rather than a switch consulted once per column.
  */
-export const getReservedColumnValues = (response: TResponse): Record<string, string> => {
+export const getReservedColumnValues = (response: TResponse, locale: string): Record<string, string> => {
   const fields: TDisplayableReservedField[] = [
     ...listDisplayableReservedFields(RESERVED_FIELD_CATALOG, response, "primary"),
     ...listDisplayableReservedFields(RESERVED_FIELD_CATALOG, response, "secondary"),
   ];
 
-  return Object.fromEntries(fields.map(({ entry, value }) => [reservedColumnId(entry.name), value]));
+  return Object.fromEntries(
+    fields.map(({ entry, value }) => [
+      reservedColumnId(entry.name),
+      formatReservedFieldValue(entry.name, value, locale),
+    ])
+  );
 };

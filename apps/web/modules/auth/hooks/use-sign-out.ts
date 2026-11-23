@@ -1,4 +1,5 @@
 import { logger } from "@formbricks/logger";
+import { logoutPlainBeforeNavigation } from "@/app/plain/lib/plain-sdk";
 import { FORMBRICKS_ENVIRONMENT_ID_LS, FORMBRICKS_WORKSPACE_ID_LS } from "@/lib/localStorage";
 import { logSignOutAction } from "@/modules/auth/actions/sign-out";
 import { authClient } from "@/modules/auth/lib/auth-client";
@@ -30,14 +31,22 @@ interface SessionUser {
  */
 export const useSignOut = (sessionUser?: SessionUser | null) => {
   const signOutWithAudit = async (options?: UseSignOutOptions) => {
-    // Log audit event before signing out (server action)
-    if (sessionUser?.id) {
+    // Log audit event before signing out (server action). The action reads the user from the session,
+    // so it has to run while the session still exists — and not at all after account deletion, which
+    // has already removed the user and its sessions.
+    if (sessionUser?.id && options?.reason !== "account_deletion") {
       try {
-        await logSignOutAction(sessionUser.id, sessionUser.email ?? "", {
+        const result = await logSignOutAction({
           reason: options?.reason || "user_initiated", // NOSONAR // We want to check for empty strings
           redirectUrl: options?.redirectUrl || options?.callbackUrl, // NOSONAR // We want to check for empty strings
           organizationId: options?.organizationId,
         });
+        if (result?.serverError || result?.validationErrors) {
+          logger.error(
+            new Error(result.serverError ?? "Invalid sign out audit input"),
+            "Failed to log signOut event"
+          );
+        }
       } catch (error) {
         // Don't block signOut if audit logging fails
         logger.error(
@@ -51,6 +60,11 @@ export const useSignOut = (sessionUser?: SessionUser | null) => {
       localStorage.removeItem(FORMBRICKS_WORKSPACE_ID_LS);
       localStorage.removeItem(FORMBRICKS_ENVIRONMENT_ID_LS);
     }
+
+    // The full page load below never unmounts PlainChat, and Plain persists its session in
+    // localStorage, so log the support chat out explicitly or the next person at this browser
+    // could open it as this user. Bounded and failure-tolerant: never blocks sign-out.
+    await logoutPlainBeforeNavigation();
 
     // Better Auth sign-out clears the BA session; the redirect is manual (BA's signOut doesn't take
     // redirect/callbackUrl like NextAuth's did). Mirror NextAuth's contract: navigate by default, or

@@ -1,87 +1,83 @@
 "use client";
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
+import { ArrowDownIcon, ArrowUpDownIcon, ArrowUpIcon } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TMember, TOrganizationRole } from "@formbricks/types/memberships";
 import { TOrganization } from "@formbricks/types/organizations";
+import { getReportingTimeZone } from "@/lib/date-ranges";
 import { getAccessFlags } from "@/lib/membership/utils";
-import { formatDateWithOrdinal } from "@/lib/utils/datetime";
+import { formatDateForDisplay, formatDateWithOrdinal } from "@/lib/utils/datetime";
 import { EditMembershipRole } from "@/modules/ee/role-management/components/edit-membership-role";
 import { MemberActions } from "@/modules/organization/settings/teams/components/edit-memberships/member-actions";
+import {
+  type TMemberRow,
+  canActOnInvite,
+  isInvitee,
+  showDeleteButton,
+} from "@/modules/organization/settings/teams/lib/member-controls";
+import {
+  type TLastSignInSort,
+  sortMembersByLastSignIn,
+} from "@/modules/organization/settings/teams/lib/sort-members";
 import { hasMoreThanOneActiveOwner, isInviteExpired } from "@/modules/organization/settings/teams/lib/utils";
 import { TInvite } from "@/modules/organization/settings/teams/types/invites";
 import { Badge } from "@/modules/ui/components/badge";
 import { SettingsTable, type TSettingsTableColumn } from "@/modules/ui/components/settings-table";
 import { TooltipRenderer } from "@/modules/ui/components/tooltip";
+import { ReactivateMemberButton } from "./reactivate-member-button";
 
-/** The two row shapes this table mixes: accepted memberships and pending invites. */
-type TMemberRow = TMember | TInvite;
-
-// Type guard to check if member is an invitee
-const isInvitee = (member: TMemberRow): member is TInvite => {
-  return (member as TInvite).expiresAt !== undefined;
-};
-
-/**
- * The four badge texts are English literals, as they were before this conversion. Fixing that needs new
- * i18n keys and is a behaviour change rather than a restyle, so it stays a follow-up.
- */
 const getMembershipBadge = (member: TMemberRow, t: TFunction, locale: string) => {
   if (isInvitee(member)) {
     return isInviteExpired(member) ? (
-      <Badge type="gray" text="Expired" size="tiny" data-testid="expired-badge" />
+      <Badge type="gray" text={t("common.expired")} size="tiny" data-testid="expired-badge" />
     ) : (
       <TooltipRenderer
         tooltipContent={`${t("workspace.settings.general.invite_expires_on", {
           date: formatDateWithOrdinal(member.expiresAt, locale),
         })}`}>
-        <Badge type="warning" text="Pending" size="tiny" />
+        <Badge type="warning" text={t("common.pending")} size="tiny" />
       </TooltipRenderer>
     );
   }
 
   if (!member.isActive) {
-    return <Badge type="gray" text="Inactive" size="tiny" />;
+    return <Badge type="gray" text={t("common.inactive")} size="tiny" />;
   }
 
-  return <Badge type="success" text="Active" size="tiny" />;
+  return <Badge type="success" text={t("common.active")} size="tiny" />;
 };
 
-const showDeleteButton = (
-  member: TMemberRow,
-  {
-    isOwnerOrManager,
-    isManager,
-    currentUserId,
-    doesOrgHaveMoreThanOneOwner,
-  }: Readonly<{
-    isOwnerOrManager: boolean;
-    isManager: boolean;
-    currentUserId: string;
-    doesOrgHaveMoreThanOneOwner: boolean;
-  }>
-): boolean => {
-  if (isInvitee(member)) {
-    return isOwnerOrManager;
-  }
+// The calendar day is read in the organization's reporting zone, so a sign-in near midnight lands on the
+// same day here as on the Usage page, whatever the viewer's browser zone.
+const LAST_SIGN_IN_OPTIONS: Intl.DateTimeFormatOptions = { year: "numeric", month: "short", day: "numeric" };
 
-  if (!isOwnerOrManager) {
-    return false;
+const getLastSignInLabel = (member: TMemberRow, t: TFunction, locale: string, timeZone: string) => {
+  if (isInvitee(member)) return null;
+  if (!member.lastLoginAt) {
+    return <span className="text-slate-500">{t("common.no_sign_in_recorded")}</span>;
   }
+  return formatDateForDisplay(new Date(member.lastLoginAt), locale, { ...LAST_SIGN_IN_OPTIONS, timeZone });
+};
 
-  if (member.userId === currentUserId) {
-    return false;
-  }
-
-  if (isManager) {
-    return member.role !== "owner";
-  }
-
-  if (member.role === "owner") {
-    return doesOrgHaveMoreThanOneOwner;
-  }
-
-  return true;
+const LastSignInHeader = ({
+  t,
+  sort,
+  onToggle,
+}: Readonly<{ t: TFunction; sort: TLastSignInSort | null; onToggle: () => void }>) => {
+  const Icon = { desc: ArrowDownIcon, asc: ArrowUpIcon, none: ArrowUpDownIcon }[sort ?? "none"];
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="inline-flex items-center gap-1 whitespace-nowrap hover:text-slate-900"
+      data-testid="last-sign-in-sort">
+      {t("common.last_sign_in")}
+      <Icon className="size-3.5" aria-hidden="true" />
+    </button>
+  );
 };
 
 /**
@@ -101,10 +97,14 @@ const getMemberColumns = ({
   currentUserId,
   isAccessControlAllowed,
   isFormbricksCloud,
+  isDashboardViewerRoleEnabled,
   isUserManagementDisabledFromUi,
   isOwnerOrManager,
+  canManageUsers,
   isManager,
   doesOrgHaveMoreThanOneOwner,
+  lastSignInSort,
+  onToggleLastSignInSort,
 }: Readonly<{
   t: TFunction;
   locale: string;
@@ -113,25 +113,36 @@ const getMemberColumns = ({
   currentUserId: string;
   isAccessControlAllowed: boolean;
   isFormbricksCloud: boolean;
+  isDashboardViewerRoleEnabled: boolean;
   isUserManagementDisabledFromUi: boolean;
   isOwnerOrManager: boolean;
+  /**
+   * `organization.manage_access`, decided on the server: owners and managers above the
+   * `USER_MANAGEMENT_MINIMUM_ROLE` floor, licensed or not. Delete, Reactivate, the invite controls and the
+   * role picker are user management, so they follow it rather than the caller's role (ENG-6812).
+   */
+  canManageUsers: boolean;
   isManager: boolean;
   doesOrgHaveMoreThanOneOwner: boolean;
+  lastSignInSort: TLastSignInSort | null;
+  onToggleLastSignInSort: () => void;
 }>): TSettingsTableColumn<TMemberRow>[] => {
   // `ph-no-capture` on the name, email and role cells is PostHog redaction, not styling.
   const columns: TSettingsTableColumn<TMemberRow>[] = [
     {
       id: "name",
       header: t("common.full_name"),
-      headerClassName: "w-[17%]",
+      headerClassName: "w-[15%]",
       cellClassName: "ph-no-capture",
       cell: (member) => member.name,
     },
     {
       id: "email",
       header: t("common.email"),
-      headerClassName: "w-[25%]",
-      cellClassName: "ph-no-capture",
+      headerClassName: "w-[22%]",
+      // A long address wraps rather than widening the table: an inactive member's Reactivate button
+      // already takes the actions column's room.
+      cellClassName: "ph-no-capture break-all",
       cell: (member) => member.email,
     },
   ];
@@ -140,7 +151,7 @@ const getMemberColumns = ({
     columns.push({
       id: "role",
       header: t("common.role"),
-      headerClassName: "w-[17%]",
+      headerClassName: "w-[15%]",
       cellClassName: "ph-no-capture",
       cell: (member) => (
         <EditMembershipRole
@@ -153,16 +164,31 @@ const getMemberColumns = ({
           inviteId={isInvitee(member) ? member.id : ""}
           doesOrgHaveMoreThanOneOwner={doesOrgHaveMoreThanOneOwner}
           isFormbricksCloud={isFormbricksCloud}
-          isUserManagementDisabledFromUi={isUserManagementDisabledFromUi}
+          isDashboardViewerRoleEnabled={isDashboardViewerRoleEnabled}
+          isUserManagementDisabledFromUi={isUserManagementDisabledFromUi || !canManageUsers}
         />
       ),
+    });
+  }
+
+  // Owners and Managers only (ENG-3317); the server does not even send the value to anyone else.
+  if (isOwnerOrManager) {
+    columns.push({
+      id: "last-sign-in",
+      header: <LastSignInHeader t={t} sort={lastSignInSort} onToggle={onToggleLastSignInSort} />,
+      headerClassName: "w-[13%]",
+      // `ph-no-capture` is PostHog redaction, like the name and email cells.
+      cellClassName: "ph-no-capture",
+      hideBelow: "md",
+      cell: (member) =>
+        getLastSignInLabel(member, t, locale, getReportingTimeZone(organization.displayTimeZone)),
     });
   }
 
   columns.push({
     id: "status",
     header: t("common.status"),
-    headerClassName: "w-[17%]",
+    headerClassName: "w-[13%]",
     cell: (member) => getMembershipBadge(member, t, locale),
   });
 
@@ -170,7 +196,7 @@ const getMemberColumns = ({
     columns.push({
       id: "actions",
       header: t("common.actions"),
-      headerClassName: "w-[24%]",
+      headerClassName: "w-[22%]",
       // `align` is doing real work here, unlike the other actions columns in this series: this header has
       // visible text, and `text-align` is the only thing that moves it. Right rather than the centre the
       // old header used, so the label sits over the controls it names.
@@ -180,17 +206,31 @@ const getMemberColumns = ({
       // `align-middle` and leaving the buttons baseline-aligned rather than centred.
       align: "right",
       cell: (member) => (
-        <MemberActions
-          organization={organization}
-          member={isInvitee(member) ? undefined : member}
-          invite={isInvitee(member) ? member : undefined}
-          showDeleteButton={showDeleteButton(member, {
-            isOwnerOrManager,
-            isManager,
-            currentUserId,
-            doesOrgHaveMoreThanOneOwner,
-          })}
-        />
+        <div className="flex items-center justify-end gap-2">
+          {canManageUsers &&
+          !isInvitee(member) &&
+          !member.isActive &&
+          // Managers don't act on owners, as with Delete; the API refuses it too.
+          !(isManager && member.role === "owner") ? (
+            <ReactivateMemberButton
+              organizationId={organization.id}
+              userId={member.userId}
+              name={member.name || member.email}
+            />
+          ) : null}
+          <MemberActions
+            organization={organization}
+            member={isInvitee(member) ? undefined : member}
+            invite={isInvitee(member) ? member : undefined}
+            canManageInvites={isInvitee(member) && canActOnInvite(member, { canManageUsers, isManager })}
+            showDeleteButton={showDeleteButton(member, {
+              canManageUsers,
+              isManager,
+              currentUserId,
+              doesOrgHaveMoreThanOneOwner,
+            })}
+          />
+        </div>
       ),
     });
   }
@@ -206,7 +246,9 @@ interface MembersInfoProps {
   currentUserId: string;
   isAccessControlAllowed: boolean;
   isFormbricksCloud: boolean;
+  isDashboardViewerRoleEnabled: boolean;
   isUserManagementDisabledFromUi: boolean;
+  canManageUsers: boolean;
 }
 
 export const MembersInfo = ({
@@ -217,44 +259,61 @@ export const MembersInfo = ({
   currentUserId,
   isAccessControlAllowed,
   isFormbricksCloud,
+  isDashboardViewerRoleEnabled,
   isUserManagementDisabledFromUi,
+  canManageUsers,
 }: Readonly<MembersInfoProps>) => {
   const { t, i18n } = useTranslation();
   const locale = i18n.resolvedLanguage ?? i18n.language ?? "en-US";
 
-  const allMembers = [...members, ...invites];
+  // Unsorted until the header is clicked, then newest first, then oldest first. Invites have no sign-in
+  // and always follow the members.
+  const [lastSignInSort, setLastSignInSort] = useState<TLastSignInSort | null>(null);
+  const toggleLastSignInSort = () => setLastSignInSort((current) => (current === "desc" ? "asc" : "desc"));
+  const sortedMembers = lastSignInSort ? sortMembersByLastSignIn(members, lastSignInSort) : members;
+  const allMembers = [...sortedMembers, ...invites];
 
   const { isOwner, isManager } = getAccessFlags(currentUserRole);
   const isOwnerOrManager = isOwner || isManager;
 
   const doesOrgHaveMoreThanOneOwner = hasMoreThanOneActiveOwner(members);
 
+  // One client for the list's mutations (Reactivate), not one per row.
+  const [queryClient] = useState(() => new QueryClient({ defaultOptions: { mutations: { retry: false } } }));
+
   return (
-    <SettingsTable
-      columns={getMemberColumns({
-        t,
-        locale,
-        organization,
-        currentUserRole,
-        currentUserId,
-        isAccessControlAllowed,
-        isFormbricksCloud,
-        isUserManagementDisabledFromUi,
-        isOwnerOrManager,
-        isManager,
-        doesOrgHaveMoreThanOneOwner,
-      })}
-      rows={allMembers}
-      getRowId={(member) => member.email}
-      // Effectively unreachable: whoever is looking at this page is themselves a member.
-      emptyMessage={t("common.no_results")}
-      // These two ids are what `organization.spec.ts` and `invite-existing-account.spec.ts` locate. Kept
-      // exactly where they were — on the row container and on each row — so this conversion needs no
-      // spec changes. `#singleMemberInfo` repeating per row is invalid HTML and worth retiring, but that
-      // is a spec change, so it stays a follow-up.
-      bodyProps={{ id: "membersInfoWrapper" }}
-      getRowProps={() => ({ id: "singleMemberInfo" })}
-      aria-label={t("workspace.settings.general.manage_members")}
-    />
+    <QueryClientProvider client={queryClient}>
+      <SettingsTable
+        columns={getMemberColumns({
+          t,
+          locale,
+          organization,
+          currentUserRole,
+          currentUserId,
+          isAccessControlAllowed,
+          isFormbricksCloud,
+          isDashboardViewerRoleEnabled,
+          isUserManagementDisabledFromUi,
+          isOwnerOrManager,
+          // Delete, Reactivate (ENG-3610), the invite controls and the role picker.
+          canManageUsers,
+          isManager,
+          doesOrgHaveMoreThanOneOwner,
+          lastSignInSort,
+          onToggleLastSignInSort: toggleLastSignInSort,
+        })}
+        rows={allMembers}
+        getRowId={(member) => member.email}
+        // Effectively unreachable: whoever is looking at this page is themselves a member.
+        emptyMessage={t("common.no_results")}
+        // These two ids are what `organization.spec.ts` and `invite-existing-account.spec.ts` locate. Kept
+        // exactly where they were — on the row container and on each row — so this conversion needs no
+        // spec changes. `#singleMemberInfo` repeating per row is invalid HTML and worth retiring, but that
+        // is a spec change, so it stays a follow-up.
+        bodyProps={{ id: "membersInfoWrapper" }}
+        getRowProps={() => ({ id: "singleMemberInfo" })}
+        aria-label={t("workspace.settings.general.manage_members")}
+      />
+    </QueryClientProvider>
   );
 };

@@ -7,16 +7,16 @@ import { useTranslation } from "react-i18next";
 import { TOrganization } from "@formbricks/types/organizations";
 import { deleteOrganizationAction } from "@/app/(app)/workspaces/[workspaceId]/settings/organization/general/actions";
 import { FORMBRICKS_ENVIRONMENT_ID_LS } from "@/lib/localStorage";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { Alert, AlertDescription } from "@/modules/ui/components/alert";
 import { Button } from "@/modules/ui/components/button";
 import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
 import { Input } from "@/modules/ui/components/input";
 
 type DeleteOrganizationProps = {
-  organization: TOrganization;
-  isDeleteDisabled?: boolean;
-  isUserOwner?: boolean;
+  readonly organization: TOrganization;
+  readonly isDeleteDisabled?: boolean;
+  readonly isUserOwner?: boolean;
 };
 
 export const DeleteOrganization = ({
@@ -88,12 +88,12 @@ export const DeleteOrganization = ({
 };
 
 interface DeleteOrganizationModalProps {
-  open: boolean;
-  setOpen: Dispatch<SetStateAction<boolean>>;
+  readonly open: boolean;
+  readonly setOpen: Dispatch<SetStateAction<boolean>>;
   // organizationData: { name: string; id: string; plan: string };
-  organizationData: TOrganization;
-  deleteOrganization: () => void;
-  isDeleting?: boolean;
+  readonly organizationData: TOrganization;
+  readonly deleteOrganization: () => void;
+  readonly isDeleting?: boolean;
 }
 
 const DeleteOrganizationModal = ({

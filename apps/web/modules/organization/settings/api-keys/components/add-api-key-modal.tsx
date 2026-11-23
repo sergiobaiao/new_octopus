@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronDownIcon, Trash2Icon } from "lucide-react";
+import { Trash2Icon } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "react-hot-toast";
@@ -18,13 +18,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/modules/ui/components/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/modules/ui/components/dropdown-menu";
 import { Input } from "@/modules/ui/components/input";
+import { InputCombobox, TComboboxOption } from "@/modules/ui/components/input-combo-box";
 import { Label } from "@/modules/ui/components/label";
 import { Switch } from "@/modules/ui/components/switch";
 
@@ -42,11 +37,13 @@ interface AddApiKeyModalProps {
   workspaces: TOrganizationWorkspace[];
   isCreatingAPIKey: boolean;
   isFormbricksCloud: boolean;
-}
-
-interface WorkspaceOption {
-  id: string;
-  name: string;
+  /**
+   * Whether the signed-in user clears USER_MANAGEMENT_MINIMUM_ROLE (ENG-3075). A key with
+   * organization write access can manage the org's users, teams and workspace-team grants, so the
+   * toggle is withheld rather than disabled when the floor is not cleared — `createApiKeyAction`
+   * refuses the same request, and this keeps the form from offering it. Read access is not gated.
+   */
+  canGrantOrganizationWriteAccess: boolean;
 }
 
 interface PermissionRecord {
@@ -55,8 +52,6 @@ interface PermissionRecord {
   workspaceName: string;
 }
 
-const permissionOptions = [ApiKeyPermission.read, ApiKeyPermission.write, ApiKeyPermission.manage];
-
 export const AddApiKeyModal = ({
   open,
   setOpen,
@@ -64,7 +59,8 @@ export const AddApiKeyModal = ({
   workspaces,
   isCreatingAPIKey,
   isFormbricksCloud,
-}: AddApiKeyModalProps) => {
+  canGrantOrganizationWriteAccess,
+}: Readonly<AddApiKeyModalProps>) => {
   const { t } = useTranslation();
   const { register, getValues, handleSubmit, reset, watch } = useForm<{ label: string }>();
   const apiKeyLabel = watch("label");
@@ -94,10 +90,16 @@ export const AddApiKeyModal = ({
   // Initialize with one permission by default
   const [selectedPermissions, setSelectedPermissions] = useState<Record<string, PermissionRecord>>({});
 
-  const workspaceOptions: WorkspaceOption[] = workspaces.map((workspace) => ({
-    id: workspace.id,
-    name: workspace.name,
+  const workspaceOptions: TComboboxOption[] = workspaces.map((workspace) => ({
+    value: workspace.id,
+    label: workspace.name,
   }));
+
+  const permissionOptions: TComboboxOption[] = [
+    { value: ApiKeyPermission.read, label: t("workspace.api_keys.permission_read") },
+    { value: ApiKeyPermission.write, label: t("workspace.api_keys.permission_write") },
+    { value: ApiKeyPermission.manage, label: t("workspace.api_keys.permission_manage") },
+  ];
 
   const removePermission = (index: number) => {
     const updatedPermissions = { ...selectedPermissions };
@@ -228,64 +230,33 @@ export const AddApiKeyModal = ({
                   const permission = selectedPermissions[key];
                   return (
                     <div key={key} className="flex items-center gap-2">
-                      {/* Workspace dropdown */}
-                      <div className="w-1/2">
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <button
-                              type="button"
-                              className="flex h-10 w-full rounded-md border border-slate-300 bg-transparent px-3 py-2 text-sm text-slate-800 placeholder:text-slate-400 focus:outline-hidden">
-                              <span className="flex w-4/5 flex-1">
-                                <span className="w-full truncate text-left">{permission.workspaceName}</span>
-                              </span>
-                              <span className="flex h-full items-center border-l pl-3">
-                                <ChevronDownIcon className="size-4 text-slate-500" />
-                              </span>
-                            </button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent className="max-h-[300px] min-w-32 overflow-y-auto">
-                            {workspaceOptions.map((option) => (
-                              <DropdownMenuItem
-                                key={option.id}
-                                onClick={() => {
-                                  updateWorkspaceSelection(key, option.id);
-                                }}>
-                                {option.name}
-                              </DropdownMenuItem>
-                            ))}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
+                      <div className="min-w-0 flex-1">
+                        <InputCombobox
+                          id={`workspace-select-${permissionIndex}`}
+                          aria-label={t("common.workspace")}
+                          options={workspaceOptions}
+                          value={permission.workspaceId}
+                          onChangeValue={(value) => {
+                            if (typeof value === "string") updateWorkspaceSelection(key, value);
+                          }}
+                          showSearch
+                          searchPlaceholder={t("common.search")}
+                          comboboxClasses="flex-1 min-w-0 w-full"
+                          emptyDropdownText={t("workspace.surveys.edit.no_option_found")}
+                        />
                       </div>
-
-                      {/* Permission level dropdown */}
-                      <div className="w-1/2">
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <button
-                              type="button"
-                              className="flex h-10 w-full rounded-md border border-slate-300 bg-transparent px-3 py-2 text-sm text-slate-800 placeholder:text-slate-400 focus:outline-hidden">
-                              <span className="flex w-4/5 flex-1">
-                                <span className="w-full truncate text-left capitalize">
-                                  {permission.permission}
-                                </span>
-                              </span>
-                              <span className="flex h-full items-center border-l pl-3">
-                                <ChevronDownIcon className="size-4 text-slate-500" />
-                              </span>
-                            </button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent className="min-w-32 capitalize">
-                            {permissionOptions.map((option) => (
-                              <DropdownMenuItem
-                                key={option}
-                                onClick={() => {
-                                  updatePermission(key, "permission", option);
-                                }}>
-                                {option}
-                              </DropdownMenuItem>
-                            ))}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
+                      <div className="min-w-0 flex-1">
+                        <InputCombobox
+                          id={`workspace-permission-select-${permissionIndex}`}
+                          aria-label={t("workspace.api_keys.permissions")}
+                          options={permissionOptions}
+                          value={permission.permission}
+                          onChangeValue={(value) => {
+                            if (typeof value === "string") updatePermission(key, "permission", value);
+                          }}
+                          showSearch={false}
+                          comboboxClasses="flex-1 min-w-0 w-full"
+                        />
                       </div>
 
                       {/* Delete button */}
@@ -326,14 +297,16 @@ export const AddApiKeyModal = ({
                       disabled={selectedOrganizationAccess[key].write}
                     />
                   </div>
-                  <div className="flex items-center gap-2">
-                    <Label>Write</Label>
-                    <Switch
-                      data-testid={`organization-access-${key}-write`}
-                      checked={selectedOrganizationAccess[key].write}
-                      onCheckedChange={(newVal) => setSelectedOrganizationAccessValue(key, "write", newVal)}
-                    />
-                  </div>
+                  {canGrantOrganizationWriteAccess && (
+                    <div className="flex items-center gap-2">
+                      <Label>Write</Label>
+                      <Switch
+                        data-testid={`organization-access-${key}-write`}
+                        checked={selectedOrganizationAccess[key].write}
+                        onCheckedChange={(newVal) => setSelectedOrganizationAccessValue(key, "write", newVal)}
+                      />
+                    </div>
+                  )}
                 </div>
               ))}
               {isFormbricksCloud && (

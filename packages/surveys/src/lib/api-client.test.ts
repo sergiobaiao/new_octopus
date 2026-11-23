@@ -143,6 +143,31 @@ describe("ApiClient", () => {
       expect(result.ok).toBe(true);
     });
 
+    test("sends the Mark as low quality flag with the update (ENG-6933)", async () => {
+      vi.mocked(global.fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ok: true, data: {} }),
+      } as unknown as Response);
+
+      await client.updateResponse({ responseId: "resp123", finished: false, markLowQuality: true });
+
+      const [, init] = vi.mocked(global.fetch).mock.calls[0];
+      expect(JSON.parse(String(init?.body))).toMatchObject({ finished: false, markLowQuality: true });
+    });
+
+    test("sends the whole not-shown record with the update (ENG-6936)", async () => {
+      vi.mocked(global.fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ok: true, data: {} }),
+      } as unknown as Response);
+      const notShown = { blocks: ["heavy"], elements: ["apple_reason"] };
+
+      await client.updateResponse({ responseId: "resp123", finished: false, data: {}, notShown });
+
+      const body = JSON.parse(String(vi.mocked(global.fetch).mock.calls[0][1]?.body));
+      expect(body.notShown).toEqual(notShown);
+    });
+
     test("handles update error", async () => {
       vi.mocked(global.fetch).mockResolvedValueOnce({
         ok: false,
@@ -219,6 +244,41 @@ describe("ApiClient", () => {
         allowedFileExtensions: ["jpg"],
         surveyId: "survey123",
         elementId: "element123",
+      });
+    });
+
+    test("forwards the PIN token, single-use id and page url in the signing request", async () => {
+      vi.mocked(global.fetch)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: {
+              signedUrl: "https://fake-s3-url.com",
+              fileUrl: "/storage/ws-test/private/x.jpg",
+              presignedFields: { policy: "test" },
+              signingData: null,
+              updatedFileName: "test.jpg",
+            },
+          }),
+        } as unknown as Response)
+        .mockResolvedValueOnce({ ok: true } as unknown as Response);
+
+      await client.uploadFile(
+        { base64: "data:image/jpeg;base64,abcd", name: "test.jpg", type: "image/jpeg" },
+        {
+          surveyId: "survey123",
+          elementId: "element123",
+          pinAuthToken: "pin-token",
+          singleUseId: "su-1",
+          url: "https://example.com/s/survey123?suId=su-1",
+        }
+      );
+
+      const requestInit = vi.mocked(global.fetch).mock.calls[0][1] as RequestInit;
+      expect(JSON.parse(requestInit.body as string)).toMatchObject({
+        pinAuthToken: "pin-token",
+        singleUseId: "su-1",
+        url: "https://example.com/s/survey123?suId=su-1",
       });
     });
 

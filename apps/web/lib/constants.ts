@@ -1,6 +1,7 @@
 import "server-only";
 import { TUserLocale } from "@formbricks/types/user";
 import { env } from "./env";
+import { isPlainChatConfigured } from "./plain-chat-config";
 
 export { DEFAULT_BRAND_COLOR } from "./brand-color";
 
@@ -27,6 +28,7 @@ export const IMPRINT_URL = env.IMPRINT_URL;
 export const IMPRINT_ADDRESS = env.IMPRINT_ADDRESS;
 
 export const DANGEROUSLY_ALLOW_WEBHOOK_INTERNAL_URLS = env.DANGEROUSLY_ALLOW_WEBHOOK_INTERNAL_URLS === "1";
+export const WEBHOOK_DELIVERY_TIMEOUT_MS = env.WEBHOOK_DELIVERY_TIMEOUT_MS ?? 5_000;
 export const DEBUG_SHOW_RESET_LINK = !IS_PRODUCTION && env.DEBUG_SHOW_RESET_LINK === "1";
 export const PASSWORD_RESET_DISABLED = env.PASSWORD_RESET_DISABLED === "1";
 export const PASSWORD_RESET_TOKEN_LIFETIME_MINUTES = env.PASSWORD_RESET_TOKEN_LIFETIME_MINUTES;
@@ -67,6 +69,7 @@ export const SIGNUP_ENABLED = IS_FORMBRICKS_CLOUD || IS_DEVELOPMENT || E2E_TESTI
 export const EMAIL_AUTH_ENABLED = env.EMAIL_AUTH_DISABLED !== "1";
 export const INVITE_DISABLED = env.INVITE_DISABLED === "1";
 export const INVITE_RATE_LIMIT_PER_24_HOURS = env.INVITE_RATE_LIMIT_PER_24_HOURS;
+export const EMAIL_RATE_LIMIT_MULTIPLIER = env.EMAIL_RATE_LIMIT_MULTIPLIER;
 
 export const SLACK_CLIENT_SECRET = env.SLACK_CLIENT_SECRET;
 export const SLACK_CLIENT_ID = env.SLACK_CLIENT_ID;
@@ -84,6 +87,12 @@ export const NOTION_AUTH_URL = `https://api.notion.com/v1/oauth/authorize?client
 
 export const AIRTABLE_CLIENT_ID = env.AIRTABLE_CLIENT_ID;
 
+export const SES_CONFIGURATION_SET = env.SES_CONFIGURATION_SET;
+export const SES_EMAIL_ENVIRONMENT = env.SES_EMAIL_ENVIRONMENT;
+export const EMAIL_SEND_AUDIT_ENABLED = env.EMAIL_SEND_AUDIT_ENABLED === "1";
+export const EMAIL_SEND_AUDIT_BUCKET = env.EMAIL_SEND_AUDIT_BUCKET;
+export const EMAIL_SEND_AUDIT_KMS_KEY_ARN = env.EMAIL_SEND_AUDIT_KMS_KEY_ARN;
+export const EMAIL_SEND_AUDIT_HMAC_KEY_ARN = env.EMAIL_SEND_AUDIT_HMAC_KEY_ARN;
 export const SMTP_HOST = env.SMTP_HOST;
 export const SMTP_PORT = env.SMTP_PORT;
 
@@ -98,11 +107,58 @@ export const SMTP_USER = env.SMTP_USER;
 export const SMTP_PASSWORD = env.SMTP_PASSWORD;
 export const SMTP_AUTHENTICATED = env.SMTP_AUTHENTICATED !== "0";
 export const SMTP_REJECT_UNAUTHORIZED_TLS = env.SMTP_REJECT_UNAUTHORIZED_TLS !== "0";
+export const SMTP_REQUIRE_TLS = env.SMTP_REQUIRE_TLS === "1";
 export const MAIL_FROM = env.MAIL_FROM;
 export const MAIL_FROM_NAME = env.MAIL_FROM_NAME;
 
-export const NEXTAUTH_SECRET = env.NEXTAUTH_SECRET;
-export const BETTER_AUTH_SECRET = env.BETTER_AUTH_SECRET;
+/**
+ * Auth secret and base URL, resolved once for the whole app.
+ *
+ * `BETTER_AUTH_*` are the documented names. `NEXTAUTH_*` are a deliberately UNDOCUMENTED
+ * backward-compatible alias: ENG-1054 shipped them as the canonical names, and ENG-2599 flipped the docs
+ * without dropping them. The alias is permanent, not a deprecation window — nothing ever rewrites an
+ * existing install's env. A Compose install keeps a literal `NEXTAUTH_SECRET:` in its customized
+ * `docker-compose.yml` and `update_formbricks()` never touches it, so removing the fallback would break
+ * every instance that upgraded from v5.1 or earlier.
+ *
+ * Resolve here, never at the call site. The secret signs Better Auth's session cookies (auth.ts), the
+ * forward-auth proxy's verification of them (session-cookie.ts), and every app JWT — invites, email
+ * verification, email change, survey PIN tokens, gateway service tokens (lib/jwt.ts). A divergence
+ * between any two of those is an outage, and it surfaces only as an opaque `state_security_mismatch`
+ * (better-auth-observability.ts).
+ *
+ * `firstConfigured` treats a blank value as unset, which `??` does not: `"" ?? env.NEXTAUTH_SECRET` is
+ * `""`, which is falsy and would fail every guard below while shadowing a perfectly good legacy secret.
+ * `env.ts` already normalizes blank to undefined for both names, so this is the second line of defence
+ * rather than the first — kept because the invariant belongs next to the resolution, not in a distant
+ * schema. It selects a value, never rewrites one: trimming a secret would re-key the instance.
+ *
+ * Note these constant names collide with env vars Better Auth reads on its own
+ * (`options.secret || env.BETTER_AUTH_SECRET || env.AUTH_SECRET`). There is no live conflict because
+ * auth.ts passes `secret` and `baseURL` explicitly; `assertAuthRuntimeConfiguration` in lib/env.ts
+ * refuses to boot on the one configuration where it would matter.
+ */
+const firstConfigured = (...values: (string | undefined)[]): string | undefined =>
+  values.find((value) => value !== undefined && value.trim().length > 0);
+
+export const AUTH_SECRET = firstConfigured(env.BETTER_AUTH_SECRET, env.NEXTAUTH_SECRET);
+export const AUTH_URL = firstConfigured(env.BETTER_AUTH_URL, env.NEXTAUTH_URL);
+
+/**
+ * Every configured auth origin, not just the winning one: an instance mid-rename has both set, and both
+ * have to stay trusted or Better Auth's CSRF/origin check rejects requests arriving on the other.
+ *
+ * De-duplicated because the managed paths set both names to the same value — the chart writes both keys
+ * from one `$webappUrl`, and the one-click installer seds both to the same domain — so the common case is
+ * one origin listed twice.
+ *
+ * The explicit type predicate is load-bearing — `.filter(Boolean)` does not narrow
+ * `(string | undefined)[]` to the `string[]` that `trustedOrigins` requires.
+ */
+export const AUTH_TRUSTED_ORIGINS = [
+  ...new Set([env.BETTER_AUTH_URL, env.NEXTAUTH_URL].filter((url): url is string => Boolean(url?.trim()))),
+];
+
 export const ITEMS_PER_PAGE = 30;
 export const SURVEYS_PER_PAGE = 12;
 export const RESPONSES_PER_PAGE = 25;
@@ -189,8 +245,7 @@ export const DEBUG = env.DEBUG === "1";
 // Enterprise License constant
 export const ENTERPRISE_LICENSE_KEY = env.ENTERPRISE_LICENSE_KEY;
 
-export const ENTERPRISE_LICENSE_REQUEST_FORM_URL =
-  "https://app.formbricks.com/s/trvp8tzy5uvsps9rc9qi9l9w?delivery=onpremise&source=ce&type=licenseRequest";
+export { ENTERPRISE_LICENSE_REQUEST_FORM_URL } from "@/modules/ee/license-check/lib/lite-license";
 
 export const REDIS_URL = env.REDIS_URL;
 export const RATE_LIMITING_DISABLED = env.RATE_LIMITING_DISABLED === "1";
@@ -221,6 +276,9 @@ export const STRIPE_API_VERSION = "2026-02-25.clover";
 
 // Maximum number of attribute classes allowed:
 export const MAX_ATTRIBUTE_CLASSES_PER_ENVIRONMENT = 150;
+// Most attributes one identify request may carry. Over three times what an environment can define, so
+// no real call reaches it; it stops a body from making the attribute validation walk an unbounded map.
+export const MAX_CONTACT_ATTRIBUTES_PER_REQUEST = 500;
 
 export const DEFAULT_LOCALE = "en-US";
 export const AVAILABLE_LOCALES: TUserLocale[] = [
@@ -243,7 +301,11 @@ export const AVAILABLE_LOCALES: TUserLocale[] = [
 
 export const PLAIN_APP_ID = env.PLAIN_APP_ID;
 export const PLAIN_ACTIVE_CUSTOMER_LABEL_TYPE_ID = env.PLAIN_ACTIVE_CUSTOMER_LABEL_TYPE_ID;
-export const IS_PLAIN_CHAT_CONFIGURED = Boolean(env.PLAIN_APP_ID);
+// Requires the HMAC secret too: without it Plain cannot verify identity, so the chat stays off.
+export const IS_PLAIN_CHAT_CONFIGURED = isPlainChatConfigured({
+  appId: env.PLAIN_APP_ID,
+  hmacSecret: env.PLAIN_CHAT_HMAC_SECRET,
+});
 
 // Formbricks-in-Formbricks: in-app surveys served by a Formbricks instance
 // (defaults to Formbricks Cloud). The widget only mounts when a workspace id is set.
@@ -261,9 +323,10 @@ export const RECAPTCHA_SITE_KEY = env.RECAPTCHA_SITE_KEY;
 export const RECAPTCHA_SECRET_KEY = env.RECAPTCHA_SECRET_KEY;
 export const IS_RECAPTCHA_CONFIGURED = Boolean(RECAPTCHA_SITE_KEY && RECAPTCHA_SECRET_KEY);
 
-// Use the app version for Sentry release (updated during build in production)
-// Fallback to environment variable if package.json is not accessible
-export const SENTRY_RELEASE = (() => {
+// The app's release version (CI bumps package.json during the production build); undefined for a
+// development, local or self-built (0.0.0) build. Sentry tags events with it, and the link survey
+// page loads the survey renderer under it so a release never waits out the CDN copy of the last one.
+export const APP_RELEASE_VERSION = (() => {
   if (!IS_PRODUCTION) {
     return undefined;
   }
@@ -278,6 +341,7 @@ export const SENTRY_RELEASE = (() => {
     return undefined;
   }
 })();
+export const SENTRY_RELEASE = APP_RELEASE_VERSION;
 export const SENTRY_ENVIRONMENT = env.SENTRY_ENVIRONMENT;
 export const SENTRY_DSN = env.SENTRY_DSN;
 

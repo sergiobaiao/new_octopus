@@ -1,5 +1,11 @@
 import { TFunction } from "i18next";
-import { CalendarDaysIcon, type LucideIcon, SquareArrowOutUpRightIcon, UploadIcon } from "lucide-react";
+import {
+  CalendarDaysIcon,
+  type LucideIcon,
+  SignatureIcon,
+  SquareArrowOutUpRightIcon,
+  UploadIcon,
+} from "lucide-react";
 import React from "react";
 import {
   Column,
@@ -57,19 +63,18 @@ import {
   getScaleOptionStyle,
   getSecondaryButtonStyle,
   importantStyle,
-  normalizeRichTextSpacing,
-  suppressNestedListMarkers,
+  prepareEmailRichText,
 } from "../lib/preview-email-template-styles";
 import { getNPSOptionColor, getRatingNumberOptionColor } from "../lib/utils";
 
 const EMAIL_RATING_SMILEY_SIZE = 40;
 
 interface PreviewEmailTemplateProps {
-  survey: TSurvey;
-  surveyUrl: string;
-  styling: TSurveyStyling;
-  locale: string;
-  t: TFunction;
+  readonly survey: TSurvey;
+  readonly surveyUrl: string;
+  readonly styling: TSurveyStyling;
+  readonly locale: string;
+  readonly t: TFunction;
 }
 
 interface PreviewFieldConfig {
@@ -161,9 +166,9 @@ function PreviewElementHeader({
   return (
     <ElementHeader
       className={className}
-      headline={suppressNestedListMarkers(normalizeRichTextSpacing(headline))}
+      headline={prepareEmailRichText(headline)}
       style={getLightModeTextStyle(styleTokens)}
-      subheader={subheader ? suppressNestedListMarkers(normalizeRichTextSpacing(subheader)) : undefined}
+      subheader={subheader ? prepareEmailRichText(subheader) : undefined}
       subheaderStyle={{
         ...getForcedColorStyle(styleTokens.elementDescriptionColor),
         fontSize: styleTokens.elementDescriptionFontSize,
@@ -714,6 +719,23 @@ export async function PreviewEmailTemplate({
               isContentVerticallyCentered
               isDashed
               label={t("emails.click_or_drag_to_upload_files")}
+              minHeight="96px"
+              styleTokens={styleTokens}
+            />
+          </Section>
+        </PreviewQuestionCard>
+      );
+    case TSurveyElementTypeEnum.Signature:
+      return (
+        <PreviewQuestionCard headline={headline} styleTokens={styleTokens} subheader={subheader} t={t}>
+          <Section className="w-full">
+            <PreviewInputLink
+              href={previewSurveyUrl}
+              icon={SignatureIcon}
+              isAccent
+              isContentVerticallyCentered
+              isDashed
+              label={t("emails.click_to_sign")}
               minHeight="96px"
               styleTokens={styleTokens}
             />

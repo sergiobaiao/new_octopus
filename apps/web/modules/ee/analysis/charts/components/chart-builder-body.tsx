@@ -31,6 +31,8 @@ interface ChartBuilderBodyProps {
   queryState: ChartQueryState;
   isLoadingChart: boolean;
   chartLoadError: string | null;
+  /** A saved chart whose data was refused: only its name can change, so nothing else is offered. */
+  renameOnly?: boolean;
 }
 
 /**
@@ -56,33 +58,48 @@ export function ChartBuilderBody({
   queryState,
   isLoadingChart,
   chartLoadError,
+  renameOnly = false,
 }: Readonly<ChartBuilderBodyProps>) {
   const { t } = useTranslation();
   const showsDisplaySettings = Boolean(chartData) && hasChartDisplaySettings(chartData?.chartType);
+  // A preset hands over a query with no rows yet: the builder runs it, and until then the preview
+  // spins instead of flashing "no data returned".
+  const isAwaitingFirstRun = Boolean(chartData && !chartData.data && !chartData.error && !queryState.error);
 
   return (
     <div className="grid min-h-0 flex-1 grid-cols-1 gap-6 lg:grid-cols-[minmax(0,24rem)_minmax(0,1fr)]">
       <div className="flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto px-1 pb-1 lg:pr-3">
         <ChartNameField formId={formId} value={chartName} onChange={onChartNameChange} onSubmit={onSave} />
 
-        <AdvancedChartBuilder
-          workspaceId={workspaceId}
-          chartType={chartType}
-          initialQuery={chartData?.query ?? initialQuery}
-          onChartGenerated={onChartGenerated}
-          onQueryStateChange={onQueryStateChange}
-          feedbackDirectoryId={feedbackDirectoryId}
-        />
+        {!renameOnly && (
+          <AdvancedChartBuilder
+            workspaceId={workspaceId}
+            chartType={chartType}
+            initialQuery={chartData?.query ?? initialQuery}
+            runInitialQuery={isAwaitingFirstRun}
+            onChartGenerated={onChartGenerated}
+            onQueryStateChange={onQueryStateChange}
+            feedbackDirectoryId={feedbackDirectoryId}
+          />
+        )}
       </div>
 
       <ChartPreview
         className="min-h-0 min-w-0"
         chartData={chartData}
         config={chartConfig}
-        isLoading={isLoadingChart || queryState.isLoading}
+        isLoading={isLoadingChart || queryState.isLoading || isAwaitingFirstRun}
         error={chartLoadError ?? queryState.error}
-        emptyMessage={t("workspace.analysis.charts.advanced_chart_builder_config_prompt")}
-        typeControl={<ChartTypeSwitch selectedChartType={chartType} onChartTypeSelect={onChartTypeSelect} />}
+        emptyMessage={
+          chartType === "matrix"
+            ? t("workspace.analysis.charts.matrix_empty_prompt")
+            : t("workspace.analysis.charts.advanced_chart_builder_config_prompt")
+        }
+        typeControl={
+          renameOnly ? undefined : (
+            <ChartTypeSwitch selectedChartType={chartType} onChartTypeSelect={onChartTypeSelect} />
+          )
+        }
         displaySettings={
           showsDisplaySettings ? (
             <ChartDisplaySettings

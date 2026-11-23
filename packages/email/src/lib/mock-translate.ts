@@ -8,7 +8,36 @@ const translations: Record<TranslationKey, TranslationValue> = {
   "common.continue": "Continue",
   "common.powered_by_formbricks": "Powered by Formbricks",
   "emails.accept": "Accept",
+  "emails.account_deleted_email_did_not_request":
+    "If you did not delete your account, please contact support immediately.",
+  "emails.account_deleted_email_heading": "Your account has been deleted",
+  "emails.account_deleted_email_subject": "Your Formbricks account has been deleted",
+  "emails.account_deleted_email_text": "Your Formbricks account has been permanently removed.",
+  "emails.attachment_export_failed_email_heading": "We couldn't prepare your attachments",
+  "emails.attachment_export_failed_email_open_responses": "Open responses",
+  "emails.attachment_export_failed_email_reason_build_timeout":
+    "It took longer to build than one export is allowed. Narrow the response filter so it includes fewer files, then start it again.",
+  "emails.attachment_export_failed_email_reason_no_attachments":
+    "The responses it covered no longer hold any files, so there was nothing to export.",
+  "emails.attachment_export_failed_email_reason_other":
+    "Something went wrong while preparing it. Start it again from the survey's Responses page.",
+  "emails.attachment_export_failed_email_reason_too_many_files":
+    "It covers more than {maxFiles} files, the most one export can hold. Narrow the response filter on the survey's Responses page, then start it again.",
+  "emails.attachment_export_failed_email_subject": "Your attachments export from {surveyName} failed",
+  "emails.attachment_export_failed_email_text": "The attachments export from {surveyName} didn't finish.",
+  "emails.attachment_export_ready_email_download": "Download attachments",
+  "emails.attachment_export_ready_email_expiry":
+    "This link works for {months} months, until {date}. After that the export is deleted, and you can start a new one from the survey's Responses page.",
+  "emails.attachment_export_ready_email_files": "Files: {includedFileCount} of {fileCount}",
+  "emails.attachment_export_ready_email_heading": "Your attachments are ready",
+  "emails.attachment_export_ready_email_size": "Size: {size}",
+  "emails.attachment_export_ready_email_subject": "Your attachments from {surveyName} are ready to download",
+  "emails.attachment_export_ready_email_text":
+    "The attachments export from {surveyName} is ready to download.",
+  "emails.attachment_export_ready_email_truncated":
+    "Some files were left out because the export reached its {sizeLimit} limit. manifest.csv in the archive lists every file and marks the ones left out. To get those, start a new export with a narrower response filter.",
   "emails.click_or_drag_to_upload_files": "Click or drag to upload files.",
+  "emails.click_to_sign": "Click to sign.",
   "emails.delete_account_email_confirm_deletion": "Confirm account deletion",
   "emails.delete_account_email_did_not_request":
     "If you did not request this, please ignore this email and your account will remain active.",
@@ -60,18 +89,57 @@ const translations: Record<TranslationKey, TranslationValue> = {
   "emails.reject": "Reject",
   "emails.render_email_response_value_file_upload_response_link_not_included":
     "Link to uploaded file is not included for data privacy reasons",
+  "emails.render_email_response_value_signature_link_not_included":
+    "Link to the signature is not included for data privacy reasons",
+  "emails.sso_recovery_factors_removed_email_api_keys":
+    "API keys you had created were deleted. You can create new ones in your organization settings.",
   "emails.sso_recovery_factors_removed_email_did_not_expect":
     "If you did not just sign in with single sign-on, contact your administrator immediately.",
-  "emails.sso_recovery_factors_removed_email_heading": "Sign-in factors removed from your account",
+  "emails.sso_recovery_factors_removed_email_heading": "Credentials removed from your account",
   "emails.sso_recovery_factors_removed_email_password": "Your password was removed.",
   "emails.sso_recovery_factors_removed_email_review_security": "Review security settings",
   "emails.sso_recovery_factors_removed_email_sign_in_hint":
     "You can keep signing in with single sign-on. To use a password or two-factor authentication again, set them up in your security settings.",
   "emails.sso_recovery_factors_removed_email_subject":
-    "Sign-in factors were removed from your Formbricks account",
+    "Credentials were removed from your Formbricks account",
   "emails.sso_recovery_factors_removed_email_text":
-    "You just signed in with single sign-on for the first time. Because your email address had never been verified, we removed the sign-in factors that were set on the account before:",
+    "You just signed in with single sign-on for the first time. Because your email address had never been verified, we removed the credentials that were set on the account before:",
   "emails.sso_recovery_factors_removed_email_two_factor": "Two-factor authentication was removed.",
+  "emails.member_retention_notice_email_heading": "Your account will be deactivated",
+  "emails.member_retention_notice_email_keep":
+    "To keep your account active, sign in before then. Once deactivated, an owner or manager of the organization can reactivate it.",
+  "emails.member_retention_notice_email_sign_in": "Sign in",
+  "emails.member_retention_notice_email_subject": "Your {organizationName} account will be deactivated",
+  "emails.member_retention_notice_email_text":
+    "You haven't used {organizationName} for a while, so its data retention policy will deactivate your account on {date}.",
+  "emails.retention_notice_email_heading": "Some survey data will be removed soon",
+  "emails.retention_notice_email_keep":
+    "To keep any of this data, ask an owner or manager of your organization to add an exemption in its data retention settings.",
+  "emails.retention_notice_email_responses_after":
+    "After that date, each response is deleted once it is older than the period your organization set.",
+  "emails.retention_notice_email_responses_heading": "Responses to be deleted",
+  "emails.retention_notice_email_responses_item": "{count} due for deletion from {date}",
+  "emails.retention_notice_email_subject": "Survey data in {organizationName} will be removed soon",
+  "emails.retention_notice_email_surveys_heading": "Surveys to be archived",
+  "emails.retention_notice_email_surveys_item": "archived on {archiveDate}, then deleted on {deleteDate}",
+  "emails.retention_notice_email_text":
+    "{organizationName} automatically deletes responses after a set time and archives surveys that haven't been used in a while. The following is due soon:",
+  "emails.retention_notice_email_text_responses":
+    "{organizationName} automatically deletes responses after a set time. The following is due soon:",
+  "emails.retention_notice_email_text_surveys":
+    "{organizationName} automatically archives surveys that haven't been used in a while. The following is due soon:",
+  "emails.retention_notice_email_view_settings": "View data retention settings",
+  "emails.sso_sign_in_hint_email_did_not_request":
+    "If you did not request this, you can ignore this email. Nothing about your account has changed.",
+  "emails.sso_sign_in_hint_email_go_to_login": "Go to sign in",
+  "emails.sso_sign_in_hint_email_heading": "Sign in with single sign-on",
+  "emails.sso_sign_in_hint_email_no_access":
+    "If you can no longer sign in this way, contact your administrator.",
+  "emails.sso_sign_in_hint_email_subject": "How to sign in to your Formbricks account",
+  "emails.sso_sign_in_hint_email_text":
+    "We received a request to reset the password for your Formbricks account. Your account does not use a password, so there is nothing to reset. You sign in with:",
+  "emails.sso_sign_in_hint_email_text_unavailable":
+    "We received a request to reset the password for your Formbricks account. Your account does not use a password: it signs in with single sign-on, which is not available on this Formbricks instance right now. Contact your administrator to get access again.",
   "emails.response_data": "Response data",
   "emails.response_finished_email_subject": "A response for {surveyName} was completed ✅",
   "emails.schedule_your_meeting": "Schedule your meeting",

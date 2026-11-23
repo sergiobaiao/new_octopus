@@ -22,12 +22,12 @@
     "question_video": "Question Video",
     "required": "Required",
     "respondents_will_not_see_this_card": "Respondents will not see this card",
-    "response_saved_offline": "Your response hasn't been sent yet. It will be submitted automatically once you're back online.",
+    "response_saved_offline": "Your response has not been sent yet. It will be submitted automatically once you are back online.",
     "retry": "Retry",
     "retrying": "Retrying…",
     "scheduling_calendar": "Scheduling calendar",
     "scroll_to_bottom": "Scroll to bottom",
-    "search": "Search...",
+    "search": "Search…",
     "select_option": "Select an option",
     "select_options": "Select options",
     "sending_responses": "Sending responses…",
@@ -60,7 +60,7 @@
       "placeholder_text": "Click or drag to upload files",
       "upload_failed": "Upload failed! Please try again.",
       "upload_service_unavailable": "File upload service is unavailable. Please try again later or contact the survey owner.",
-      "uploading": "Uploading...",
+      "uploading": "Uploading…",
       "you_can_only_upload_a_maximum_of_files": "You can only upload a maximum of {FILE_LIMIT} files."
     },
     "invalid_device_error": {
@@ -102,5 +102,18 @@
     "value_must_equal": "Value must equal {value}",
     "value_must_not_contain": "Value must not contain {value}",
     "value_must_not_equal": "Value must not equal {value}"
+  },
+  "signature": {
+    "clear": "Clear",
+    "draw": "Draw",
+    "method": "Signature method",
+    "not_signed": "Not signed",
+    "pad_label": "Signature pad. Draw your signature with your finger, a stylus or a mouse.",
+    "pad_label_with_type": "Signature pad. Draw your signature with your finger, a stylus or a mouse, or switch to Type to enter your name with the keyboard.",
+    "saved": "Your signature is saved. Clear it to sign again.",
+    "sign_here": "Sign here",
+    "signed": "Signed",
+    "type": "Type",
+    "type_your_name": "Type your name"
   }
 }

@@ -18,25 +18,28 @@ const { handlerMock, runWithCtxMock } = vi.hoisted(() => ({
   runWithCtxMock: vi.fn((fn: () => unknown) => fn()),
 }));
 
-vi.mock("@/modules/auth/lib/auth", () => ({
-  auth: {
-    handler: handlerMock,
-    api: {
-      getSession: { path: "/get-session" },
-      signInEmail: { path: "/sign-in/email" },
-      resetPassword: { path: "/reset-password" },
-      resetPasswordCallback: { path: "/reset-password/:token" },
-      // The OAuth callback Better Auth really declares (`api/routes/callback.mjs`). Present here so the
-      // label vocabulary matches production: without it `callback` is not a known first segment and a
-      // pinned SSO callback would label `unknown` in this suite while labelling correctly in the app.
-      callbackOAuth: { path: "/callback/:id" },
-      // A nullish entry, deliberately. The label vocabulary is built at MODULE LOAD from this object,
-      // so `endpoint.path` on a null would throw there and take down every `/api/auth/*` request — the
-      // route, not just the tag. Importing this file at all is what asserts it does not.
-      nullishEndpoint: null,
-    },
-  },
-}));
+vi.mock("@/modules/auth/lib/auth", () => {
+  const api = {
+    getSession: { path: "/get-session" },
+    signInEmail: { path: "/sign-in/email" },
+    resetPassword: { path: "/reset-password" },
+    resetPasswordCallback: { path: "/reset-password/:token" },
+    // The OAuth callback Better Auth really declares (`api/routes/callback.mjs`). Present here so the
+    // label vocabulary matches production: without it `callback` is not a known first segment and a
+    // pinned SSO callback would label `unknown` in this suite while labelling correctly in the app.
+    callbackOAuth: { path: "/callback/:id" },
+    // A nullish entry, deliberately. The label vocabulary is built at MODULE LOAD from this object,
+    // so `endpoint.path` on a null would throw there and take down every `/api/auth/*` request — the
+    // route, not just the tag. Importing this file at all is what asserts it does not.
+    nullishEndpoint: null,
+  };
+  return {
+    auth: { handler: handlerMock, api },
+    // The real accessor's shape, over this registry: the route builds its label vocabulary from it.
+    getDeclaredAuthPaths: () =>
+      Object.values(api).map((endpoint) => (endpoint as { path?: string } | null)?.path),
+  };
+});
 vi.mock("@/modules/ee/sso/lib/sso-request-context", () => ({
   runWithSsoRequestContext: runWithCtxMock,
 }));
@@ -190,5 +193,47 @@ describe("[...all] Better Auth route — pinned SSO callback (ENG-2343)", () => 
     await GET(request);
 
     expect(handlerMock.mock.calls[0][0]).toBe(request);
+  });
+});
+
+/**
+ * The DCR redirect-URI allowlist (ENG-3086). `prepareDcrRequest` is the real implementation here, so
+ * these prove the route wires it: a non-loopback registration is rejected before `auth.handler` runs,
+ * and a loopback one is still delegated (with the application_type inference applied to its body).
+ */
+describe("[...all] Better Auth route — DCR redirect-URI allowlist (ENG-3086)", () => {
+  beforeEach(() => {
+    handlerMock.mockClear();
+    runWithCtxMock.mockClear();
+  });
+
+  test("rejects a non-loopback registration without delegating to auth.handler", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/auth/oauth2/register", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: ["https://attacker-controlled-test.example.org/cb"] }),
+      })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: "invalid_redirect_uri" });
+    expect(handlerMock).not.toHaveBeenCalled();
+    expect(runWithCtxMock).not.toHaveBeenCalled();
+  });
+
+  test("delegates a loopback registration to auth.handler with the inferred type", async () => {
+    await POST(
+      new Request("http://localhost/api/auth/oauth2/register", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: ["http://127.0.0.1:33418/callback"] }),
+      })
+    );
+
+    expect(handlerMock).toHaveBeenCalledTimes(1);
+    const handled = handlerMock.mock.calls[0][0];
+    expect(handled.url).toBe("http://localhost/api/auth/oauth2/register");
+    await expect(handled.json()).resolves.toMatchObject({ application_type: "native" });
   });
 });

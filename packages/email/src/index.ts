@@ -3,7 +3,20 @@ export { ForgotPasswordEmail } from "../emails/auth/forgot-password-email";
 export { DeleteAccountEmail } from "../emails/auth/delete-account-email";
 export { NewEmailVerification } from "../emails/auth/new-email-verification";
 export { PasswordResetNotifyEmail } from "../emails/auth/password-reset-notify-email";
+export { AccountDeletedEmail } from "../emails/auth/account-deleted-email";
 export { SsoRecoveryFactorsRemovedEmail } from "../emails/auth/sso-recovery-factors-removed-email";
+export { SsoSignInHintEmail } from "../emails/auth/sso-sign-in-hint-email";
+export { MemberRetentionNoticeEmail } from "../emails/retention/member-retention-notice-email";
+export {
+  AttachmentExportFailedEmail,
+  type TAttachmentExportFailureReason,
+} from "../emails/survey/attachment-export-failed-email";
+export { AttachmentExportReadyEmail } from "../emails/survey/attachment-export-ready-email";
+export {
+  SurveyRetentionNoticeEmail,
+  type TRetentionNoticeArchivedSurvey,
+  type TRetentionNoticeResponseDeletion,
+} from "../emails/retention/survey-retention-notice-email";
 export { InviteEmail } from "../emails/invite/invite-email";
 export { InviteAcceptedEmail } from "../emails/invite/invite-accepted-email";
 export { LinkSurveyEmail } from "../emails/survey/link-survey-email";
@@ -23,7 +36,13 @@ export {
   renderAccountDeletionEmail,
   renderNewEmailVerification,
   renderPasswordResetNotifyEmail,
+  renderAccountDeletedEmail,
   renderSsoRecoveryFactorsRemovedEmail,
+  renderSsoSignInHintEmail,
+  renderSurveyRetentionNoticeEmail,
+  renderMemberRetentionNoticeEmail,
+  renderAttachmentExportReadyEmail,
+  renderAttachmentExportFailedEmail,
   renderInviteEmail,
   renderInviteAcceptedEmail,
   renderLinkSurveyEmail,
@@ -32,8 +51,6 @@ export {
   renderEmailCustomizationPreviewEmail,
   renderFollowUpEmail,
 } from "./lib/render";
-
-export { render } from "@react-email/render";
 
 export {
   Body,
@@ -51,6 +68,7 @@ export {
   Section,
   Tailwind,
   Text,
-} from "@react-email/components";
+  render,
+} from "react-email";
 
 export type { ProcessedHiddenField, ProcessedResponseElement, ProcessedVariable } from "./types/follow-up";

@@ -24,7 +24,6 @@ import {
   WEBAPP_URL,
 } from "@/lib/constants";
 import { getAuthIssuerUrl } from "@/modules/auth/lib/oauth-urls";
-import { ssoAccountIssuer } from "./constants";
 import { resolveEmailVerifiedFromRawClaim } from "./email-verification-policy";
 import { captureSsoIdentity } from "./sso-request-context";
 
@@ -141,7 +140,7 @@ const toAccountSubject = (subject: string | number | null | undefined): string |
  *
  * Built off `getAuthIssuerUrl()` rather than `WEBAPP_URL`, deliberately: this URL is where the identity
  * provider delivers the authorization code, so it must name the same origin Better Auth itself considers
- * its base — `env.BETTER_AUTH_URL ?? env.NEXTAUTH_URL` (auth.ts), with WEBAPP_URL only as the last
+ * its base — the resolved `AUTH_URL` (lib/constants.ts), with WEBAPP_URL only as the last
  * fallback, which is exactly the precedence `getAuthIssuerUrl` encodes. Deriving it from WEBAPP_URL alone
  * would let the two diverge: the code would arrive at a host whose signed state cookie was never set, so
  * sign-in fails closed with a state mismatch. `appendPath` also handles the documented subpath shape where
@@ -426,7 +425,6 @@ export const ssoGenericOAuthConfig: GenericOAuthConfig[] = ENTERPRISE_LICENSE_KE
               // 1.7 only compares `iss` when the provider actually returns one
               // (`if (iss && provider.issuer && iss !== provider.issuer)`), so Entra short-circuits
               // and the mix-up defence still applies to providers that do implement RFC 9207.
-              accountIssuer: ssoAccountIssuer("azuread"),
               accountSubject: ssoAccountSubject("sub"),
               redirectURI: ssoLegacyRedirectUri("azuread"),
               overrideUserInfo: ssoSyncProfileOnSignIn,
@@ -467,7 +465,6 @@ export const ssoGenericOAuthConfig: GenericOAuthConfig[] = ENTERPRISE_LICENSE_KE
               // `requireIssuerValidation: true` (RFC 9207 mix-up defence, design doc §10.3) is gone
               // in 1.7 — the comparison is now automatic whenever the provider returns `iss`, so the
               // defence is kept without the flag.
-              accountIssuer: ssoAccountIssuer("openid"),
               accountSubject: ssoAccountSubject("sub"),
               redirectURI: ssoLegacyRedirectUri("openid"),
               overrideUserInfo: ssoSyncProfileOnSignIn,
@@ -502,7 +499,6 @@ export const ssoGenericOAuthConfig: GenericOAuthConfig[] = ENTERPRISE_LICENSE_KE
               pkce: true,
               // Already a plain string map, which is all 1.7 accepts here.
               authorizationUrlParams: { provider: "saml", tenant: SAML_TENANT, product: SAML_PRODUCT },
-              accountIssuer: ssoAccountIssuer("saml"),
               accountSubject: ssoAccountSubject("id"),
               redirectURI: ssoLegacyRedirectUri("saml"),
               overrideUserInfo: ssoSyncProfileOnSignIn,

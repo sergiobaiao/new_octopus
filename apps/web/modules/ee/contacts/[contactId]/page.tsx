@@ -1,6 +1,6 @@
-import { ResourceNotFoundError } from "@formbricks/types/errors";
+import { notFound } from "next/navigation";
+import { getUserVisibleSurveyWhere } from "@/lib/survey/visibility/actor-context";
 import { getTagsByWorkspaceId } from "@/lib/tag/service";
-import { getTranslate } from "@/lingodotdev/server";
 import { AttributesSection } from "@/modules/ee/contacts/[contactId]/components/attributes-section";
 import { ContactControlBar } from "@/modules/ee/contacts/[contactId]/components/contact-control-bar";
 import { getContactAttributeKeys } from "@/modules/ee/contacts/lib/contact-attribute-keys";
@@ -15,26 +15,30 @@ import { PageHeader } from "@/modules/ui/components/page-header";
 import { ActivitySection } from "./components/activity-section";
 
 export const SingleContactPage = async (props: {
-  params: Promise<{ workspaceId: string; contactId: string }>;
+  readonly params: Promise<{ workspaceId: string; contactId: string }>;
 }) => {
   const params = await props.params;
-  const t = await getTranslate();
 
   // Ties the contact in the URL to the workspace in the URL: authorizing the workspace alone would
   // let any authenticated user read a foreign contact's PII through their own workspace.
-  const { isReadOnly, organization, workspace } = await getContactAuth(params.workspaceId, params.contactId);
+  const { isReadOnly, organization, session, workspace } = await getContactAuth(
+    params.workspaceId,
+    params.contactId
+  );
+  // ENG-3282: a contact's responses, displays and link pickers only cover surveys the viewer may see.
+  const visibleSurveyWhere = await getUserVisibleSurveyWhere(session.user.id, organization.id);
 
   const [environmentTags, contact, publishedLinkSurveys, attributesWithKeyInfo, allAttributeKeys] =
     await Promise.all([
       getTagsByWorkspaceId(workspace.id),
       getContactInWorkspace(params.contactId, workspace.id),
-      getPublishedLinkSurveys(workspace.id),
+      getPublishedLinkSurveys(workspace.id, visibleSurveyWhere),
       getContactAttributesWithKeyInfo(params.contactId, workspace.id),
       getContactAttributeKeys(workspace.id),
     ]);
 
   if (!contact) {
-    throw new ResourceNotFoundError(t("common.contact"), params.contactId);
+    return notFound();
   }
 
   const isQuotasAllowed = await getIsQuotasEnabled(organization.id);
@@ -65,11 +69,17 @@ export const SingleContactPage = async (props: {
       <PageHeader pageTitle={contactIdentifier} cta={getContactControlBar()} />
       <section className="pt-6 pb-24">
         <div className="grid grid-cols-4 gap-x-8">
-          <AttributesSection contactId={params.contactId} workspaceId={workspace.id} />
+          <AttributesSection
+            contactId={params.contactId}
+            workspaceId={workspace.id}
+            visibleSurveyWhere={visibleSurveyWhere}
+          />
           <ActivitySection
             workspaceId={workspace.id}
             contactId={params.contactId}
             environmentTags={environmentTags}
+            isReadOnly={isReadOnly}
+            visibleSurveyWhere={visibleSurveyWhere}
           />
         </div>
       </section>

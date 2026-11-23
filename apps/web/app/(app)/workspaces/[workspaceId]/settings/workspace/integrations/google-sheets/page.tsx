@@ -14,6 +14,7 @@ import { getIntegrations } from "@/lib/integration/service";
 import { getUserLocale } from "@/lib/user/service";
 import { getTranslate } from "@/lingodotdev/server";
 import { getSettingsPageMetadata } from "@/modules/settings/lib/metadata";
+import { isSurveyVisibilityEnforced } from "@/modules/survey/visibility/lib/gate";
 import { GoBackButton } from "@/modules/ui/components/go-back-button";
 import { PageContentWrapper } from "@/modules/ui/components/page-content-wrapper";
 import { PageHeader } from "@/modules/ui/components/page-header";
@@ -22,17 +23,18 @@ import { getWorkspaceAuth } from "@/modules/workspaces/lib/utils";
 export const generateMetadata = () =>
   getSettingsPageMetadata("workspace.integrations.google_sheets.google_sheets_integration");
 
-const Page = async (props: { params: Promise<{ workspaceId: string }> }) => {
+const Page = async (props: { readonly params: Promise<{ workspaceId: string }> }) => {
   const params = await props.params;
   const t = await getTranslate();
   const isEnabled = !!(GOOGLE_SHEETS_CLIENT_ID && GOOGLE_SHEETS_CLIENT_SECRET && GOOGLE_SHEETS_REDIRECT_URL);
 
-  const { isReadOnly, session, workspace } = await getWorkspaceAuth(params.workspaceId);
+  const { isReadOnly, organization, session, workspace } = await getWorkspaceAuth(params.workspaceId);
 
-  const [surveys, integrations, locale] = await Promise.all([
-    getSurveys(workspace.id),
+  const [surveys, integrations, locale, surveyVisibilityEnabled] = await Promise.all([
+    getSurveys(workspace.id, session.user.id, organization.id),
     getIntegrations(workspace.id),
     getUserLocale(session.user.id),
+    isSurveyVisibilityEnforced(),
   ]);
 
   const googleSheetIntegration: TIntegrationGoogleSheets | undefined = integrations?.find(
@@ -51,6 +53,7 @@ const Page = async (props: { params: Promise<{ workspaceId: string }> }) => {
           isEnabled={isEnabled}
           workspaceId={workspace.id}
           surveys={surveys}
+          surveyVisibilityEnabled={surveyVisibilityEnabled}
           googleSheetIntegration={redactIntegrationCredentials(googleSheetIntegration)}
           webAppUrl={WEBAPP_URL}
           locale={locale ?? DEFAULT_LOCALE}

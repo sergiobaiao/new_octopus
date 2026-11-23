@@ -6,7 +6,7 @@ import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 import { ZUserPassword } from "@formbricks/types/user";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { setupTwoFactorAuthAction } from "@/modules/ee/two-factor-auth/actions";
 import { Button } from "@/modules/ui/components/button";
 import { FormControl, FormError, FormField, FormItem } from "@/modules/ui/components/form";
@@ -19,11 +19,11 @@ const ZConfirmPasswordFormState = z.object({
 type TConfirmPasswordFormState = z.infer<typeof ZConfirmPasswordFormState>;
 
 interface ConfirmPasswordFormProps {
-  setCurrentStep: (step: EnableTwoFactorModalStep) => void;
-  setBackupCodes: (codes: string[]) => void;
-  setDataUri: (dataUri: string) => void;
-  setSecret: (secret: string) => void;
-  setOpen: (open: boolean) => void;
+  readonly setCurrentStep: (step: EnableTwoFactorModalStep) => void;
+  readonly setBackupCodes: (codes: string[]) => void;
+  readonly setDataUri: (dataUri: string) => void;
+  readonly setSecret: (secret: string) => void;
+  readonly setOpen: (open: boolean) => void;
 }
 export const ConfirmPasswordForm = ({
   setBackupCodes,

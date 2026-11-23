@@ -269,14 +269,22 @@ paths:
                 fileType:
                   type: string
                   description: The MIME type of the file.
+                elementId:
+                  type: string
+                  description: The ID of the File upload or Signature element the file is for.
+                    The request is refused when the survey has no such upload
+                    element. A Signature element accepts only a PNG named
+                    `signature.png`, up to 1 MB.
               required:
                 - surveyId
                 - fileName
                 - fileType
+                - elementId
               example:
                 surveyId: cm7pr0x2y004o192zmit8cjvb
                 fileName: example.jpg
                 fileType: image/jpeg
+                elementId: upload_element_1
       responses:
         "200":
           description: OK - Returns the signed URL, presigned fields, updated file name,
@@ -3538,7 +3546,11 @@ paths:
       operationId: updateUser
       summary: Update a user
       description: Updates an existing user in the database.<br />Only available for
-        self-hosted Formbricks.
+        self-hosted Formbricks.<br />`name` and `isActive` apply to the whole
+        account, so they can only be changed for a user who belongs to this
+        organization alone. For a user who also belongs to other organizations,
+        a request that changes either is rejected with 409 and nothing in it is
+        applied.
       tags:
         - Organizations API - Users
       parameters:
@@ -4064,6 +4076,12 @@ components:
             - boolean
             - "null"
           description: Whether to show the language switch
+        autoSelectLanguage:
+          type:
+            - boolean
+            - "null"
+          description: Whether to open the survey in the respondent's browser language when it matches an
+            enabled survey language
         showThankYouMessage:
           type:
             - boolean
@@ -5179,6 +5197,54 @@ components:
                         - email
                         - phone
                         - company
+                    - type: object
+                      properties:
+                        id:
+                          type: string
+                        type:
+                          type: string
+                          const: signature
+                        headline:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        subheader:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        imageUrl:
+                          type: string
+                          format: uri
+                        videoUrl:
+                          type: string
+                          format: uri
+                        required:
+                          type: boolean
+                        scale:
+                          type: string
+                          enum: *a13
+                        range:
+                          anyOf:
+                            - type: number
+                              const: 5
+                            - type: number
+                              const: 3
+                            - type: number
+                              const: 4
+                            - type: number
+                              const: 7
+                            - type: number
+                              const: 10
+                        isDraft:
+                          type: boolean
+                        allowTypedSignature:
+                          type: boolean
+                      required:
+                        - id
+                        - type
+                        - headline
+                        - required
+                        - allowTypedSignature
                 minItems: 1
               logic:
                 type: array
@@ -5512,6 +5578,9 @@ components:
             - number
             - "null"
           description: Auto close time in seconds
+        keepEndingCardOpen:
+          type: boolean
+          description: Keep the ending card open until the respondent closes it instead of closing after 3 seconds
         autoComplete:
           type:
             - number
@@ -5803,6 +5872,7 @@ components:
         - status
         - thankYouMessage
         - showLanguageSwitch
+        - autoSelectLanguage
         - showThankYouMessage
         - welcomeCard
         - displayProgressBar
@@ -5818,6 +5888,7 @@ components:
         - recontactDays
         - displayLimit
         - autoClose
+        - keepEndingCardOpen
         - autoComplete
         - delay
         - surveyClosedMessage

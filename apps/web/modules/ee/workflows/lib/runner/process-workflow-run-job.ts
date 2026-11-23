@@ -5,6 +5,7 @@ import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { type JobHandler, type TWorkflowRunJobData } from "@formbricks/jobs";
 import { logger } from "@formbricks/logger";
+import { TooManyRequestsError } from "@formbricks/types/errors";
 import type { TResponse } from "@formbricks/types/responses";
 import type { TSurvey } from "@formbricks/types/surveys/types";
 import { type TUserLocale, ZUserLocale } from "@formbricks/types/user";
@@ -23,14 +24,17 @@ import { isDatabasePoolExhaustionError } from "@/lib/jobs/pool-exhaustion";
 import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
 import { getResponse } from "@/lib/response/service";
 import { getSurvey } from "@/lib/survey/service";
+import { isSurveyOutboundAllowed } from "@/lib/survey/visibility/outbound";
 import { normalizeEmailForComparison } from "@/lib/utils/email";
 import { getWorkspaceMemberEmails } from "@/lib/workspace/service";
 import { captureWorkflowRunFailed } from "@/modules/ee/workflows/lib/analytics/run-failure";
 import { sendEmail } from "@/modules/email";
+import { resolveEmailActorUserId } from "@/modules/email/lib/email-actor";
 import {
   buildSurveyResponseEmailHtml,
   resolveResponseRecipient,
 } from "@/modules/email/lib/survey-response-email";
+import { recordSurveyOutboundSkipped } from "@/modules/response-pipeline/lib/outbound-visibility-metrics";
 
 /** Strips CR/LF and other control chars from the subject — defense against SMTP header injection. */
 const CONTROL_CHARS_PATTERN = /[\x00-\x1f\x7f\u2028\u2029]/g;
@@ -59,7 +63,8 @@ const workflowRunSelect = {
   triggerType: true,
   triggerPayload: true,
   workflowVersion: { select: { definition: true } },
-  workflow: { select: { definition: true } },
+  // `createdBy` carries the per-user email limit: the respondent who triggers a run is anonymous.
+  workflow: { select: { definition: true, createdBy: true } },
 } as const;
 
 /** Thrown when the run cannot be executed at all (definition missing/invalid). Marks the run failed. */
@@ -148,6 +153,8 @@ interface StepOutcome {
 
 /** The survey/response/branding context, loaded once per run, that every step renders against. */
 interface RunEmailContext {
+  workflowId?: string;
+  configuredByUserId?: string;
   survey: TSurvey;
   response: TResponse;
   logoUrl: string;
@@ -159,6 +166,8 @@ interface RunEmailContext {
    * rejected.
    */
   allowedRecipientEmails: Set<string>;
+  /** The organization and workflow owner the run's emails are rate-limited by (ENG-3823). */
+  rateLimit: { organizationId?: string; actorUserId: string | null };
 }
 
 /**
@@ -215,11 +224,23 @@ const sendResolvedEmail = async (
     // No `from` — the deployment MAIL_FROM default applies, exactly like survey Follow-Ups. `config.from`
     // is only used to derive the stable Message-ID domain, never as the actual sender.
     const sent = await sendEmail({
+      emailType: "workflow_email",
+      auditContext: {
+        trigger: "workflow",
+        organizationId: emailContext.rateLimit.organizationId,
+        surveyId: emailContext.survey.id,
+        responseId: emailContext.response.id,
+        workflowRunId,
+        workflowId: emailContext.workflowId,
+        configuredByUserId: emailContext.configuredByUserId,
+      },
       to: recipient.email,
       replyTo: config.replyTo.length > 0 ? config.replyTo.join(", ") : undefined,
       subject,
       html,
       messageId,
+      // A literal address is a workspace member (the allowlist above); a respondent-field one is external.
+      rateLimit: { ...emailContext.rateLimit, externalRecipient: !isLiteralEmailRecipient(config.to) },
     });
 
     if (sent) {
@@ -227,6 +248,11 @@ const sendResolvedEmail = async (
     }
     return { status: "failed", error: "SMTP is not configured; workflow email was not sent", output: {} };
   } catch (sendError) {
+    // A spent email cap is not a send failure: nothing reached SMTP, and the run history and failure
+    // analytics should say "throttled", not "broken". Recorded as skipped, which a later attempt retries.
+    if (sendError instanceof TooManyRequestsError) {
+      return { status: "skipped", error: null, output: { reason: "email_rate_limited" } };
+    }
     return {
       status: "failed",
       error: toError(sendError, "Failed to send workflow email").message,
@@ -353,9 +379,10 @@ const claimAndSendStep = async (
     return sendOwnedStep(step, runId, emailContext);
   }
 
-  // A prior attempt left a `failed`/`pending` row — take it over only if it is still in that state.
+  // A prior attempt left a `failed`/`pending`/`skipped` row — take it over only if it is still in that
+  // state. `skipped` means a rate-limited send that never went out, so re-attempting it is safe.
   const claim = await prisma.workflowRunLog.updateMany({
-    where: { runId, stepId: step.stepId, status: { in: ["failed", "pending"] } },
+    where: { runId, stepId: step.stepId, status: { in: ["failed", "pending", "skipped"] } },
     data: { status: "running", startedAt, output: {}, error: null, finishedAt: null },
   });
   if (claim.count === 0) {
@@ -378,8 +405,8 @@ const STEP_BAIL = Symbol("workflow-step-bail");
  * Runs one planned step with a per-step claim guard:
  *  - `succeeded` row → resume (no send).
  *  - `running` row → owned by a concurrent delivery / stalled attempt → BAIL (no send, don't finalize).
- *  - no row / `failed` / `pending` → claim, then send (a `failed` send never went out, so re-sending is safe).
- *    A lost claim (concurrent `create`/`updateMany` won) also BAILs.
+ *  - no row / `failed` / `pending` / `skipped` → claim, then send (none of those ever went out, so
+ *    re-sending is safe). A lost claim (concurrent `create`/`updateMany` won) also BAILs.
  */
 const runStep = async (
   step: TWorkflowExecutableStep,
@@ -456,7 +483,8 @@ const claimRun = async (
 const loadRunEmailContext = async (
   triggerPayload: TWorkflowTriggerRunPayload,
   workspaceId: string,
-  steps: TWorkflowExecutableStep[]
+  steps: TWorkflowExecutableStep[],
+  actorUserId: string | null
 ): Promise<RunEmailContext> => {
   const [response, survey] = await Promise.all([
     getResponse(triggerPayload.responseId),
@@ -483,6 +511,15 @@ const loadRunEmailContext = async (
     );
   }
 
+  // ENG-3283: the survey may have been restricted after this run was enqueued. A run forwards the
+  // response out of the app, so it stops here rather than sending a restricted survey's data.
+  if (!isSurveyOutboundAllowed(survey)) {
+    recordSurveyOutboundSkipped("workflow");
+    throw new WorkflowRunNotExecutableError(
+      `Survey ${triggerPayload.surveyId} is not visible to the whole workspace`
+    );
+  }
+
   const organization = await getOrganizationByWorkspaceId(workspaceId);
   const logoUrl = organization?.whitelabel?.logoUrl ?? "";
   // Only literal `to` recipients are allowlist-checked, so the member query is skipped entirely for
@@ -492,11 +529,19 @@ const loadRunEmailContext = async (
   // yields an empty allowlist, so a literal external recipient is rejected rather than allowed
   // through unchecked.
   const needsRecipientAllowlist = steps.some((step) => isLiteralEmailRecipient(step.node.config.to));
-  const allowedRecipientEmails = needsRecipientAllowlist
-    ? await getWorkspaceMemberEmails(workspaceId)
-    : new Set<string>();
+  const [allowedRecipientEmails, rateLimitActorUserId] = await Promise.all([
+    needsRecipientAllowlist ? getWorkspaceMemberEmails(workspaceId) : new Set<string>(),
+    organization ? resolveEmailActorUserId(actorUserId, organization.id) : actorUserId,
+  ]);
 
-  return { survey, response, logoUrl, allowedRecipientEmails };
+  return {
+    survey,
+    response,
+    logoUrl,
+    allowedRecipientEmails,
+    configuredByUserId: actorUserId ?? undefined,
+    rateLimit: { organizationId: organization?.id, actorUserId: rateLimitActorUserId },
+  };
 };
 
 /**
@@ -532,7 +577,11 @@ const runSteps = async (
 
 /** Walks the claimed run to completion, throwing `WorkflowStepFailedError` (with the trace) on a failed step. */
 const executeClaimedRun = async (
-  run: { id: string; workflowVersion: { definition: unknown } | null; workflow: { definition: unknown } },
+  run: {
+    id: string;
+    workflowVersion: { definition: unknown } | null;
+    workflow: { definition: unknown; createdBy: string | null };
+  },
   workspaceId: string,
   triggerPayload: TWorkflowTriggerRunPayload,
   logContext: ReturnType<typeof getWorkflowRunLogContext>
@@ -540,7 +589,10 @@ const executeClaimedRun = async (
   const definition = resolveExecutableDefinition(run);
   const steps = planExecutableSteps(definition);
 
-  const emailContext = await loadRunEmailContext(triggerPayload, workspaceId, steps);
+  const emailContext = {
+    ...(await loadRunEmailContext(triggerPayload, workspaceId, steps, run.workflow.createdBy ?? null)),
+    workflowId: logContext.workflowId,
+  };
   const outcome = await runSteps(steps, run.id, emailContext, logContext);
 
   if (outcome.bail) {

@@ -2,6 +2,7 @@
 import { type TActionClassNoCodeConfig } from "@formbricks/types/action-classes";
 import type { TChartConfig, TChartQuery, TWidgetLayout } from "@formbricks/types/analysis";
 import type { TOrganizationAccess } from "@formbricks/types/api-key";
+import type { TCustomCssStored } from "@formbricks/types/custom-css";
 import { type TEmbeddedDataDefaultValue } from "@formbricks/types/embedded-data";
 import { type TIngestFlag } from "@formbricks/types/embedded-data-ingest";
 import { type TIntegrationConfig } from "@formbricks/types/integration";
@@ -20,8 +21,10 @@ import {
   type TResponseVariables,
 } from "@formbricks/types/responses";
 import { type TBaseFilters } from "@formbricks/types/segment";
-import { type TSurveyBlock } from "@formbricks/types/surveys/blocks";
+import type { TShowConditionGroup } from "@formbricks/types/show-conditions";
+import { type TSurveyBlock, type TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import type { TSurveyFollowUpAction, TSurveyFollowUpTrigger } from "@formbricks/types/surveys/follow-up";
+import type { TResponseNotShown } from "@formbricks/types/surveys/not-shown";
 import {
   type TSurveyClosedMessage,
   type TSurveyEnding,
@@ -55,6 +58,7 @@ declare global {
     export type WorkspaceConfig = TWorkspaceConfig;
     export type ResponseData = TResponseData;
     export type ResponseIngestFlags = TIngestFlag[];
+    export type ResponseNotShown = TResponseNotShown;
     export type ResponseVariables = TResponseVariables;
     export type ResponseTtc = TResponseTtc;
     export type ResponseMeta = TResponseMeta;
@@ -71,6 +75,8 @@ declare global {
     export type SurveyClosedMessage = TSurveyClosedMessage;
     export type SurveySingleUse = TSurveySingleUse;
     export type SurveyRecaptcha = TSurveyRecaptcha;
+    export type SurveyShowConditions = TShowConditionGroup;
+    export type SurveyStartLogic = TSurveyBlockLogic[];
     export type SurveyLinkMetadata = TSurveyMetadata;
     export type OrganizationBilling = TOrganizationBilling;
     export type OrganizationBillingPlanLimits = TOrganizationBillingPlanLimits;
@@ -79,6 +85,7 @@ declare global {
     export type UserNotificationSettings = TUserNotificationSettings;
     export type SegmentFilter = TBaseFilters;
     export type Styling = TWorkspaceStyling;
+    export type CustomCssStored = TCustomCssStored;
     export type Logo = TLogo;
     export type Locale = TUserLocale;
     export type SurveyFollowUpTrigger = TSurveyFollowUpTrigger;

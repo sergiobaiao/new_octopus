@@ -1,4 +1,5 @@
 import { type Mock, beforeEach, describe, expect, test, vi } from "vitest";
+import { modelFetch } from "./model-fetch";
 import {
   AIConfigurationError,
   getActiveAiModel,
@@ -8,6 +9,7 @@ import {
   isAiConfigured,
   resetLanguageModelCache,
 } from "./provider";
+import { openaiCompatibleProviderAdapter } from "./providers/openai-compatible";
 import type { AIEnvironment } from "./types";
 
 const mocks = vi.hoisted(() => ({
@@ -224,6 +226,7 @@ describe("packages/ai provider helpers", () => {
     expect(firstModel).toEqual({ providerName: "google", modelName: "gemini-2.5-flash" });
     expect(secondModel).toBe(firstModel);
     expect(mocks.createVertex).toHaveBeenCalledWith({
+      fetch: modelFetch,
       project: "test-project",
       location: "us-central1",
       googleAuthOptions: {
@@ -250,6 +253,7 @@ describe("packages/ai provider helpers", () => {
 
     expect(model).toEqual({ providerName: "google", modelName: "gemini-2.5-flash" });
     expect(mocks.createVertex).toHaveBeenCalledWith({
+      fetch: modelFetch,
       project: "test-project",
       location: "us-central1",
       googleAuthOptions: {
@@ -272,6 +276,7 @@ describe("packages/ai provider helpers", () => {
 
     expect(model).toEqual({ providerName: "google", modelName: "gemini-2.5-flash" });
     expect(mocks.createVertex).toHaveBeenCalledWith({
+      fetch: modelFetch,
       project: "test-project",
       location: "us-central1",
     });
@@ -300,6 +305,7 @@ describe("packages/ai provider helpers", () => {
 
     expect(model).toEqual({ providerName: "google", modelName: "gemini-3.5-flash" });
     expect(mocks.createVertex).toHaveBeenCalledWith({
+      fetch: modelFetch,
       project: "test-project",
       location,
       baseURL,
@@ -322,6 +328,7 @@ describe("packages/ai provider helpers", () => {
 
       expect(model).toEqual({ providerName: "google", modelName: "gemini-3.5-flash" });
       expect(mocks.createVertex).toHaveBeenCalledWith({
+        fetch: modelFetch,
         project: "test-project",
         location,
       });
@@ -370,6 +377,7 @@ describe("packages/ai provider helpers", () => {
 
     expect(model).toEqual({ providerName: "aws", modelName: "amazon.nova-lite-v1:0" });
     expect(mocks.createAmazonBedrock).toHaveBeenCalledWith({
+      fetch: modelFetch,
       region: "us-east-1",
       accessKeyId: "aws-access-key-id",
       secretAccessKey: "aws-secret-access-key",
@@ -391,6 +399,7 @@ describe("packages/ai provider helpers", () => {
 
     expect(model).toEqual({ providerName: "azure", modelName: "gpt-4.1" });
     expect(mocks.createAzure).toHaveBeenCalledWith({
+      fetch: modelFetch,
       apiKey: "azure-api-key",
       resourceName: "test-resource",
       apiVersion: "v1",
@@ -518,6 +527,7 @@ describe("packages/ai provider helpers", () => {
     expect(firstModel).toEqual({ providerName: "openai-compatible", modelName: "Qwen/Qwen2.5-7B-Instruct" });
     expect(secondModel).toBe(firstModel);
     expect(mocks.createOpenAICompatible).toHaveBeenCalledWith({
+      fetch: modelFetch,
       name: "qwen-vllm",
       baseURL: "http://vllm:8000/v1",
       supportsStructuredOutputs: true,
@@ -541,6 +551,7 @@ describe("packages/ai provider helpers", () => {
 
     expect(model).toEqual({ providerName: "openai-compatible", modelName: "Qwen/Qwen2.5-7B-Instruct" });
     expect(mocks.createOpenAICompatible).toHaveBeenCalledWith({
+      fetch: modelFetch,
       name: "openai-compatible",
       baseURL: "http://vllm:8000/v1",
       supportsStructuredOutputs: false,
@@ -566,6 +577,135 @@ describe("packages/ai provider helpers", () => {
 
     expect(secondModel).not.toBe(firstModel);
     expect(mocks.createOpenAICompatible).toHaveBeenCalledTimes(2);
+  });
+
+  describe("OpenAI-compatible auth modes", () => {
+    const oauthEnvironment: AIEnvironment = {
+      AI_PROVIDER: "openai-compatible",
+      AI_MODEL: "gateway-model",
+      AI_OPENAI_COMPATIBLE_BASE_URL: "https://gateway.example.internal/v1",
+      AI_OPENAI_COMPATIBLE_AUTH_MODE: "oauth2-client-credentials",
+      AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL: "https://gateway.example.internal/oauth/token",
+      AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID: "test-client",
+      AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET: "test-secret-value",
+    };
+
+    test("keeps api-key mode's provider call args exactly as before, with stray OAuth vars ignored", () => {
+      mocks.createOpenAICompatible.mockReturnValue(createMockProvider("openai-compatible"));
+
+      getAiModel({
+        AI_PROVIDER: "openai-compatible",
+        AI_MODEL: "Qwen/Qwen2.5-7B-Instruct",
+        AI_OPENAI_COMPATIBLE_BASE_URL: "http://vllm:8000/v1",
+        AI_OPENAI_COMPATIBLE_API_KEY: "vllm-api-key",
+        AI_OPENAI_COMPATIBLE_PROVIDER_NAME: "qwen-vllm",
+        AI_OPENAI_COMPATIBLE_SUPPORTS_STRUCTURED_OUTPUTS: "true",
+        AI_OPENAI_COMPATIBLE_HEADERS_JSON: JSON.stringify({ "X-Tenant": "acme" }),
+        AI_OPENAI_COMPATIBLE_QUERY_PARAMS_JSON: JSON.stringify({ "api-version": "2024-01" }),
+        AI_OPENAI_COMPATIBLE_AUTH_MODE: "api-key",
+        AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL: "not-a-url",
+        AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE: "bogus",
+      });
+
+      expect(mocks.createOpenAICompatible.mock.calls[0][0]).toStrictEqual({
+        fetch: modelFetch,
+        name: "qwen-vllm",
+        baseURL: "http://vllm:8000/v1",
+        supportsStructuredOutputs: true,
+        apiKey: "vllm-api-key",
+        headers: { "X-Tenant": "acme" },
+        queryParams: { "api-version": "2024-01" },
+      });
+    });
+
+    test("passes a fetch wrapper and no apiKey in oauth2-client-credentials mode", () => {
+      mocks.createOpenAICompatible.mockReturnValue(createMockProvider("openai-compatible"));
+
+      expect(getAiConfigurationStatus(oauthEnvironment).isConfigured).toBe(true);
+      getAiModel(oauthEnvironment);
+
+      const options = mocks.createOpenAICompatible.mock.calls[0][0] as Record<string, unknown>;
+      expect(options).toMatchObject({
+        name: "openai-compatible",
+        baseURL: "https://gateway.example.internal/v1",
+        supportsStructuredOutputs: false,
+      });
+      expect(options.fetch).toBeTypeOf("function");
+      expect(options).not.toHaveProperty("apiKey");
+    });
+
+    test("reports every missing OAuth credential", () => {
+      expect(
+        getAiConfigurationStatus({
+          AI_PROVIDER: "openai-compatible",
+          AI_MODEL: "gateway-model",
+          AI_OPENAI_COMPATIBLE_BASE_URL: "https://gateway.example.internal/v1",
+          AI_OPENAI_COMPATIBLE_AUTH_MODE: "oauth2-client-credentials",
+        })
+      ).toMatchObject({
+        isConfigured: false,
+        missingFields: [
+          "AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL",
+          "AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID",
+          "AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET",
+        ],
+        errorCode: "providerNotConfigured",
+      });
+    });
+
+    test("fails closed on an unrecognised auth mode", () => {
+      const environment: AIEnvironment = { ...oauthEnvironment, AI_OPENAI_COMPATIBLE_AUTH_MODE: "oauth2" };
+
+      expect(getAiConfigurationStatus(environment)).toMatchObject({
+        isConfigured: false,
+        invalidFields: ["AI_OPENAI_COMPATIBLE_AUTH_MODE"],
+      });
+      expect(() => getAiModel(environment)).toThrowError(AIConfigurationError);
+      expect(mocks.createOpenAICompatible).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ["AI_OPENAI_COMPATIBLE_API_KEY", { AI_OPENAI_COMPATIBLE_API_KEY: "static-key" }],
+      [
+        "AI_OPENAI_COMPATIBLE_BASE_URL",
+        { AI_OPENAI_COMPATIBLE_BASE_URL: "http://gateway.example.internal/v1" },
+      ],
+      ["AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL", { AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL: "ftp://idp/token" }],
+      [
+        "AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL",
+        { AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL: "http://idp.example.internal/token" },
+      ],
+      ["AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE", { AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE: "header" }],
+      [
+        "AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON",
+        { AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON: "[1]" },
+      ],
+    ])("flags %s as invalid in oauth mode", (field, overrides) => {
+      expect(getAiConfigurationStatus({ ...oauthEnvironment, ...overrides })).toMatchObject({
+        isConfigured: false,
+        invalidFields: [field],
+      });
+    });
+
+    test("builds a new model when the client secret rotates, without the secret in the cache key", () => {
+      mocks.createOpenAICompatible
+        .mockReturnValueOnce(createMockProvider("openai-compatible"))
+        .mockReturnValueOnce(createMockProvider("openai-compatible"));
+
+      const firstModel = getAiModel(oauthEnvironment);
+      expect(getAiModel(oauthEnvironment)).toBe(firstModel);
+      const rotatedModel = getAiModel({
+        ...oauthEnvironment,
+        AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET: "rotated-secret-value",
+      });
+
+      expect(rotatedModel).not.toBe(firstModel);
+      expect(mocks.createOpenAICompatible).toHaveBeenCalledTimes(2);
+
+      const cacheKey = openaiCompatibleProviderAdapter.buildCacheKey("gateway-model", oauthEnvironment);
+      expect(cacheKey).not.toContain("test-secret-value");
+      expect(cacheKey).toContain("oauthClientSecretFingerprint");
+    });
   });
 
   test("throws a helpful error when the active model is missing", () => {

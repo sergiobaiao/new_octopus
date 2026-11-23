@@ -1,20 +1,103 @@
 import type { JobSchedulerTemplateOptions, JobsOptions } from "bullmq";
 
+/** The default queue: every job runs here unless its definition names a dedicated queue. */
 export const JOBS_QUEUE_NAME = "background-jobs";
+
+/**
+ * AuthZed projection delivery gets a queue of its own, served by one dedicated worker in every jobs
+ * runtime. Every authorization check fails closed once a revocation has waited in the outbox longer than
+ * `AUTHZED_OUTBOX_REVOCATION_MAX_AGE_MS` (apps/web), so delivery must never queue behind a long sweep on
+ * the default queue's worker slots.
+ */
+export const AUTHZED_PROJECTION_QUEUE_NAME = "authzed-projection";
+
+/**
+ * The nightly data retention sweep gets a queue of its own too: it may keep starting work for half an
+ * hour, and on the default queue (one worker, one job at a time by default) every webhook delivery,
+ * response pipeline run and cleanup drain would wait behind it.
+ */
+export const DATA_RETENTION_QUEUE_NAME = "data-retention";
+
+/**
+ * The six-hourly AuthZed reconciliation audit and the daily survey audit share a queue of their own: each
+ * walks every organization (or survey) in one job, so on the default queue every webhook delivery and
+ * response pipeline run would wait behind a whole sweep (ENG-3764). Neither is latency-sensitive, so one
+ * waiting behind the other is fine.
+ */
+export const AUTHZED_RECONCILIATION_QUEUE_NAME = "authzed-reconciliation";
+
+/**
+ * Attachment exports build multi-GB ZIPs for minutes at a time (ENG-6862). On the default queue they
+ * would hold its only worker slot and stall webhook deliveries and response pipelines behind them; here
+ * one export at a time runs per process, and nothing else waits.
+ */
+export const ATTACHMENT_EXPORT_QUEUE_NAME = "attachment-export";
+
+/** Queues that each get exactly one worker of their own, outside `workerCount`/`concurrency`. */
+export const DEDICATED_JOBS_QUEUE_NAMES = [
+  AUTHZED_PROJECTION_QUEUE_NAME,
+  AUTHZED_RECONCILIATION_QUEUE_NAME,
+  DATA_RETENTION_QUEUE_NAME,
+  ATTACHMENT_EXPORT_QUEUE_NAME,
+] as const;
+
+export const JOBS_QUEUE_NAMES = [JOBS_QUEUE_NAME, ...DEDICATED_JOBS_QUEUE_NAMES] as const;
+
+export type TJobsQueueName = (typeof JOBS_QUEUE_NAMES)[number];
+
+export type TDedicatedJobsQueueName = (typeof DEDICATED_JOBS_QUEUE_NAMES)[number];
+
 export const JOBS_PREFIX = "{formbricks:jobs}";
 
 export const JOB_NAMES = {
+  attachmentExport: "attachment-export.process",
+  attachmentExportReconcile: "attachment-export.reconcile",
+  emailAuditMaintenance: "email-audit.maintain",
   authzedProjectionDelivery: "authzed-projection.deliver",
   authzedReconciliationAudit: "authzed-reconciliation.audit",
+  authzedSurveyAudit: "authzed-survey.audit",
+  creativeStatsFlush: "creative-stats.flush",
+  dataRetentionSweep: "data-retention.sweep",
+  deletionCleanupDrain: "deletion-cleanup.drain",
   testLog: "system.test-log",
   responsePipeline: "response-pipeline.process",
   surveyScheduling: "survey-scheduling.reconcile",
   surveyArchivePurge: "survey-archive-purge.process",
   usageTelemetry: "usage-telemetry.process",
+  webhookDelivery: "webhook-delivery.process",
   workflowsUsageSnapshot: "workflows-usage.snapshot",
   workflowRun: "workflow-run.process",
   workflowRunReconcile: "workflow-run.reconcile",
 } as const;
+
+/**
+ * Retry policy for a single webhook delivery. Deliveries are fanned out one job per webhook, so this
+ * budget belongs to one endpoint and never delays the rest of the pipeline. Five attempts with a 30 s
+ * exponential base spread the retries over roughly 30 s, 1 min, 2 min and 4 min (~7.5 min total): long
+ * enough to ride out a receiver restart or deploy, short enough that a dead endpoint stops costing us
+ * within minutes. Permanent failures (SSRF rejection, 4xx other than 408/429) are raised as
+ * `UnrecoverableError` by the handler and do not consume this budget.
+ */
+export const WEBHOOK_DELIVERY_JOB_OPTIONS = Object.freeze({
+  attempts: 5,
+  backoff: Object.freeze({
+    type: "exponential",
+    delay: 30_000,
+  } as const),
+}) satisfies JobsOptions;
+
+/**
+ * Retry policy for one attachment export build. A retry rebuilds the archive from the first file, up to
+ * 5 GB of reads and writes, so it gets one second chance (a stalled job after a pod restart, a storage
+ * blip) and no more; the export then fails and the user starts a new one.
+ */
+export const ATTACHMENT_EXPORT_JOB_OPTIONS = Object.freeze({
+  attempts: 2,
+  backoff: Object.freeze({
+    type: "fixed",
+    delay: 30_000,
+  } as const),
+}) satisfies JobsOptions;
 
 const JOBS_DEFAULT_BACKOFF = Object.freeze({
   type: "exponential",

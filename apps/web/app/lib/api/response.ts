@@ -18,7 +18,9 @@ interface ApiErrorResponse {
     | "forbidden"
     | "too_many_requests"
     | "conflict"
-    | "payload_too_large";
+    | "payload_too_large"
+    | "service_unavailable"
+    | "workspace_survey_limit_reached";
   message: string;
   details: {
     [key: string]: string | string[] | number | number[] | boolean | boolean[];
@@ -239,6 +241,16 @@ const successResponse = (data: Object, cors: boolean = false, cache: string = "p
   );
 };
 
+/** 204 with no body, for endpoints that tell the caller nothing (the creative events beacon). */
+const noContentResponse = (cors: boolean = false, cache: string = "private, no-store") =>
+  new Response(null, {
+    status: 204,
+    headers: {
+      ...(cors && corsHeaders),
+      "Cache-Control": cache,
+    },
+  });
+
 const internalServerErrorResponse = (
   message: string,
   cors: boolean = false,
@@ -287,6 +299,17 @@ const conflictResponse = (
   );
 };
 
+/** ENG-3282: the workspace already holds its maximum number of surveys. */
+const workspaceSurveyLimitResponse = (limit: number, count: number, cache: string = "private, no-store") =>
+  Response.json(
+    {
+      code: "workspace_survey_limit_reached",
+      message: "This workspace has reached its survey limit",
+      details: { count, limit },
+    } as ApiErrorResponse,
+    { status: 422, headers: { "Cache-Control": cache } }
+  );
+
 const tooManyRequestsResponse = (
   message: string,
   cors: boolean = false,
@@ -310,6 +333,23 @@ const tooManyRequestsResponse = (
   );
 };
 
+/** The server cannot take the request right now; `retryAfterSeconds` tells the caller when to try again. */
+const serviceUnavailableResponse = (message: string, retryAfterSeconds?: number) =>
+  Response.json(
+    {
+      code: "service_unavailable",
+      message,
+      details: {},
+    } as ApiErrorResponse,
+    {
+      status: 503,
+      headers: {
+        "Cache-Control": "private, no-store",
+        ...(retryAfterSeconds === undefined ? {} : { "Retry-After": String(retryAfterSeconds) }),
+      },
+    }
+  );
+
 export const responses = {
   goneResponse,
   badRequestResponse,
@@ -319,8 +359,11 @@ export const responses = {
   unauthorizedResponse,
   notFoundResponse,
   successResponse,
+  noContentResponse,
   payloadTooLargeResponse,
   tooManyRequestsResponse,
+  serviceUnavailableResponse,
   forbiddenResponse,
   conflictResponse,
+  workspaceSurveyLimitResponse,
 };

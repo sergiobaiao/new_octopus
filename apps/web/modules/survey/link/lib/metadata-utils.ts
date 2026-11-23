@@ -1,4 +1,5 @@
 import { Metadata } from "next";
+import { resolveSurveyLanguage } from "@formbricks/i18n-utils/survey-language-match";
 import { TSurveyStyling } from "@formbricks/types/surveys/types";
 import { getTextContent } from "@formbricks/types/surveys/validation";
 import { TWorkspaceStyling } from "@formbricks/types/workspace";
@@ -10,7 +11,14 @@ import { recallToHeadline } from "@/lib/utils/recall";
 import { getSurvey } from "@/modules/survey/lib/survey";
 
 type TBasicSurveyMetadata = {
+  /** Bare title for `metadata.title`. The root layout's `title.template` adds the brand suffix. */
   title: string;
+  /**
+   * Title for social previews (og:title / twitter:title and the OG image). These are not run through
+   * `title.template`, so on Cloud this carries the " | Formbricks" suffix itself, unless the author set
+   * a custom link-metadata title.
+   */
+  ogTitle: string;
   description: string;
   survey: Awaited<ReturnType<typeof getSurvey>> | null;
   ogImage?: string;
@@ -26,11 +34,14 @@ export const getBrandColorForURL = (value: string) => encodeURIComponent(value);
  * @param surveyId - Survey identifier
  * @param languageCode - Language code for localization (default: "default")
  * @param survey - Optional survey data if already available (e.g., from generateMetadata)
+ * @param acceptedLanguages - The respondent's Accept-Language tags, so the title and description follow
+ *   the same browser-selected language as the survey itself
  */
 export const getBasicSurveyMetadata = async (
   surveyId: string,
   languageCode = "default",
-  survey?: Awaited<ReturnType<typeof getSurvey>> | null
+  survey?: Awaited<ReturnType<typeof getSurvey>> | null,
+  acceptedLanguages: string[] = []
 ): Promise<TBasicSurveyMetadata> => {
   const surveyData = survey ?? (await getSurvey(surveyId));
 
@@ -38,6 +49,7 @@ export const getBasicSurveyMetadata = async (
   if (!surveyData) {
     return {
       title: "Survey",
+      ogTitle: "Survey",
       description: "Please complete this survey.",
       survey: null,
       ogImage: undefined,
@@ -47,21 +59,16 @@ export const getBasicSurveyMetadata = async (
   const metadata = surveyData.metadata;
   const welcomeCard = surveyData.welcomeCard;
 
-  // Resolve the language code, accepting either the language code or its alias (case-insensitive).
-  const selectedLanguage =
-    languageCode === "default"
-      ? undefined
-      : surveyData.languages.find(
-          (lang) =>
-            lang.language.code.toLowerCase() === languageCode.toLowerCase() ||
-            lang.language.alias?.toLowerCase() === languageCode.toLowerCase()
-        );
-
-  // Determine language code to use for metadata
+  // The same resolver the survey renderer uses, so the metadata always names the language the survey
+  // opens in: `?lang=` first, then the browser languages when the survey opted in, then the default.
   const langCode =
-    !selectedLanguage || selectedLanguage.default || !selectedLanguage.enabled
-      ? "default"
-      : selectedLanguage.language.code;
+    resolveSurveyLanguage({
+      languages: surveyData.languages,
+      explicitLanguage: languageCode === "default" ? undefined : languageCode,
+      browserLanguages: acceptedLanguages,
+      autoSelectLanguage: surveyData.autoSelectLanguage,
+      unmatchedExplicitLanguage: "fallback",
+    }) ?? "default";
 
   // Set title - priority: custom link metadata > welcome card > survey name
   const titleFromMetadata = metadata?.title ? getLocalizedValue(metadata.title, langCode) || "" : undefined;
@@ -71,7 +78,7 @@ export const getBasicSurveyMetadata = async (
           getLocalizedValue(recallToHeadline(welcomeCard.headline, surveyData, false, langCode), langCode)
         ) || ""
       : undefined;
-  let title = titleFromMetadata || titleFromWelcome || surveyData.name;
+  const title = titleFromMetadata || titleFromWelcome || surveyData.name;
 
   // Set description - priority: custom link metadata > default
   const descriptionFromMetadata = metadata?.description
@@ -82,14 +89,13 @@ export const getBasicSurveyMetadata = async (
   // Get OG image from link metadata if available
   const ogImage = metadata?.ogImage;
 
-  if (!titleFromMetadata) {
-    if (IS_FORMBRICKS_CLOUD) {
-      title = `${title} | Formbricks`;
-    }
-  }
+  // Only the social-preview title is branded here: `<title>` already gets " | Formbricks" from the
+  // root layout's template, so suffixing `title` too rendered it twice on Cloud.
+  const ogTitle = !titleFromMetadata && IS_FORMBRICKS_CLOUD ? `${title} | Formbricks` : title;
 
   return {
     title,
+    ogTitle,
     description,
     survey: surveyData,
     ogImage,

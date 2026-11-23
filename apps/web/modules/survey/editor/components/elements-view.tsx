@@ -11,29 +11,26 @@ import {
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
 import { createId } from "@paralleldrive/cuid2";
-import React, { SetStateAction, useEffect, useMemo } from "react";
+import React, { SetStateAction, useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
-import { Workspace } from "@formbricks/database/prisma-browser";
 import { TI18nString } from "@formbricks/types/i18n";
 import { TSurveyQuota } from "@formbricks/types/quota";
-import { TSurveyBlock, TSurveyBlockLogic, TSurveyBlockLogicAction } from "@formbricks/types/surveys/blocks";
+import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement } from "@formbricks/types/surveys/elements";
-import { type TConditionGroup, type TSingleCondition } from "@formbricks/types/surveys/logic";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
 import { getDefaultEndingCard } from "@/app/lib/survey-builder";
 import { addMultiLanguageLabels, createI18nString, extractLanguageCodes } from "@/lib/i18n/utils";
 import { structuredClone } from "@/lib/pollyfills/structuredClone";
-import { isConditionGroup } from "@/lib/surveyLogic/utils";
 import { checkForEmptyFallBackValue } from "@/lib/utils/recall";
+import { type TWorkspaceWithoutCustomCss } from "@/modules/custom-css/lib/types";
 import { AddElementButton } from "@/modules/survey/editor/components/add-element-button";
 import { AddEndingCardButton } from "@/modules/survey/editor/components/add-ending-card-button";
 import { BlocksDroppable } from "@/modules/survey/editor/components/blocks-droppable";
 import { EditEndingCard } from "@/modules/survey/editor/components/edit-ending-card";
 import { EditWelcomeCard } from "@/modules/survey/editor/components/edit-welcome-card";
-import { HiddenFieldsCard } from "@/modules/survey/editor/components/hidden-fields-card";
-import { SurveyVariablesCard } from "@/modules/survey/editor/components/survey-variables-card";
+import { EmbeddedDataCard } from "@/modules/survey/editor/components/embedded-data-card";
 import {
   addElementToBlock,
   deleteBlock,
@@ -45,16 +42,21 @@ import {
   moveElementInBlock,
   renumberAutoNamedBlocks,
   updateElementInBlock,
+  withFilledCodes,
 } from "@/modules/survey/editor/lib/blocks";
+import { describeDeletionWarning } from "@/modules/survey/editor/lib/deletion-warning";
 import {
+  type TUseKind,
   findBlockUsedInLogic,
-  findElementUsedInLogic,
+  findElementUse,
   isUsedInQuota,
   isUsedInRecall,
   scrollElementCardIntoView,
 } from "@/modules/survey/editor/lib/utils";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import { Alert, AlertButton, AlertDescription, AlertTitle } from "@/modules/ui/components/alert";
 import { ConfirmationModal } from "@/modules/ui/components/confirmation-modal";
+import { useStableCallback } from "@/modules/ui/hooks/use-stable-callback";
 import {
   isBlockLogicItemValid,
   isEndingCardValid,
@@ -62,12 +64,18 @@ import {
   validateElement,
 } from "../lib/validation";
 
+// Module-level so the sensor descriptor keeps its identity: a fresh options object per render gives
+// DndContext new activators, which re-renders every useSortable consumer (each BlockCard) on every edit.
+const POINTER_SENSOR_OPTIONS = { activationConstraint: { distance: 5 } };
+
 interface ElementsViewProps {
   localSurvey: TSurvey;
   setLocalSurvey: React.Dispatch<SetStateAction<TSurvey>>;
+  /** The survey as stored. The Embedded Data card reads it for promote and for the name guard. */
+  persistedSurvey: TSurvey;
   activeElementId: string | null;
   setActiveElementId: (elementId: string | null) => void;
-  workspace: Workspace;
+  workspace: TWorkspaceWithoutCustomCss;
   invalidElements: string[] | null;
   setInvalidElements: React.Dispatch<SetStateAction<string[] | null>>;
   selectedLanguageCode: string;
@@ -75,10 +83,12 @@ interface ElementsViewProps {
   isCxMode: boolean;
   locale: TUserLocale;
   responseCount: number;
-  setIsCautionDialogOpen: (open: boolean) => void;
   isStorageConfigured: boolean;
   quotas: TSurveyQuota[];
   isExternalUrlsAllowed: boolean;
+  /** The one-time "Logic has moved" notice (ENG-6929), until the Flow tab has been opened once. */
+  showLogicMovedNotice?: boolean;
+  onOpenFlow?: () => void;
 }
 
 export const ElementsView = ({
@@ -86,6 +96,7 @@ export const ElementsView = ({
   setActiveElementId,
   localSurvey,
   setLocalSurvey,
+  persistedSurvey,
   workspace,
   invalidElements,
   setInvalidElements,
@@ -94,22 +105,26 @@ export const ElementsView = ({
   isCxMode,
   locale,
   responseCount,
-  setIsCautionDialogOpen,
   isStorageConfigured = true,
   quotas,
   isExternalUrlsAllowed,
-}: ElementsViewProps) => {
+  showLogicMovedNotice = false,
+  onOpenFlow,
+}: Readonly<ElementsViewProps>) => {
   const { t } = useTranslation();
   const [logicDeletionWarning, setLogicDeletionWarning] = React.useState<{
     open: boolean;
     elementIdx: number;
     type: "element" | "block";
     blockId?: string;
+    /** What uses the question: a rule (the default), a show-if, or another question's copied options. */
+    useKind?: TUseKind;
   }>({
     open: false,
     elementIdx: 0,
     type: "element",
   });
+  const deletionWarning = describeDeletionWarning(logicDeletionWarning.useKind, t);
 
   const elements = useMemo(() => getElementsFromBlocks(localSurvey.blocks), [localSurvey.blocks]);
 
@@ -122,91 +137,6 @@ export const ElementsView = ({
 
   const surveyLanguages = localSurvey.languages;
 
-  const handleElementLogicChange = (survey: TSurvey, compareId: string, updatedId: string): TSurvey => {
-    const updateConditions = (conditions: TConditionGroup): TConditionGroup => {
-      return {
-        ...conditions,
-        conditions: conditions?.conditions.map((condition) => {
-          if (isConditionGroup(condition)) {
-            return updateConditions(condition);
-          } else {
-            return updateSingleCondition(condition);
-          }
-        }),
-      };
-    };
-
-    const updateSingleCondition = (condition: TSingleCondition): TSingleCondition => {
-      let updatedCondition = { ...condition };
-
-      if (condition.leftOperand.value === compareId) {
-        updatedCondition.leftOperand = { ...condition.leftOperand, value: updatedId };
-      }
-
-      if (condition.rightOperand?.type === "element" && condition.rightOperand?.value === compareId) {
-        updatedCondition.rightOperand = { ...condition.rightOperand, value: updatedId };
-      }
-
-      return updatedCondition;
-    };
-
-    const updateActions = (actions: TSurveyBlockLogicAction[]): TSurveyBlockLogicAction[] => {
-      return actions.map((action) => {
-        let updatedAction = { ...action };
-
-        // Handle jumpToBlock actions (blocks model)
-        if (updatedAction.objective === "jumpToBlock" && updatedAction.target === compareId) {
-          updatedAction.target = updatedId;
-        }
-
-        if (updatedAction.objective === "requireAnswer" && updatedAction.target === compareId) {
-          updatedAction.target = updatedId;
-        }
-
-        return updatedAction;
-      });
-    };
-
-    const updatedBlocks = survey.blocks.map((block) => {
-      const updatedElements = block.elements.map((element) => {
-        let updatedElement = { ...element };
-
-        if (element.headline[selectedLanguageCode]?.includes(`recall:${compareId}`)) {
-          updatedElement.headline = {
-            ...element.headline,
-            [selectedLanguageCode]: element.headline[selectedLanguageCode].replaceAll(
-              `recall:${compareId}`,
-              `recall:${updatedId}`
-            ),
-          };
-        }
-
-        return updatedElement;
-      });
-
-      // Update block-level logic
-      let updatedLogic = block.logic;
-      if (block.logic) {
-        updatedLogic = block.logic.map((logicRule: TSurveyBlockLogic) => ({
-          ...logicRule,
-          conditions: updateConditions(logicRule.conditions),
-          actions: updateActions(logicRule.actions),
-        }));
-      }
-
-      return {
-        ...block,
-        elements: updatedElements,
-        logic: updatedLogic,
-      };
-    });
-
-    return {
-      ...survey,
-      blocks: updatedBlocks,
-    };
-  };
-
   const updateElement = (elementIdx: number, updatedAttributes: any) => {
     // Get element ID from current elements array (for validation)
     const element = elements[elementIdx];
@@ -214,9 +144,6 @@ export const ElementsView = ({
 
     // Store element ID for use in functional updater
     const elementId = element.id;
-
-    // Track side effects that need to happen after state update
-    let newActiveElementId: string | null = null;
 
     // Use functional update to ensure we work with the latest state
     setLocalSurvey((prevSurvey) => {
@@ -257,19 +184,6 @@ export const ElementsView = ({
         updatedSurvey = { ...updatedSurvey, blocks };
       }
 
-      // Handle element ID changes
-      if ("id" in elementLevelAttributes) {
-        const initialElementId = elementId;
-        updatedSurvey = handleElementLogicChange(updatedSurvey, initialElementId, elementLevelAttributes.id);
-
-        // Track new active element ID
-        newActiveElementId = elementLevelAttributes.id;
-
-        // Update internal element ID map
-        internalElementIdMap[elementLevelAttributes.id] = internalElementIdMap[elementId];
-        delete internalElementIdMap[elementId];
-      }
-
       // Update element-level attributes if any
       if (Object.keys(elementLevelAttributes).length > 0) {
         const attributesToCheck = ["upperLabel", "lowerLabel"];
@@ -300,39 +214,6 @@ export const ElementsView = ({
       }
 
       return updatedSurvey;
-    });
-
-    // Apply side effects after state update is queued
-    if (newActiveElementId) {
-      setActiveElementId(newActiveElementId);
-    }
-  };
-
-  // Update block logic (block-level property)
-  const updateBlockLogic = (blockIdx: number, logic: TSurveyBlockLogic[]) => {
-    if (blockIdx < 0 || blockIdx >= localSurvey.blocks.length) return;
-
-    setLocalSurvey((prevSurvey) => {
-      const blocks = [...(prevSurvey.blocks ?? [])];
-      blocks[blockIdx] = {
-        ...blocks[blockIdx],
-        logic,
-      };
-      return { ...prevSurvey, blocks };
-    });
-  };
-
-  // Update block logic fallback (block-level property)
-  const updateBlockLogicFallback = (blockIdx: number, logicFallback: string | undefined) => {
-    if (blockIdx < 0 || blockIdx >= localSurvey.blocks.length) return;
-
-    setLocalSurvey((prevSurvey) => {
-      const blocks = [...(prevSurvey.blocks ?? [])];
-      blocks[blockIdx] = {
-        ...blocks[blockIdx],
-        logicFallback,
-      };
-      return { ...prevSurvey, blocks };
     });
   };
 
@@ -460,9 +341,9 @@ export const ElementsView = ({
       return;
     }
 
-    const usedElementIdx = findElementUsedInLogic(localSurvey, elementId);
-    if (usedElementIdx !== -1) {
-      setLogicDeletionWarning({ open: true, elementIdx, type: "element" });
+    const use = findElementUse(localSurvey, elementId);
+    if (use) {
+      setLogicDeletionWarning({ open: true, elementIdx, type: "element", useKind: use.kind });
       return;
     }
 
@@ -478,7 +359,9 @@ export const ElementsView = ({
 
     // Create a duplicate of the element with a new ID
     const newElementId = createId();
-    const duplicatedElement = { ...element, id: newElementId };
+    // The copy drops the question code so it takes the next unused one (answer codes stay).
+    const { code: _code, ...elementWithoutCode } = element as TSurveyElement & { code?: string };
+    const duplicatedElement = { ...elementWithoutCode, id: newElementId } as TSurveyElement;
 
     // Add the duplicated element to the same block
     const result = addElementToBlock(localSurvey, blockId, duplicatedElement);
@@ -511,10 +394,10 @@ export const ElementsView = ({
         backButtonLabel: createI18nString("", []),
       };
 
-      return {
+      return withFilledCodes({
         ...prevSurvey,
         blocks: [...prevSurvey.blocks, newBlock],
-      };
+      });
     });
 
     setActiveElementId(element.id);
@@ -823,13 +706,7 @@ export const ElementsView = ({
     }
   }, [activeElementId, setActiveElementId, localSurvey, selectedLanguageCode, t]);
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: {
-        distance: 5,
-      },
-    })
-  );
+  const sensors = useSensors(useSensor(PointerSensor, POINTER_SENSOR_OPTIONS));
 
   const onBlockCardDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
@@ -865,8 +742,31 @@ export const ElementsView = ({
   // Auto animate
   const [parent] = useAutoAnimate();
 
+  // BlockCard is memoized, so everything handed to it must keep its identity across renders. These
+  // wrappers always run the handler from the latest render, i.e. against the current localSurvey.
+  const [lastInteractedBlockId, setLastInteractedBlockId] = useState<string | null>(null);
+  const stableMoveElement = useStableCallback(moveElement);
+  const stableUpdateElement = useStableCallback(updateElement);
+  const stableUpdateBlockName = useStableCallback(updateBlockName);
+  const stableUpdateBlockButtonLabel = useStableCallback(updateBlockButtonLabel);
+  const stableDuplicateElement = useStableCallback(duplicateElement);
+  const stableDeleteElement = useStableCallback(deleteElement);
+  const stableAddElement = useStableCallback(addElement);
+  const stableDuplicateBlock = useStableCallback(duplicateBlock);
+  const stableDeleteBlock = useStableCallback(deleteBlockById);
+  const stableMoveBlock = useStableCallback(moveBlockById);
+  const stableAddElementToBlock = useStableCallback(_addElementToBlock);
+  const stableMoveElementToBlock = useStableCallback(moveElementToBlock);
+
   return (
     <div className="mt-12 w-full px-5 py-4">
+      {showLogicMovedNotice && onOpenFlow && (
+        <Alert variant="info" className="mb-5" role="note">
+          <AlertTitle>{t("workspace.surveys.edit.flow.logic_moved_title")}</AlertTitle>
+          <AlertDescription>{t("workspace.surveys.edit.flow.logic_moved_description")}</AlertDescription>
+          <AlertButton onClick={onOpenFlow}>{t("workspace.surveys.edit.flow.open_flow")}</AlertButton>
+        </Alert>
+      )}
       {!isCxMode && (
         <div className="mb-5 flex w-full flex-col gap-5">
           <EditWelcomeCard
@@ -889,32 +789,31 @@ export const ElementsView = ({
         collisionDetection={closestCorners}>
         <BlocksDroppable
           localSurvey={localSurvey}
+          persistedSurvey={persistedSurvey}
           setLocalSurvey={setLocalSurvey}
           workspace={workspace}
-          moveElement={moveElement}
-          updateElement={updateElement}
-          updateBlockLogic={updateBlockLogic}
-          updateBlockLogicFallback={updateBlockLogicFallback}
-          updateBlockName={updateBlockName}
-          updateBlockButtonLabel={updateBlockButtonLabel}
-          duplicateElement={duplicateElement}
-          deleteElement={deleteElement}
+          moveElement={stableMoveElement}
+          updateElement={stableUpdateElement}
+          updateBlockName={stableUpdateBlockName}
+          updateBlockButtonLabel={stableUpdateBlockButtonLabel}
+          duplicateElement={stableDuplicateElement}
+          deleteElement={stableDeleteElement}
           activeElementId={activeElementId}
           setActiveElementId={setActiveElementId}
           invalidElements={invalidElements}
-          addElement={addElement}
+          addElement={stableAddElement}
           isFormbricksCloud={isFormbricksCloud}
           isCxMode={isCxMode}
           locale={locale}
-          responseCount={responseCount}
-          onAlertTrigger={() => setIsCautionDialogOpen(true)}
           isStorageConfigured={isStorageConfigured}
           isExternalUrlsAllowed={isExternalUrlsAllowed}
-          duplicateBlock={duplicateBlock}
-          deleteBlock={deleteBlockById}
-          moveBlock={moveBlockById}
-          addElementToBlock={_addElementToBlock}
-          moveElementToBlock={moveElementToBlock}
+          duplicateBlock={stableDuplicateBlock}
+          deleteBlock={stableDeleteBlock}
+          moveBlock={stableMoveBlock}
+          addElementToBlock={stableAddElementToBlock}
+          moveElementToBlock={stableMoveElementToBlock}
+          lastInteractedBlockId={lastInteractedBlockId}
+          onBlockInteract={setLastInteractedBlockId}
         />
       </DndContext>
 
@@ -953,19 +852,16 @@ export const ElementsView = ({
           <>
             <AddEndingCardButton localSurvey={localSurvey} addEndingCard={addEndingCard} />
             <hr />
-            <HiddenFieldsCard
+            <EmbeddedDataCard
               localSurvey={localSurvey}
               setLocalSurvey={setLocalSurvey}
-              setActiveElementId={setActiveElementId}
-              activeElementId={activeElementId}
-              quotas={quotas}
-            />
-            <SurveyVariablesCard
-              localSurvey={localSurvey}
-              setLocalSurvey={setLocalSurvey}
+              persistedSurvey={persistedSurvey}
               activeElementId={activeElementId}
               setActiveElementId={setActiveElementId}
               quotas={quotas}
+              responseCount={responseCount}
+              workspaceId={workspace.id}
+              locale={locale}
             />
           </>
         )}
@@ -974,8 +870,8 @@ export const ElementsView = ({
       <ConfirmationModal
         open={logicDeletionWarning.open}
         setOpen={(open) => setLogicDeletionWarning((prev) => ({ ...prev, open: open as boolean }))}
-        title={t("workspace.surveys.edit.question_used_in_logic_warning_title")}
-        body={t("workspace.surveys.edit.question_used_in_logic_warning_text")}
+        title={deletionWarning.title}
+        body={deletionWarning.body}
         buttonText={t("workspace.surveys.edit.delete_anyways")}
         onConfirm={() => {
           if (logicDeletionWarning.type === "element") {

@@ -7,7 +7,6 @@ import {
   getIngestedEmbeddedFields,
 } from "@formbricks/types/embedded-data-resolver";
 import { TResponseWithQuotas } from "@formbricks/types/responses";
-import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/constants";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { getTextContent } from "@formbricks/types/surveys/validation";
 import { TUserLocale } from "@formbricks/types/user";
@@ -17,7 +16,9 @@ import { getSurveyDateFormatMap } from "@/lib/utils/date-display";
 import { parseRecallInfo } from "@/lib/utils/recall";
 import { ResponseCardQuotas } from "@/modules/ee/quotas/components/single-response-card-quotas";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
-import { isValidValue, splitRecallHighlights } from "../util";
+import { IdBadge } from "@/modules/ui/components/id-badge";
+import { type TResponseCardRow } from "../lib/card-rows";
+import { splitRecallHighlights } from "../util";
 import { ElementSkip } from "./ElementSkip";
 import { HiddenFields } from "./HiddenFields";
 import { RenderResponse } from "./RenderResponse";
@@ -27,19 +28,20 @@ import { VerifiedEmail } from "./VerifiedEmail";
 interface SingleResponseCardBodyProps {
   survey: TSurvey;
   response: TResponseWithQuotas;
-  skippedQuestions: string[][];
+  /** One per element of the survey, from `getResponseCardRows`. */
+  rows: TResponseCardRow[];
   locale: TUserLocale;
 }
 
 export const SingleResponseCardBody = ({
   survey,
   response,
-  skippedQuestions,
+  rows,
   locale,
 }: Readonly<SingleResponseCardBodyProps>) => {
   const elements = getElementsFromBlocks(survey.blocks);
   // ENG-1837: both blocks below render the survey's Embedded Data definitions, resolved through the
-  // tables with the legacy columns as fallback.
+  // tables — the only place they are stored since ENG-2404.
   const computedFields = getComputedEmbeddedFields(survey);
   const ingestedFields = getIngestedEmbeddedFields(survey);
   const dateFormats = getSurveyDateFormatMap(elements);
@@ -85,31 +87,15 @@ export const SingleResponseCardBody = ({
         {survey.isVerifyEmailEnabled && response.data["verifiedEmail"] && (
           <VerifiedEmail responseData={response.data} />
         )}
-        {elements.map((question) => {
-          // Skip CTA elements without external buttons only if they have no response data
-          // This preserves historical data from when buttonExternal was true
-          if (
-            question.type === TSurveyElementTypeEnum.CTA &&
-            !question.buttonExternal &&
-            !response.data[question.id]
-          ) {
-            return null;
-          }
-
-          const skipped = skippedQuestions.find((skippedQuestionElement) =>
-            skippedQuestionElement.includes(question.id)
-          );
-
-          // If found, remove it from the list
-          if (skipped) {
-            skippedQuestions = skippedQuestions.filter((item) => item !== skipped);
-          }
+        {elements.map((question, index) => {
+          const row = rows[index];
+          if (!row || row.type === "none") return null;
 
           return (
             <div key={`${question.id}`}>
-              {isValidValue(response.data[question.id]) ? (
+              {row.type === "answer" ? (
                 <div>
-                  <p className="mb-1 text-sm font-semibold text-slate-600">
+                  <p className="mb-1 flex items-center gap-2 text-sm font-semibold text-slate-600">
                     {formatTextWithSlashes(
                       getTextContent(
                         parseRecallInfo(
@@ -122,6 +108,7 @@ export const SingleResponseCardBody = ({
                         )
                       )
                     )}
+                    {question.type !== "cta" && question.code && <IdBadge id={question.code} />}
                   </p>
                   <div dir="auto">
                     <RenderResponse
@@ -131,23 +118,19 @@ export const SingleResponseCardBody = ({
                       language={response.language}
                       locale={locale}
                       showId={true}
+                      signatureVariant="full"
+                      responseId={response.id}
                     />
                   </div>
                 </div>
               ) : (
                 <ElementSkip
-                  skippedElements={skipped}
+                  skippedElements={row.elementIds}
                   elements={elements}
                   recallValues={recallValues}
                   variables={response.variables}
                   locale={locale}
-                  status={
-                    response.finished ||
-                    (skippedQuestions.length > 0 &&
-                      !skippedQuestions[skippedQuestions.length - 1].includes(question.id))
-                      ? "skipped"
-                      : "aborted"
-                  }
+                  status={row.type}
                 />
               )}
             </div>
@@ -166,7 +149,7 @@ export const SingleResponseCardBody = ({
         <div className="mt-4 flex items-center">
           <CheckCircle2Icon className="size-6 text-slate-400" />
           <p className="mx-2 rounded-lg bg-slate-100 px-2 text-sm font-medium text-slate-700">
-            {t("common.completed")}
+            {t("workspace.surveys.responses.response_complete")}
           </p>
         </div>
       )}

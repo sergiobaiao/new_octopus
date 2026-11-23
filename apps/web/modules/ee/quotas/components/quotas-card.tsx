@@ -10,7 +10,7 @@ import { useTranslation } from "react-i18next";
 import { TSurveyQuota, TSurveyQuotaInput } from "@formbricks/types/quota";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { useWorkspace } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import {
   createQuotaAction,
   deleteQuotaAction,
@@ -24,12 +24,12 @@ import { QuotaList } from "./quota-list";
 import { QuotaModal } from "./quota-modal";
 
 interface QuotasCardProps {
-  localSurvey: TSurvey;
-  isQuotasAllowed: boolean;
-  isFormbricksCloud?: boolean;
-  quotas: TSurveyQuota[];
-  hasResponses: boolean;
-  enterpriseLicenseRequestFormUrl: string;
+  readonly localSurvey: TSurvey;
+  readonly isQuotasAllowed: boolean;
+  readonly isFormbricksCloud?: boolean;
+  readonly quotas: TSurveyQuota[];
+  readonly hasResponses: boolean;
+  readonly enterpriseLicenseRequestFormUrl: string;
 }
 
 const AddQuotaButton = ({
@@ -39,11 +39,11 @@ const AddQuotaButton = ({
   hasResponses,
   setOpenCreateQuotaConfirmationModal,
 }: {
-  setIsQuotaModalOpen: (open: boolean) => void;
-  setActiveQuota: (quota: TSurveyQuota | null) => void;
-  t: TFunction;
-  hasResponses: boolean;
-  setOpenCreateQuotaConfirmationModal: (open: boolean) => void;
+  readonly setIsQuotaModalOpen: (open: boolean) => void;
+  readonly setActiveQuota: (quota: TSurveyQuota | null) => void;
+  readonly t: TFunction;
+  readonly hasResponses: boolean;
+  readonly setOpenCreateQuotaConfirmationModal: (open: boolean) => void;
 }) => {
   return (
     <Button
@@ -149,7 +149,7 @@ export const QuotasCard = ({
           asChild
           className="h-full w-full cursor-pointer rounded-lg hover:bg-slate-50"
           id="quotasCardTrigger">
-          <div className="inline-flex px-4 py-4">
+          <button type="button" className="inline-flex px-4 py-4 text-left">
             <div className="flex items-center pr-5 pl-2">
               <CheckIcon
                 strokeWidth={3}
@@ -161,7 +161,7 @@ export const QuotasCard = ({
               <p className="font-semibold text-slate-800">{t("common.quotas")}</p>
               <p className="mt-1 text-sm text-slate-500">{t("common.quotas_description")}</p>
             </div>
-          </div>
+          </button>
         </Collapsible.Trigger>
 
         <Collapsible.Content className="flex flex-col overflow-hidden data-[state=closed]:animate-collapsible-up data-[state=open]:animate-collapsible-down">

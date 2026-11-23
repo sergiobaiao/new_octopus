@@ -70,6 +70,38 @@ describe("validateElementResponse", () => {
       expect(result.errors).toHaveLength(0);
     });
 
+    describe("Signature element", () => {
+      const signatureElement = (required: boolean) =>
+        ({
+          id: "sig1",
+          type: TSurveyElementTypeEnum.Signature,
+          headline: { default: "Sign here" },
+          required,
+          allowTypedSignature: true,
+        }) as unknown as TSurveyElement;
+      const signatureUrl = "/storage/ws1/private/surveys/survey1/elements/sig1/signature--fid--abc.png";
+
+      test.each([
+        ["an empty string", ""],
+        ["undefined", undefined],
+      ])("should block a required Signature left as %s with the required error", (_label, value) => {
+        const result = validateElementResponse(signatureElement(true), value as never, "en");
+
+        expect(result.valid).toBe(false);
+        expect(result.errors).toHaveLength(1);
+        expect(result.errors[0].ruleId).toBe("required");
+      });
+
+      test("should accept a required Signature that holds a stored URL", () => {
+        expect(validateElementResponse(signatureElement(true), signatureUrl, "en").valid).toBe(true);
+      });
+
+      test("should let an optional Signature be skipped", () => {
+        expect(validateElementResponse(signatureElement(false), "", "en").valid).toBe(true);
+        expect(validateElementResponse(signatureElement(false), undefined as never, "en").valid).toBe(true);
+      });
+    });
+
     test("should return valid when field is not required", () => {
       const element: TSurveyElement = {
         id: "text1",
@@ -289,6 +321,44 @@ describe("validateElementResponse", () => {
       expect(result.errors[0].ruleId).toBe("invalidOption");
     });
 
+    test("should accept the rendered default label when the default language's code key holds a stale value (ENG-4103)", () => {
+      // The renderer shows `default` but reports the response language as the default's real code,
+      // whose key here carries an older label respondents never see.
+      const element = {
+        id: "single1",
+        type: TSurveyElementTypeEnum.MultipleChoiceSingle,
+        headline: { default: "Tier" },
+        required: true,
+        choices: [
+          { id: "gold", label: { default: "Gold (200만원)", "ko-KR": "Gold | 2,000,000 KRW" } },
+          { id: "silver", label: { default: "Silver (100만원)", "ko-KR": "Silver | 1,000,000 KRW" } },
+        ],
+      } as unknown as TSurveyElement;
+
+      expect(validateElementResponse(element, "Gold (200만원)", "ko-KR").valid).toBe(true);
+      expect(validateElementResponse(element, "Silver | 1,000,000 KRW", "ko-KR").valid).toBe(true);
+
+      const injected = validateElementResponse(element, "Platinum", "ko-KR");
+      expect(injected.valid).toBe(false);
+      expect(injected.errors[0].ruleId).toBe("invalidOption");
+    });
+
+    test("should accept a multi-select label stored under another language than the response's (ENG-4103)", () => {
+      const element = {
+        id: "mc1",
+        type: TSurveyElementTypeEnum.MultipleChoiceMulti,
+        headline: { default: "Pick" },
+        required: true,
+        choices: [
+          { id: "opt1", label: { default: "Option 1", de: "Option eins" } },
+          { id: "opt2", label: { default: "Option 2", de: "Option zwei" } },
+        ],
+      } as unknown as TSurveyElement;
+
+      expect(validateElementResponse(element, ["Option 1", "Option zwei"], "de").valid).toBe(true);
+      expect(validateElementResponse(element, ["Option 1", "Option drei"], "de").valid).toBe(false);
+    });
+
     test("should accept arbitrary free text for a single-select with an Other option", () => {
       const element = {
         id: "single1",
@@ -396,6 +466,43 @@ describe("validateElementResponse", () => {
       const result = validateElementResponse(element, {}, "en");
       expect(result.valid).toBe(false);
       expect(result.errors).toHaveLength(1);
+    });
+  });
+
+  describe("ranking element with an Other option", () => {
+    const buildRanking = (withOther: boolean, required = false): TSurveyElement =>
+      ({
+        id: "rank1",
+        type: TSurveyElementTypeEnum.Ranking,
+        headline: { default: "Rank these" },
+        required,
+        choices: [
+          { id: "opt1", label: { default: "Price" } },
+          { id: "opt2", label: { default: "Speed" } },
+          ...(withOther ? [{ id: "other", label: { default: "Other" } }] : []),
+        ],
+      }) as unknown as TSurveyRankingElement;
+
+    test("rejects a ranked Other whose text is empty", () => {
+      const result = validateElementResponse(buildRanking(true), ["Price", ""], "en");
+      expect(result.valid).toBe(false);
+      expect(result.errors).toHaveLength(1);
+    });
+
+    test("rejects a ranked Other whose text is whitespace only", () => {
+      expect(validateElementResponse(buildRanking(true, true), ["  ", "Speed"], "en").valid).toBe(false);
+    });
+
+    test("accepts a ranked Other with text", () => {
+      expect(validateElementResponse(buildRanking(true), ["Price", "Integrations"], "en").valid).toBe(true);
+    });
+
+    test("accepts a ranking that leaves Other unranked", () => {
+      expect(validateElementResponse(buildRanking(true), ["Speed", "Price"], "en").valid).toBe(true);
+    });
+
+    test("ignores empty entries when the element has no Other option", () => {
+      expect(validateElementResponse(buildRanking(false), ["Price", ""], "en").valid).toBe(true);
     });
   });
 
@@ -722,6 +829,46 @@ describe("validateElementResponse", () => {
         "en"
       );
       expect(result.valid).toBe(false);
+    });
+
+    describe("field label prefix", () => {
+      const buildElement = (firstNamePlaceholder: string): TSurveyElement =>
+        ({
+          id: "contact1",
+          type: TSurveyElementTypeEnum.ContactInfo,
+          headline: { default: "Contact Info" },
+          firstName: { show: true, required: false, placeholder: { default: firstNamePlaceholder } },
+          lastName: { show: true, required: false, placeholder: { default: "Last Name" } },
+          email: { show: false, required: false, placeholder: { default: "Email" } },
+          phone: { show: false, required: false, placeholder: { default: "Phone" } },
+          company: { show: false, required: false, placeholder: { default: "Company" } },
+          required: false,
+          validation: {
+            rules: [{ id: "rule1", type: "minLength", field: "firstName", params: { min: 3 } }],
+          },
+        }) as unknown as TSurveyContactInfoElement;
+
+      const firstMessage = (firstNamePlaceholder: string): string | undefined => {
+        const result = validateElementResponse(buildElement(firstNamePlaceholder), ["Jo", "Doe"], "en");
+        expect(result.valid).toBe(false);
+        return result.errors[0].message;
+      };
+
+      test("should not double the colon when the label already ends with one", () => {
+        expect(firstMessage("Nombre:")).toBe("Nombre: errors.min_length");
+      });
+
+      test("should strip a trailing full-width colon", () => {
+        expect(firstMessage("名前：")).toBe("名前: errors.min_length");
+      });
+
+      test("should keep a single colon for a label without one", () => {
+        expect(firstMessage("First Name")).toBe("First Name: errors.min_length");
+      });
+
+      test("should omit the prefix when the label is only punctuation", () => {
+        expect(firstMessage(":")).toBe("errors.min_length");
+      });
     });
   });
 

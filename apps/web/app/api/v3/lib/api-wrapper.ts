@@ -3,7 +3,18 @@ import { z } from "zod";
 import { logger } from "@formbricks/logger";
 import { TooManyRequestsError } from "@formbricks/types/errors";
 import { authenticateRequest } from "@/app/api/v1/auth";
-import { RequestBodyTooLargeError, parseJsonBodyWithLimit } from "@/app/lib/api/request-body";
+import { reportApiError } from "@/app/lib/api/api-error-reporter";
+import {
+  type ConcurrencyLimiter,
+  type TReleaseSlot,
+  releaseWhenBodySettles,
+} from "@/app/lib/api/concurrency-limiter";
+import {
+  DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+  RequestBodyTooLargeError,
+  parseFormDataWithLimit,
+  readRequestBodyWithLimit,
+} from "@/app/lib/api/request-body";
 import { withAuthorizationSurface } from "@/lib/authorization/context";
 import { getApiKeyFromHeaders } from "@/modules/api/lib/api-key-auth";
 import { getSession } from "@/modules/auth/lib/session";
@@ -11,15 +22,24 @@ import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
 import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
 import type { TRateLimitConfig } from "@/modules/core/rate-limit/types/rate-limit";
 import { TAuditAction, TAuditTarget } from "@/modules/ee/audit-logs/types/audit-log";
+import {
+  arrayBudgetInvalidParam,
+  findArrayBudgetViolation,
+  findRawArrayBudgetViolation,
+} from "./array-budget";
 import { buildV3AuditLog, queueV3AuditLog } from "./audit";
 import { mapV3ThrownError } from "./errors";
+import { BoundedInvalidParams } from "./invalid-params";
 import {
   type InvalidParam,
   isInvalidParamCode,
   problemBadRequest,
+  problemCapacityReached,
+  problemConcurrencyLimitReached,
   problemPayloadTooLarge,
   problemTooManyRequests,
   problemUnauthorized,
+  problemUnsupportedMediaType,
   withBearerChallenge,
 } from "./response";
 import type { TV3AuditLog, TV3Authentication } from "./types";
@@ -30,7 +50,14 @@ type MaybePromise<T> = T | Promise<T>;
 export type TV3AuthMode = "none" | "session" | "apiKey" | "both";
 
 export type TV3Schemas = {
+  /** A JSON body. */
   body?: TV3Schema;
+  /**
+   * A `multipart/form-data` body instead of a JSON one, for a route that takes a file upload. The schema
+   * sees each field by name: a `string` or a `File`, or an array of them when the name repeats. Anything
+   * but `multipart/form-data` is a 415, a body that does not parse or fails the schema a 400.
+   */
+  formData?: TV3Schema;
   query?: TV3Schema;
   params?: TV3Schema;
 };
@@ -56,9 +83,50 @@ export type TWithV3ApiWrapperParams<S extends TV3Schemas | undefined, TProps = u
   schemas?: S;
   rateLimit?: boolean;
   customRateLimitConfig?: TRateLimitConfig;
+  /**
+   * The largest request body this route reads, in bytes. Defaults to `DEFAULT_REQUEST_BODY_LIMIT_BYTES`
+   * (2 MB). Applies to declared and undeclared bodies alike, and is enforced while reading, so a body
+   * sent without a `Content-Length` header is cut off at the limit rather than buffered whole.
+   *
+   * Raise it only for a route that genuinely takes a file-sized body, and keep it below Next's
+   * `proxyClientMaxBodySize` (`next.config.mjs`). The patched Next (`patches/next@16.4.5.patch`) no longer
+   * clones bodies for the proxy, but without the patch Next truncates a longer body before this reader sees
+   * it, so the caller would get a 400 for malformed JSON instead of a 413.
+   */
+  bodyLimitBytes?: number;
+  /**
+   * Caps how many requests to this route one server process handles at once; the next one gets a 503
+   * `capacity_reached` with `Retry-After`. The slot is taken after authentication, rate limiting and
+   * **once the body has been read** within `bodyLimitBytes`: it bounds the work, not the transfer, so a
+   * client trickling its upload never holds one, and a body read meanwhile is capped like any other. It
+   * is held until the response body is fully sent or cancelled, so a streamed response keeps its slot for as
+   * long as it runs, or until the client disconnects. Share one `ConcurrencyLimiter` per route, created at
+   * module scope.
+   *
+   * With `maxPerKey` on the limiter, one caller (session user or API key) can hold only that many slots;
+   * the next of theirs gets a 429 with `Retry-After` instead.
+   *
+   * Rate limiting runs first on purpose, so a rate-limited caller never holds a slot; the price is that
+   * a refusal still spends one rate-limit token.
+   *
+   * `appliesTo` narrows the limit to the requests that are expensive: one that returns false takes no
+   * slot and cannot be refused for lack of one (a cheap pre-flight of the same route, say).
+   */
+  concurrency?: {
+    limiter: ConcurrencyLimiter;
+    retryAfterSeconds: number;
+    appliesTo?: (req: NextRequest) => boolean;
+  };
   action?: TAuditAction;
   targetType?: TAuditTarget;
   handler: (params: TV3HandlerParams<TV3ParsedInput<S>, TProps>) => MaybePromise<Response>;
+};
+
+/** What the input-parsing steps need from the request beyond the request itself. */
+type TV3ParseContext = {
+  requestId: string;
+  instance: string;
+  bodyLimitBytes: number;
 };
 
 function getUnauthenticatedDetail(authMode: TV3AuthMode): string {
@@ -73,21 +141,86 @@ function getUnauthenticatedDetail(authMode: TV3AuthMode): string {
   return "Not authenticated";
 }
 
+/** How many unknown keys a 400 will name before it stops enumerating them. */
+const MAX_REPORTED_UNKNOWN_KEYS = 20;
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function formatZodIssues(error: z.ZodError, fallbackName: "body" | "query" | "params"): InvalidParam[] {
-  return error.issues.map((issue) => {
-    const params = "params" in issue && isPlainObject(issue.params) ? issue.params : {};
-    const code = isInvalidParamCode(params.code) ? params.code : undefined;
+/**
+ * Expand a strict object's single unrecognized-keys issue into one param per offending key.
+ *
+ * Zod reports every unknown key in ONE issue whose path points at the object rather than at any of
+ * the keys, so left as-is a caller is told it sent something unsupported without being told what.
+ * Bounded, because the key list is caller-controlled and both the response and the log line carry it.
+ */
+function expandUnrecognizedKeys(issue: z.core.$ZodIssue, fallbackName: string): InvalidParam[] {
+  const prefix = issue.path.length > 0 ? `${issue.path.join(".")}.` : "";
+  // Read defensively rather than through the `code` narrowing: `error.issues` is typed as the base
+  // `$ZodIssue`, which does not discriminate on `code`, so `issue.keys` is not reachable through it
+  // even though the runtime value carries it.
+  const rawKeys = (issue as { keys?: unknown }).keys;
+  const unknownKeys = Array.isArray(rawKeys) ? rawKeys.map(String) : [];
 
-    return {
-      name: issue.path.length > 0 ? issue.path.join(".") : fallbackName,
-      reason: issue.message,
-      ...(code ? { code } : {}),
-    };
-  });
+  if (unknownKeys.length === 0) {
+    // An empty list would silently drop the issue, leaving a 400 with no `invalid_params` at all.
+    return [{ name: fallbackName, reason: issue.message, code: "unsupported_field" }];
+  }
+
+  const named = unknownKeys.slice(0, MAX_REPORTED_UNKNOWN_KEYS);
+  const params: InvalidParam[] = named.map((key) => ({
+    name: `${prefix}${key}`,
+    reason: `Unsupported field '${key}'`,
+    code: "unsupported_field",
+  }));
+
+  if (unknownKeys.length > named.length) {
+    params.push({
+      name: prefix ? prefix.slice(0, -1) : fallbackName,
+      reason: `${unknownKeys.length - named.length} further unsupported fields were not listed`,
+      code: "unsupported_field",
+    });
+  }
+
+  return params;
+}
+
+/**
+ * Zod issues as `invalid_params`, with the unknown-key expansion the v3 400 contract needs.
+ *
+ * Exported because `POST /api/v3/responses/validate` reports problems *inside* its payload as a 200
+ * body rather than a 400, and those params have to be the ones the real write would have produced —
+ * a second formatter would let the dry run describe the same rejection differently.
+ *
+ * Bounded to `V3_INVALID_PARAMS_MAX` entries plus a summary: the issue list is caller-shaped (one per
+ * offending array element, one per unknown key), so an unbounded list is a response amplifier.
+ */
+export function formatZodIssues(error: z.ZodError, fallbackName: string): InvalidParam[] {
+  const invalidParams = new BoundedInvalidParams();
+
+  for (const issue of error.issues) {
+    if (issue.code === "unrecognized_keys") {
+      // Pushed one by one so the cap counts keys, not issues; the expansion is itself bounded.
+      for (const param of expandUnrecognizedKeys(issue, fallbackName)) {
+        invalidParams.push(() => param);
+      }
+      continue;
+    }
+
+    invalidParams.push(() => {
+      const params = "params" in issue && isPlainObject(issue.params) ? issue.params : {};
+      const code = isInvalidParamCode(params.code) ? params.code : undefined;
+
+      return {
+        name: issue.path.length > 0 ? issue.path.join(".") : fallbackName,
+        reason: issue.message,
+        ...(code ? { code } : {}),
+      };
+    });
+  }
+
+  return invalidParams.report(fallbackName, "request");
 }
 
 type TV3InputParseFailure = {
@@ -171,59 +304,237 @@ async function authenticateV3Request(req: NextRequest, authMode: TV3AuthMode): P
   return null;
 }
 
+function invalidBodyFailure(
+  invalidParams: InvalidParam[],
+  requestId: string,
+  instance: string
+): TV3InputParseFailure {
+  return {
+    ok: false,
+    detail: "Invalid request body",
+    invalidParams,
+    response: problemBadRequest(requestId, "Invalid request body", {
+      instance,
+      invalid_params: invalidParams,
+    }),
+  };
+}
+
+function bodyTooLargeFailure(
+  error: RequestBodyTooLargeError,
+  requestId: string,
+  instance: string
+): TV3InputParseFailure {
+  return {
+    ok: false,
+    detail: error.message,
+    invalidParams: [],
+    response: problemPayloadTooLarge(requestId, error.message, instance),
+  };
+}
+
+/**
+ * The array budget, checked before any schema sees the body: an oversized array would otherwise cost
+ * one Zod issue per element (ENG-3384), and this covers arrays a schema types as `unknown` or
+ * `z.record` too. `readV3JsonBody` already held the raw text to the same budget, so this walk is the
+ * second line: it sees the parsed value, which drops a repeated key's earlier values.
+ */
+function arrayBudgetFailure(
+  bodyData: unknown,
+  requestId: string,
+  instance: string
+): TV3InputParseFailure | null {
+  const violation = findArrayBudgetViolation(bodyData);
+  return violation
+    ? invalidBodyFailure([arrayBudgetInvalidParam(violation, "body")], requestId, instance)
+    : null;
+}
+
+type TV3JsonBodyRead =
+  | { kind: "parsed"; data: unknown }
+  | { kind: "malformed" }
+  | { kind: "refused"; failure: TV3InputParseFailure };
+
+/**
+ * Read the body within the byte limit and hold it to the array budget on its raw text, before
+ * `JSON.parse` builds a single object. Parsing is where a hostile body costs memory — 15.5 MiB of
+ * `[[[…]]]` is ~470 MB of arrays — so on a route that takes bodies that large the budget has to hold
+ * before the parse, not after it (ENG-3653).
+ */
+async function readV3JsonBody(
+  req: Request,
+  { requestId, instance, bodyLimitBytes }: TV3ParseContext
+): Promise<TV3JsonBodyRead> {
+  let text: string;
+  try {
+    text = await readRequestBodyWithLimit(req, bodyLimitBytes);
+  } catch (error) {
+    return error instanceof RequestBodyTooLargeError
+      ? { kind: "refused", failure: bodyTooLargeFailure(error, requestId, instance) }
+      : { kind: "malformed" };
+  }
+
+  const violation = findRawArrayBudgetViolation(text);
+  if (violation) {
+    return {
+      kind: "refused",
+      failure: invalidBodyFailure([arrayBudgetInvalidParam(violation, "body")], requestId, instance),
+    };
+  }
+
+  try {
+    return { kind: "parsed", data: JSON.parse(text) as unknown };
+  } catch {
+    return { kind: "malformed" };
+  }
+}
+
+/** The body step of `parseV3Input`: read within the byte limit, check the array budget, then parse. */
+async function parseV3Body(
+  req: NextRequest,
+  schema: TV3Schema,
+  context: TV3ParseContext
+): Promise<{ ok: true; body: unknown } | TV3InputParseFailure> {
+  const { requestId, instance } = context;
+  const read = await readV3JsonBody(req, context);
+  if (read.kind === "refused") {
+    return read.failure;
+  }
+  if (read.kind === "malformed") {
+    return invalidBodyFailure(
+      [{ name: "body", reason: "Malformed JSON input, please check your request body" }],
+      requestId,
+      instance
+    );
+  }
+
+  const bodyData = read.data;
+  const budgetFailure = arrayBudgetFailure(bodyData, requestId, instance);
+  if (budgetFailure) {
+    return budgetFailure;
+  }
+
+  const bodyResult = schema.safeParse(bodyData);
+  if (!bodyResult.success) {
+    return invalidBodyFailure(formatZodIssues(bodyResult.error, "body"), requestId, instance);
+  }
+
+  return { ok: true, body: bodyResult.data };
+}
+
+/**
+ * The same byte limit and array budget for a route that declares no body schema but hands `req` to a
+ * handler that reads it — the workflows family delegates its bodies to `packages/workflows`, whose
+ * reader buffers the whole body before it measures it and answers 400 rather than 413. The checks run
+ * on a clone so the handler's own stream stays intact; a body that is not JSON is left to the handler,
+ * which owns that error.
+ */
+async function preflightUndeclaredBody(
+  req: NextRequest,
+  context: TV3ParseContext
+): Promise<TV3InputParseFailure | null> {
+  if (req.method === "GET" || req.method === "HEAD" || req.body === null) {
+    return null;
+  }
+
+  const read = await readV3JsonBody(req.clone(), context);
+  if (read.kind === "refused") {
+    return read.failure;
+  }
+  if (read.kind === "malformed") {
+    return null;
+  }
+
+  return arrayBudgetFailure(read.data, context.requestId, context.instance);
+}
+
+const MULTIPART_FORM_DATA = "multipart/form-data";
+
+/** The media type of a `Content-Type` header, without its parameters (the multipart boundary). */
+const mediaTypeOf = (contentType: string | null): string =>
+  (contentType ?? "").split(";")[0].trim().toLowerCase();
+
+/**
+ * The form step of `parseV3Input`, for a route that takes `multipart/form-data`: the media type first
+ * (415), then the body read within the byte limit (413) and parsed (400), then the schema (400).
+ *
+ * The fields reach the schema by name, built with `Object.fromEntries` so a field called `__proto__`
+ * stays an ordinary key. A repeated name is an array, which a schema expecting one value refuses.
+ */
+async function parseV3FormData(
+  req: NextRequest,
+  schema: TV3Schema,
+  { requestId, instance, bodyLimitBytes }: TV3ParseContext
+): Promise<{ ok: true; formData: unknown } | TV3InputParseFailure> {
+  if (mediaTypeOf(req.headers.get("content-type")) !== MULTIPART_FORM_DATA) {
+    const detail = `The request body must be ${MULTIPART_FORM_DATA}`;
+    return {
+      ok: false,
+      detail,
+      invalidParams: [],
+      response: problemUnsupportedMediaType(requestId, detail, {
+        instance,
+        acceptPost: MULTIPART_FORM_DATA,
+      }),
+    };
+  }
+
+  let form: FormData;
+  try {
+    form = await parseFormDataWithLimit(req, bodyLimitBytes);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return bodyTooLargeFailure(error, requestId, instance);
+    }
+    return invalidBodyFailure(
+      [{ name: "body", reason: `Malformed ${MULTIPART_FORM_DATA} body` }],
+      requestId,
+      instance
+    );
+  }
+
+  const fields = Object.fromEntries(
+    [...new Set(form.keys())].map((name) => {
+      const values = form.getAll(name);
+      return [name, values.length === 1 ? values[0] : values];
+    })
+  );
+  const result = schema.safeParse(fields);
+  if (!result.success) {
+    return invalidBodyFailure(formatZodIssues(result.error, "body"), requestId, instance);
+  }
+
+  return { ok: true, formData: result.data };
+}
+
 async function parseV3Input<S extends TV3Schemas | undefined, TProps>(
   req: NextRequest,
   props: TProps,
   schemas: S | undefined,
-  requestId: string,
-  instance: string
+  context: TV3ParseContext
 ): Promise<{ ok: true; parsedInput: TV3ParsedInput<S> } | TV3InputParseFailure> {
+  const { requestId, instance } = context;
   const parsedInput = {} as TV3ParsedInput<S>;
 
-  if (schemas?.body) {
-    let bodyData: unknown;
-
-    try {
-      bodyData = await parseJsonBodyWithLimit(req);
-    } catch (error) {
-      if (error instanceof RequestBodyTooLargeError) {
-        return {
-          ok: false,
-          detail: error.message,
-          invalidParams: [],
-          response: problemPayloadTooLarge(requestId, error.message, instance),
-        };
-      }
-
-      const invalidParams = [
-        { name: "body", reason: "Malformed JSON input, please check your request body" },
-      ];
-      return {
-        ok: false,
-        detail: "Invalid request body",
-        invalidParams,
-        response: problemBadRequest(requestId, "Invalid request body", {
-          instance,
-          invalid_params: invalidParams,
-        }),
-      };
+  if (schemas?.formData) {
+    const formResult = await parseV3FormData(req, schemas.formData, context);
+    if (!formResult.ok) {
+      return formResult;
     }
 
-    const bodyResult = schemas.body.safeParse(bodyData);
-    if (!bodyResult.success) {
-      const invalidParams = formatZodIssues(bodyResult.error, "body");
-      return {
-        ok: false,
-        detail: "Invalid request body",
-        invalidParams,
-        response: problemBadRequest(requestId, "Invalid request body", {
-          instance,
-          invalid_params: invalidParams,
-        }),
-      };
+    parsedInput.formData = formResult.formData as TV3ParsedInput<S>["formData"];
+  } else if (schemas?.body) {
+    const bodyResult = await parseV3Body(req, schemas.body, context);
+    if (!bodyResult.ok) {
+      return bodyResult;
     }
 
-    parsedInput.body = bodyResult.data as TV3ParsedInput<S>["body"];
+    parsedInput.body = bodyResult.body as TV3ParsedInput<S>["body"];
+  } else {
+    const preflightFailure = await preflightUndeclaredBody(req, context);
+    if (preflightFailure) {
+      return preflightFailure;
+    }
   }
 
   if (schemas?.query) {
@@ -339,6 +650,115 @@ async function applyV3RateLimitOrRespond(params: {
   return null;
 }
 
+/**
+ * Report a 5xx to the logs and to Sentry, through the same reporter v1 already uses.
+ *
+ * There was no error reporting under `app/api/v3` at all before this — the surface MCP agents and the
+ * SDK consume was the one with no signal when it broke. `reportApiError` is reused rather than calling
+ * `Sentry.captureException` here: it already owns the gating (`SENTRY_DSN && IS_PRODUCTION`), the
+ * correlation id, the safe error serialization, and the rule that a reporter failure can never affect
+ * the response.
+ *
+ * Called on both exits, because a v3 500 usually is not thrown. Operations return a problem response
+ * rather than throwing — they have to, since the MCP server calls them directly with no wrapper — so
+ * reporting only from the `catch` would miss almost every real failure. The thrown path additionally
+ * passes the original error, which is what gives Sentry a stack rather than a synthetic one.
+ *
+ * `apiVersion` is passed explicitly instead of being derived from the path: under a `basePath`
+ * deployment the request URL is prefixed, and the reporter's own matcher would fall back to "unknown".
+ *
+ * 503 is excluded. In v3 it is a deployment state, not a fault: `problemServiceUnavailable` means "this
+ * capability is not enabled here", and a transient outage is a 502 (`response.ts`), which still reports.
+ * So every 503 is an operator configuration answer — a self-hoster with a Sentry DSN and no Hub or AI
+ * key would otherwise raise an `error`-level event on every such request, forever, for a deployment
+ * that is behaving exactly as configured. Downgrading instead of skipping is not an option worth taking:
+ * `buildSentryCaptureContext` hardcodes `level: "error"` for v1 and v2 as well, so a severity knob
+ * belongs to the shared reporter, not to this wrapper. Nothing is lost locally either — the Hub paths
+ * that produce most 503s already log at `warn` with a hint in `@/modules/hub/service`.
+ */
+const reportServerError = (req: NextRequest, response: Response, error?: unknown): void => {
+  if (response.status < 500 || response.status === 503) {
+    return;
+  }
+
+  try {
+    reportApiError({ request: req, status: response.status, error, apiVersion: "v3" });
+  } catch {
+    // `reportApiError` already swallows its own failures, so this should be unreachable — but it is
+    // called on the success return path, where an escaping throw would be caught by the wrapper's own
+    // `catch` and rewrite the handler's status. A 502 becoming a 500 because Sentry hiccuped is the
+    // exact class of thing observability must not do.
+  }
+};
+
+/**
+ * The answer to a request the route's concurrency limit turned away. Over the caller's own share it is
+ * the caller sending too many (429); with every slot on the process taken it is this server being busy
+ * (503 `capacity_reached`). Both carry `Retry-After`.
+ */
+function refuseOverConcurrency(
+  reason: "capacity" | "per_key",
+  concurrency: NonNullable<TWithV3ApiWrapperParams<undefined>["concurrency"]>,
+  {
+    requestId,
+    instance,
+    log,
+  }: { requestId: string; instance: string; log: ReturnType<typeof logger.withContext> }
+): Response {
+  if (reason === "per_key") {
+    log.warn(
+      { statusCode: 429, maxPerKey: concurrency.limiter.maxPerKey },
+      "V3 API caller is at its concurrency limit for this route"
+    );
+    return problemConcurrencyLimitReached(requestId, concurrency.retryAfterSeconds, instance);
+  }
+
+  log.warn(
+    { statusCode: 503, maxInFlight: concurrency.limiter.maxInFlight },
+    "V3 API route is at its concurrency limit"
+  );
+  return problemCapacityReached(requestId, concurrency.retryAfterSeconds, instance);
+}
+
+type TConcurrencyConfig = NonNullable<TWithV3ApiWrapperParams<undefined>["concurrency"]>;
+
+type TSlotAcquisition = { refusal: Response } | { release: TReleaseSlot | undefined };
+
+/**
+ * Takes a concurrency slot when the route has a limit that applies to this request. Either a refusal
+ * to return as-is, or the release for the slot held (undefined when the route takes none).
+ */
+function acquireConcurrencySlot(
+  req: NextRequest,
+  authentication: TV3Authentication,
+  concurrency: TConcurrencyConfig | undefined,
+  refusalContext: Parameters<typeof refuseOverConcurrency>[2]
+): TSlotAcquisition {
+  if (!concurrency || !(concurrency.appliesTo?.(req) ?? true)) {
+    return { release: undefined };
+  }
+
+  const slot = concurrency.limiter.tryAcquire(getRateLimitIdentifier(authentication) ?? undefined);
+  if (!slot.ok) {
+    return { refusal: refuseOverConcurrency(slot.reason, concurrency, refusalContext) };
+  }
+
+  return { release: slot.release };
+}
+
+/** Marks the audit entry for the outcome of the handler: a success, or the request id as the event id. */
+const recordAuditOutcome = (auditLog: TV3AuditLog | undefined, response: Response, requestId: string) => {
+  if (!auditLog) {
+    return;
+  }
+
+  if (response.ok) {
+    auditLog.status = "success";
+  } else {
+    auditLog.eventId = requestId;
+  }
+};
+
 export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unknown>(
   params: TWithV3ApiWrapperParams<S, TProps>
 ): ((req: NextRequest, props: TProps) => Promise<Response>) => {
@@ -347,10 +767,32 @@ export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unkn
     schemas,
     rateLimit = true,
     customRateLimitConfig,
+    bodyLimitBytes = DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+    concurrency,
     handler,
     action,
     targetType,
   } = params;
+
+  // A misconfigured limit is a programming error in the route module, so fail when the module loads
+  // rather than on the first request: NaN or a fraction would make every body "too large", and a zero
+  // or negative limit would refuse every request with a body.
+  if (!Number.isSafeInteger(bodyLimitBytes) || bodyLimitBytes <= 0) {
+    throw new Error(`withV3ApiWrapper: bodyLimitBytes must be a positive integer, got ${bodyLimitBytes}`);
+  }
+
+  if (schemas?.body && schemas.formData) {
+    throw new Error("withV3ApiWrapper: declare either a body or a formData schema, not both");
+  }
+
+  if (
+    concurrency &&
+    (!Number.isSafeInteger(concurrency.retryAfterSeconds) || concurrency.retryAfterSeconds <= 0)
+  ) {
+    throw new Error(
+      `withV3ApiWrapper: concurrency.retryAfterSeconds must be a positive integer, got ${concurrency.retryAfterSeconds}`
+    );
+  }
 
   return async (req: NextRequest, props: TProps): Promise<Response> => {
     const requestId = req.headers.get("x-request-id") ?? crypto.randomUUID();
@@ -361,6 +803,9 @@ export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unkn
       path: instance,
     });
     let auditLog: TV3AuditLog | undefined;
+    // Set while this request holds a concurrency slot. Every exit releases it in `finally`, except a
+    // response with a body, which takes it over (see `releaseWhenBodySettles`).
+    let releaseSlot: TReleaseSlot | undefined;
 
     try {
       const authResult = await authenticateV3RequestOrRespond(req, auth, requestId, instance);
@@ -383,19 +828,42 @@ export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unkn
         return rateLimitResponse;
       }
 
-      const parsedInputResult = await parseV3Input(req, props, schemas, requestId, instance);
+      const parsedInputResult = await parseV3Input(req, props, schemas, {
+        requestId,
+        instance,
+        bodyLimitBytes,
+      });
       if (!parsedInputResult.ok) {
+        // The count and the first few names, never the array: it is as long as the caller made it,
+        // and a `reason` can echo caller input (ENG-3384).
         log.warn(
           {
             statusCode: parsedInputResult.response.status,
             detail: parsedInputResult.detail,
-            invalidParams: parsedInputResult.invalidParams,
+            invalidParamCount: parsedInputResult.invalidParams.length,
+            invalidParamNames: parsedInputResult.invalidParams.slice(0, 5).map((param) => param.name),
           },
           "V3 API request validation failed"
         );
         return parsedInputResult.response;
       }
 
+      const acquisition = acquireConcurrencySlot(req, authResult.authentication, concurrency, {
+        requestId,
+        instance,
+        log,
+      });
+      if ("refusal" in acquisition) {
+        return acquisition.refusal;
+      }
+      releaseSlot = acquisition.release;
+
+      // Built after authentication, rate limiting and parsing on purpose (ENG-2872). A 401 has no actor
+      // to attribute — and an unauthenticated caller could fill the audit store one row per bad key; a
+      // 429 is already logged by the limiter; a 400 is a malformed request, not an authorization event.
+      // The rejection a reviewer wants — the 403 an authenticated caller gets for someone else's
+      // resource — is raised by the operation below and is audited as a failure. MCP's scope gate
+      // audits its own refusals in `registerScopedTool`.
       auditLog = buildV3AuditLog(authResult.authentication, action, targetType, req.url);
 
       const execute = () =>
@@ -412,16 +880,22 @@ export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unkn
         ? await withAuthorizationSurface("api_v3", execute)
         : await execute();
 
-      if (auditLog) {
-        if (response.ok) {
-          auditLog.status = "success";
-        } else {
-          auditLog.eventId = requestId;
-        }
-      }
+      recordAuditOutcome(auditLog, response, requestId);
 
       await queueV3AuditLog(auditLog, requestId, log);
-      return ensureRequestIdHeader(response, requestId);
+      reportServerError(req, response);
+      const finalResponse = ensureRequestIdHeader(response, requestId);
+
+      if (!releaseSlot) {
+        return finalResponse;
+      }
+
+      // From here the response body owns the slot, given back when it settles or the client leaves.
+      // Handed over only once `releaseWhenBodySettles` has wrapped the body: if that throws, `finally`
+      // still holds the slot to give back.
+      const settling = releaseWhenBodySettles(finalResponse, releaseSlot, req.signal);
+      releaseSlot = undefined;
+      return settling;
     } catch (error) {
       if (auditLog) {
         auditLog.eventId = requestId;
@@ -430,7 +904,11 @@ export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unkn
       // Defence in depth. Operations map their own throws and return a problem response — they have to,
       // because the MCP tools call them directly, without this wrapper. Anything reaching here escaped
       // that, so it is mapped by the same rules rather than being flattened into a blanket 500.
-      return ensureRequestIdHeader(mapV3ThrownError(error, { log, requestId, instance }), requestId);
+      const mapped = mapV3ThrownError(error, { log, requestId, instance });
+      reportServerError(req, mapped, error);
+      return ensureRequestIdHeader(mapped, requestId);
+    } finally {
+      releaseSlot?.();
     }
   };
 };

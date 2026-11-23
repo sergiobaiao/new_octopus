@@ -1,13 +1,16 @@
 import { Config } from "@/lib/common/config";
 import { JS_LOCAL_STORAGE_KEY } from "@/lib/common/constants";
+import { startDebugSession } from "@/lib/common/debug";
 import { addCleanupEventListeners, addEventListeners } from "@/lib/common/event-listeners";
 import { FORMBRICKS_EVENTS, emitFormbricksEvent } from "@/lib/common/events";
 import { Logger } from "@/lib/common/logger";
 import { getIsSetup, setIsSetup } from "@/lib/common/status";
 import { filterSurveys, getIsDebug, isNowExpired, wrapThrows } from "@/lib/common/utils";
+import { removeCreatives, showCachedCreatives } from "@/lib/creatives/creatives";
 import { addLiveRegionContainer, closeSurvey, prefetchSurveysScript } from "@/lib/survey/widget";
 import { DEFAULT_USER_STATE_NO_USER_ID } from "@/lib/user/state";
 import { sendUpdatesToBackend } from "@/lib/user/update";
+import { startVisitTracking } from "@/lib/visit/visit-tracking";
 import { fetchWorkspaceState } from "@/lib/workspace/state";
 import {
   type TConfig,
@@ -138,6 +141,12 @@ export const setup = async (
     return okVoid();
   }
 
+  // Count this page before anything that can wait or bail out: counting needs no network, and a
+  // visitor who leaves before the workspace state arrives, or a page where Formbricks is in an error
+  // state, still saw the page. Also before `addEventListeners`, so no trigger on this page is ever
+  // checked against the previous page's visit.
+  startVisitTracking();
+
   let existingConfig: TConfig | undefined;
   try {
     existingConfig = config.get();
@@ -195,6 +204,9 @@ export const setup = async (
     });
   }
 
+  // After the checks: the panel script comes from `appUrl`, and it is only ever injected once a page.
+  if (isDebug) startDebugSession(configInput.appUrl);
+
   if (
     existingConfig?.workspace &&
     existingConfig.workspaceId === effectiveId &&
@@ -215,6 +227,13 @@ export const setup = async (
       logger.debug("User state expired. Syncing.");
       isUserStateExpired = true;
     }
+
+    // Creatives from the cached state right away, expired or not, so an In page banner never waits for
+    // the network; the page view after setup reconciles them with the refreshed state. A failed refresh
+    // below takes them off again: the SDK is not set up then, so nothing would keep them current (no
+    // dismiss, page view or action reaches them), and a creative paused since the state was cached
+    // would stay up.
+    showCachedCreatives();
 
     try {
       // fetch the workspace state (if expired)
@@ -238,6 +257,7 @@ export const setup = async (
           logger.error(
             `Error fetching workspace state: ${workspaceResponse.error.code} - ${workspaceResponse.error.responseMessage ?? ""}`
           );
+          removeCreatives();
           return err({
             code: "network_error",
             message: "Error fetching workspace state",
@@ -271,6 +291,7 @@ export const setup = async (
             logger.error(
               `Error updating user state: ${updatesResponse.error.code} - ${updatesResponse.error.responseMessage ?? ""}`
             );
+            removeCreatives();
             return err({
               code: "network_error",
               message: "Error updating user state",
@@ -395,8 +416,11 @@ export const setup = async (
   // first survey announces its opening into it.
   addLiveRegionContainer();
 
-  // Prefetch surveys script so it's warm in the cache when a survey triggers
-  prefetchSurveysScript(configInput.appUrl);
+  // Resource hints can fall back to default-src even when script-src-elem allows the renderer.
+  // Strict hosts can skip this hint; a triggered survey still loads through the script path.
+  if (configInput.prefetch !== false) {
+    prefetchSurveysScript(configInput.appUrl);
+  }
 
   setIsSetup(true);
   logger.debug("Set up complete");

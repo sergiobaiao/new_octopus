@@ -7,10 +7,13 @@ import {
   createWorkflowsHandlers,
   createWorkflowsService,
 } from "@formbricks/workflows/server";
-import { requireV3WorkspaceAccess } from "@/app/api/v3/lib/auth";
+import { getV3AuthorizationActor, getV3SessionUserId, requireV3WorkspaceAccess } from "@/app/api/v3/lib/auth";
 import { problemForbidden } from "@/app/api/v3/lib/response";
 import type { TV3AuditLog, TV3Authentication } from "@/app/api/v3/lib/types";
 import { ENCRYPTION_KEY } from "@/lib/constants";
+import { resolveSurveyActorContext } from "@/lib/survey/visibility/actor-context";
+import { isSurveyOutboundAllowed, surveyOutboundVisibilitySelect } from "@/lib/survey/visibility/outbound";
+import { buildHiddenSurveyWhere } from "@/lib/survey/visibility/predicate";
 import { normalizeEmailForComparison } from "@/lib/utils/email";
 import { getOrganizationIdFromWorkspaceId } from "@/lib/utils/helper";
 import { getWorkspaceMemberEmails } from "@/lib/workspace/service";
@@ -29,9 +32,6 @@ const service = createWorkflowsService({ prisma });
 /** Singleton handlers; they are stateless and only close over the injected service. */
 export const workflowsHandlers = createWorkflowsHandlers(service);
 
-const getUserId = (authentication: TV3Authentication): string | null =>
-  authentication && "user" in authentication && authentication.user?.id ? authentication.user.id : null;
-
 /**
  * Confirm a workflow trigger's referenced survey + ending cards exist in the workspace. Injected so
  * `@formbricks/workflows` stays survey-agnostic. Scoped by the survey's `(id, workspaceId)` composite
@@ -45,7 +45,7 @@ const verifyTriggerSurvey: WorkflowApiContext["verifyTriggerSurvey"] = async ({
 }) => {
   const survey = await prisma.survey.findUnique({
     where: { id_workspaceId: { id: surveyId, workspaceId } },
-    select: { endings: true },
+    select: { endings: true, ...surveyOutboundVisibilitySelect },
   });
 
   if (!survey) {
@@ -55,9 +55,32 @@ const verifyTriggerSurvey: WorkflowApiContext["verifyTriggerSurvey"] = async ({
   const endingIds = new Set(ZSurveyEndings.parse(survey.endings).map((ending) => ending.id));
   return {
     surveyExists: true,
+    // ENG-3283: a workflow forwards the survey's responses, so its survey must be workspace-visible.
+    surveyNotWorkspaceVisible: !isSurveyOutboundAllowed(survey),
     missingEndingCardIds: endingCardIds.filter((endingCardId) => !endingIds.has(endingCardId)),
   };
 };
+
+/**
+ * The surveys in a workspace this caller may not read (ENG-3282), so run history follows its trigger
+ * survey. One indexed query over the workspace's restricted surveys — bounded by the per-workspace survey
+ * limit — and none at all when nothing is hidden (marker off, an organization administrator).
+ */
+const buildListUnreadableSurveyIds =
+  (authentication: TV3Authentication): WorkflowApiContext["listUnreadableSurveyIds"] =>
+  async ({ workspaceId, organizationId, surveyIds }) => {
+    const actor = getV3AuthorizationActor(authentication);
+    if (!actor) throw new Error("Survey visibility resolved without an authenticated actor");
+
+    const hidden = buildHiddenSurveyWhere(await resolveSurveyActorContext(actor, organizationId));
+    if (!hidden || surveyIds?.length === 0) return [];
+
+    const surveys = await prisma.survey.findMany({
+      where: { workspaceId, ...(surveyIds ? { id: { in: surveyIds } } : {}), AND: [hidden] },
+      select: { id: true },
+    });
+    return surveys.map((survey) => survey.id);
+  };
 
 /**
  * Bind the framework-agnostic audit sink to this request's audit log. The handlers call it once,
@@ -117,7 +140,7 @@ export const buildWorkflowApiContext = (
   instance: string,
   auditLog?: TV3AuditLog
 ): WorkflowApiContext => ({
-  userId: getUserId(authentication),
+  userId: getV3SessionUserId(authentication),
   requestId,
   instance,
   logger: logger.withContext({ requestId }),
@@ -147,6 +170,7 @@ export const buildWorkflowApiContext = (
   },
   verifyTriggerSurvey,
   verifyRecipientsAllowed,
+  listUnreadableSurveyIds: buildListUnreadableSurveyIds(authentication),
   ...(auditLog ? { recordAudit: buildRecordAudit(auditLog, authentication, requestId) } : {}),
   // Product analytics (ENG-2851): always bound, unlike the audit sink, because it no-ops on its own
   // when POSTHOG_KEY is unset and there is no per-request switch to respect.

@@ -63,6 +63,21 @@ export const isAuthorizationUserActive = reactCache(async (userId: string): Prom
   }
 });
 
+/** The active subset of one bounded authorization batch. No cross-request cache. */
+export const getActiveAuthorizationUserIds = async (
+  userIds: ReadonlyArray<string>
+): Promise<ReadonlySet<string>> => {
+  try {
+    const users = await prisma.user.findMany({
+      where: { id: { in: [...userIds] }, isActive: true },
+      select: { id: true },
+    });
+    return new Set(users.map(({ id }) => id));
+  } catch (error) {
+    return rethrowAsDatabaseError(error);
+  }
+};
+
 /** Whether an organization resource still exists. */
 export const getAuthorizationOrganizationId = reactCache(
   async (organizationId: string): Promise<string | null> => {
@@ -142,6 +157,45 @@ export const getSurveyAuthorizationWorkspaceScope = reactCache(
       return survey
         ? { organizationId: survey.workspace.organizationId, workspaceId: survey.workspaceId }
         : null;
+    } catch (error) {
+      return rethrowAsDatabaseError(error);
+    }
+  }
+);
+
+/**
+ * A survey's authorization facts once survey visibility is enforced (ENG-3282): its tenant boundary
+ * plus the ownership and version pair the evaluator needs to tell a settled survey from one whose
+ * visibility change is still being projected.
+ */
+export type TSurveyAuthorizationScopeRow = Readonly<{
+  id: string;
+  organizationId: string;
+  ownerId: string | null;
+  visibility: "restricted" | "workspace";
+  visibilityProjectedVersion: number;
+  visibilityVersion: number;
+  workspaceId: string;
+}>;
+
+export const getSurveyAuthorizationScopeRow = reactCache(
+  async (surveyId: string): Promise<TSurveyAuthorizationScopeRow | null> => {
+    try {
+      const survey = await prisma.survey.findUnique({
+        where: { id: surveyId },
+        select: {
+          id: true,
+          ownerId: true,
+          visibility: true,
+          visibilityProjectedVersion: true,
+          visibilityVersion: true,
+          workspaceId: true,
+          workspace: { select: { organizationId: true } },
+        },
+      });
+      if (!survey) return null;
+      const { workspace, ...facts } = survey;
+      return { ...facts, organizationId: workspace.organizationId };
     } catch (error) {
       return rethrowAsDatabaseError(error);
     }

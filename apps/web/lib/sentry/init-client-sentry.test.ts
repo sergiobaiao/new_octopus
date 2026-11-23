@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { SENTRY_CLIENT_RUNTIME_CONFIG_KEY } from "@/lib/sentry/client-runtime-config";
 
 const mockInit = vi.hoisted(() => vi.fn());
+const mockAddIntegration = vi.hoisted(() => vi.fn());
 const mockReplayIntegration = vi.hoisted(() => vi.fn(() => ({ name: "Replay" })));
 
 vi.mock("@sentry/nextjs", () => ({
   init: mockInit,
+  addIntegration: mockAddIntegration,
   replayIntegration: mockReplayIntegration,
 }));
 
@@ -21,6 +23,8 @@ describe("initClientSentryFromRuntimeConfig", () => {
     vi.resetModules();
     vi.clearAllMocks();
     vi.stubGlobal("window", {} as Window);
+    // An already-loaded page unless a test says otherwise.
+    vi.stubGlobal("document", { readyState: "complete" });
   });
 
   afterEach(() => {
@@ -91,7 +95,65 @@ describe("initClientSentryFromRuntimeConfig", () => {
         sendClientReports: false,
       })
     );
+  });
+
+  test("adds Replay once the page is idle instead of at init", async () => {
+    let runIdle = () => {};
+    window.requestIdleCallback = vi.fn((callback: IdleRequestCallback) => {
+      runIdle = () => callback({} as IdleDeadline);
+      return 1;
+    });
+    window[SENTRY_CLIENT_RUNTIME_CONFIG_KEY] = CONFIG;
+
+    (await importInit())();
+
+    expect(mockReplayIntegration).not.toHaveBeenCalled();
+    expect(mockAddIntegration).not.toHaveBeenCalled();
+
+    runIdle();
+
+    await vi.waitFor(() => expect(mockAddIntegration).toHaveBeenCalledWith({ name: "Replay" }));
     expect(mockReplayIntegration).toHaveBeenCalledWith({ maskAllText: true, blockAllMedia: true });
+  });
+
+  test("still adds Replay where requestIdleCallback is missing", async () => {
+    window[SENTRY_CLIENT_RUNTIME_CONFIG_KEY] = CONFIG;
+
+    (await importInit())();
+
+    await vi.waitFor(() => expect(mockAddIntegration).toHaveBeenCalledWith({ name: "Replay" }));
+  });
+
+  test("waits for the page's load event before scheduling Replay", async () => {
+    vi.stubGlobal("document", { readyState: "loading" });
+    let fireLoad = () => {};
+    window.addEventListener = vi.fn((_type: string, listener: EventListenerOrEventListenerObject) => {
+      fireLoad = () => (listener as EventListener)(new Event("load"));
+    }) as Window["addEventListener"];
+    window.requestIdleCallback = vi.fn((callback: IdleRequestCallback) => {
+      callback({} as IdleDeadline);
+      return 1;
+    });
+    window[SENTRY_CLIENT_RUNTIME_CONFIG_KEY] = CONFIG;
+
+    (await importInit())();
+
+    // Safari has no requestIdleCallback and other browsers can go idle mid-load: neither may start
+    // the Replay download while first-load JS is still arriving.
+    expect(window.addEventListener).toHaveBeenCalledWith("load", expect.any(Function), { once: true });
+    expect(window.requestIdleCallback).not.toHaveBeenCalled();
+
+    fireLoad();
+
+    await vi.waitFor(() => expect(mockAddIntegration).toHaveBeenCalledWith({ name: "Replay" }));
+  });
+
+  test("does not add Replay when Sentry is disabled", async () => {
+    window.requestIdleCallback = vi.fn();
+
+    (await importInit())();
+
+    expect(window.requestIdleCallback).not.toHaveBeenCalled();
   });
 
   test("drops NEXT_NOT_FOUND errors and keeps everything else", async () => {
@@ -106,6 +168,48 @@ describe("initClientSentryFromRuntimeConfig", () => {
     expect(beforeSend(event, { originalException: notFound })).toBeNull();
     expect(beforeSend(event, { originalException: new Error("boom") })).toBe(event);
     expect(beforeSend(event, {})).toBe(event);
+  });
+
+  test("drops stale server action errors, which the reload prompt already handles", async () => {
+    window[SENTRY_CLIENT_RUNTIME_CONFIG_KEY] = CONFIG;
+
+    (await importInit())();
+
+    const { beforeSend } = mockInit.mock.calls[0][0];
+    const event = { message: "boom" };
+    const staleAction = Object.assign(
+      new Error(
+        'Server Action "7f8e93d" was not found on the server. \nRead more: https://nextjs.org/docs/messages/failed-to-find-server-action'
+      ),
+      {
+        name: "UnrecognizedActionError",
+      }
+    );
+
+    expect(beforeSend(event, { originalException: staleAction })).toBeNull();
+
+    // An application error that only borrows the name is still reported: dropping it would hide a
+    // real error behind a reload prompt that has no business being up.
+    const impostor = Object.assign(new Error("boom"), { name: "UnrecognizedActionError" });
+    expect(beforeSend(event, { originalException: impostor })).toBe(event);
+  });
+
+  test("keeps reporting server actions that got an unexpected response", async () => {
+    window[SENTRY_CLIENT_RUNTIME_CONFIG_KEY] = CONFIG;
+
+    (await importInit())();
+
+    const { beforeSend } = mockInit.mock.calls[0][0];
+    const event = { message: "boom" };
+    const unexpectedResponse = Object.assign(
+      new Error("An unexpected response was received from the server."),
+      { __NEXT_ERROR_CODE: "E394" }
+    );
+
+    // Unlike a stale action, this is a real failure in front of the app (ENG-2899). The notice tells
+    // the user, but Sentry is the only signal we get that it is happening, so it must not be filtered
+    // out as framework noise.
+    expect(beforeSend(event, { originalException: unexpectedResponse })).toBe(event);
   });
 
   test("does nothing on the server where there is no window", async () => {

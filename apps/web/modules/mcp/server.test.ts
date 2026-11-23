@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { z } from "zod";
+import { MCP_REQUEST_MAX_ELEMENTS } from "./request-budget";
+import { mcpRequestStateCodec } from "./request-state";
 import { MCP_HANDLER_OPTIONS, identifyMcpUser } from "./server";
 
 vi.mock("server-only", () => ({}));
@@ -11,7 +14,9 @@ vi.mock("@/lib/posthog/mcp-tracing", () => ({
   instrumentMcpServerWithTracing: vi.fn(),
 }));
 
+vi.mock("./tools/creatives", () => ({ registerCreativeTools: vi.fn() }));
 vi.mock("./tools/feedback-records", () => ({ registerFeedbackRecordTools: vi.fn() }));
+vi.mock("./tools/responses", () => ({ registerResponseTools: vi.fn() }));
 vi.mock("./tools/surveys", () => ({ registerSurveyTools: vi.fn() }));
 vi.mock("./tools/workflows", () => ({ registerWorkflowTools: vi.fn() }));
 vi.mock("./tools/workspaces", () => ({ registerWorkspaceTools: vi.fn() }));
@@ -26,10 +31,64 @@ vi.mock("./auth", () => ({
 }));
 
 vi.mock("@formbricks/logger", () => ({
-  logger: { warn: mocks.loggerWarn },
+  logger: { warn: mocks.loggerWarn, withContext: () => ({ warn: mocks.loggerWarn, error: vi.fn() }) },
 }));
 
 describe("mcpHandler options", () => {
+  test("the real adapter enforces the SDK input budget before validating a tool", async () => {
+    const { createMcpHandler } = await vi.importActual<typeof import("mcp-handler")>("mcp-handler");
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ok" }] }));
+    const handler = createMcpHandler((server) => {
+      server.registerTool(
+        "accept_record",
+        {
+          inputSchema: z.object({ data: z.record(z.string(), z.unknown()) }),
+        },
+        execute
+      );
+    }, MCP_HANDLER_OPTIONS);
+    const call = async (data: Record<string, unknown>) => {
+      const response = await handler(
+        new Request("http://localhost/api/mcp", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            "mcp-protocol-version": "2025-06-18",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "accept_record", arguments: { data } },
+          }),
+        })
+      );
+      const text = await response.text();
+      const payload =
+        text
+          .split("\n")
+          .find((line) => line.startsWith("data:"))
+          ?.slice(5) ?? text;
+      return JSON.parse(payload);
+    };
+
+    const oversized = Object.fromEntries(
+      Array.from({ length: MCP_REQUEST_MAX_ELEMENTS }, (_, index) => [`key${index}`, null])
+    );
+    const refused = await call(oversized);
+    expect(refused.result).toMatchObject({
+      isError: true,
+      content: [
+        { type: "text", text: expect.stringContaining(`maximum of ${MCP_REQUEST_MAX_ELEMENTS} elements`) },
+      ],
+    });
+    expect(execute).not.toHaveBeenCalled();
+
+    expect((await call({ ordinary: "value" })).result.content).toEqual([{ type: "text", text: "ok" }]);
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
   /**
    * Pins the declared value only. The behaviour it produces — a `subscriptions/listen` request refused with
    * `-32603 Subscription limit reached` instead of being accepted and held open — is covered end to end
@@ -41,6 +100,19 @@ describe("mcpHandler options", () => {
    */
   test("declares subscription streams as refused", () => {
     expect(MCP_HANDLER_OPTIONS.maxSubscriptions).toBe(0);
+  });
+
+  /**
+   * The option is the whole of the "a forged `requestState` never reaches a handler" guarantee: the
+   * SDK verifies nothing by default, so leaving it unset hands every handler whatever string the
+   * client echoed. Nothing else asserted it — removing the line left all of `modules/mcp` green.
+   *
+   * Pinned by identity rather than by shape. A verifier that is merely *a function* is the failure
+   * this cannot be allowed to pass: the point is that it is the codec's own, so a hand-rolled or
+   * permissive stand-in fails here.
+   */
+  test("declares the request-state verifier, and it is the codec's own", () => {
+    expect(MCP_HANDLER_OPTIONS.requestState.verify).toBe(mcpRequestStateCodec.verify);
   });
 });
 

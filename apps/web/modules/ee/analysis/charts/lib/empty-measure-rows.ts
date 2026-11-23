@@ -21,10 +21,9 @@ const isEmptyMeasureValue = (value: unknown): boolean =>
  *
  * Only grouped, non-time queries qualify:
  *
- * - **A dimension is required.** Without one the result is a single measure-only row, and dropping
- *   it would turn "this measure computed to nothing" into "no data available" — a big number
- *   renders that case as an en dash on purpose, and a measure-pivot bar chart keeps the measure's
- *   slot on the axis as a gap.
+ * - **A dimension is required.** Without one the result is a single measure-only row. Whether that
+ *   row is empty is the renderers' call (`isChartResultEmpty`), and when only some of its measures
+ *   are empty a measure-pivot bar chart keeps each empty measure's slot on the axis as a gap.
  * - **A time granularity disqualifies it.** An empty bucket in a time series is information: area
  *   charts render it as a gap (`connectNulls={false}`), and silently removing the bucket would
  *   close the gap and misdate every point after it.
@@ -58,4 +57,23 @@ export const dropEmptyMeasureRows = (rows: TChartDataRow[], query: TChartQuery):
   if (measures.length === 0) return rows;
 
   return rows.filter((row) => measures.some((measure) => !isEmptyMeasureValue(row[measure])));
+};
+
+const VALUE_ID_DIMENSION = "FeedbackRecords.valueId";
+
+/**
+ * The query to execute for a `valueId` grouping: the same query plus a `valueId set` filter.
+ *
+ * Only choice answers (single/multi-select, matrix columns) write a `value_id`; text, rating, NPS
+ * and the rest leave it NULL. Left alone, Cube emits one group for all of those rows, so a chart
+ * grouped by value option gains a blank-labelled bucket that is not an option and can dwarf the
+ * real ones. Filtering in the query, rather than dropping the group afterwards, keeps a `limit`
+ * from being spent on that bucket.
+ *
+ * Execution only: callers keep the original query for what they return and save, so the filter
+ * never shows up in the builder. A query that does not group by `valueId` is returned untouched.
+ */
+export const withOptionIdFilter = (query: TChartQuery): TChartQuery => {
+  if (!(query.dimensions ?? []).includes(VALUE_ID_DIMENSION)) return query;
+  return { ...query, filters: [...(query.filters ?? []), { member: VALUE_ID_DIMENSION, operator: "set" }] };
 };

@@ -1,20 +1,25 @@
 import { useTranslation } from "react-i18next";
-import { TSurvey, TSurveyElementSummaryRanking } from "@formbricks/types/surveys/types";
+import { TSurvey, TSurveyElementSummaryRanking, TSurveyType } from "@formbricks/types/surveys/types";
 import { getChoiceIdByValue } from "@/lib/response/utils";
 import { IdBadge } from "@/modules/ui/components/id-badge";
 import { convertFloatToNDecimal } from "../lib/utils";
 import { ElementSummaryHeader } from "./ElementSummaryHeader";
+import { OptionBaseNote } from "./OptionBaseNote";
+import { OtherValuesList } from "./OtherValuesList";
 
 interface RankingSummaryProps {
-  elementSummary: TSurveyElementSummaryRanking;
-  survey: TSurvey;
+  readonly elementSummary: TSurveyElementSummaryRanking;
+  readonly surveyType: TSurveyType;
+  readonly survey: TSurvey;
 }
 
-export const RankingSummary = ({ elementSummary, survey }: RankingSummaryProps) => {
+export const RankingSummary = ({ elementSummary, surveyType, survey }: RankingSummaryProps) => {
   // sort by count and transform to array
   const { t } = useTranslation();
+  // Best average rank first; a choice nobody ranked has no average, so it goes last.
   const results = Object.values(elementSummary.choices).sort((a, b) => {
-    return a.avgRanking - b.avgRanking; // Sort by count
+    if (a.count === 0 || b.count === 0) return b.count - a.count;
+    return a.avgRanking - b.avgRanking;
   });
 
   return (
@@ -32,6 +37,11 @@ export const RankingSummary = ({ elementSummary, survey }: RankingSummaryProps) 
                       <span className="mr-2 text-slate-400">#{resultsIdx + 1}</span>
                       <div className="rounded-sm bg-slate-100 px-2 py-1">{result.value}</div>
                       {choiceId && <IdBadge id={choiceId} />}
+                      <OptionBaseNote
+                        shownCount={result.shownCount}
+                        base={elementSummary.responseCount}
+                        hidden={result.hidden}
+                      />
                     </div>
                     <span className="ml-auto flex items-center gap-x-1">
                       <span className="font-bold text-slate-600">
@@ -42,6 +52,9 @@ export const RankingSummary = ({ elementSummary, survey }: RankingSummaryProps) 
                   </div>
                 </div>
               </div>
+              {result.others && result.others.length > 0 && (
+                <OtherValuesList others={result.others} surveyType={surveyType} />
+              )}
             </div>
           );
         })}

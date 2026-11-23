@@ -104,13 +104,28 @@ export const LoginForm = ({
           title: t("auth.login.oauth_misconfigured_title"),
           description: t("auth.login.oauth_misconfigured_description"),
         };
+      case "second_factor_unavailable":
+        return {
+          title: t("auth.login.oauth_second_factor_unavailable_title"),
+          description: t("auth.login.oauth_second_factor_unavailable_description"),
+        };
+      case "recovery_link_not_opened":
+        return {
+          title: t("auth.login.oauth_recovery_link_not_opened_title"),
+          description: t("auth.login.oauth_recovery_link_not_opened_description"),
+        };
       case "generic":
         return {
           title: t("auth.login.oauth_generic_error_title"),
           description: t("auth.login.oauth_generic_error_description"),
         };
-      default:
+      case null:
         return null;
+      default: {
+        // A variant without a case would render no alert at all; make that a type error instead.
+        const unhandledVariant: never = oauthErrorVariant;
+        return unhandledVariant;
+      }
     }
   }, [oauthErrorVariant, t]);
 

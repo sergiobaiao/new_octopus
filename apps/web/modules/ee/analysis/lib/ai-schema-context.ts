@@ -2,9 +2,12 @@
  * Generates a system prompt for the AI chart query LLM.
  * Derived from FEEDBACK_FIELDS to keep schema and prompt in sync.
  */
+import { DATE_RANGE_PRESETS } from "@/lib/date-ranges";
 import { CHART_TYPE_IDS } from "@/modules/ee/analysis/types/analysis";
+import { ANSWER_MEMBER, MAX_ANSWER_RULES, type TAnswerQuestion } from "./answer-filter";
+import { MAX_TOKEN_EMBEDDED_KEYS } from "./embedded-data-fields";
+import type { TDatasetChartFields } from "./field-catalog";
 import {
-  DATE_PRESETS,
   FEEDBACK_FIELDS,
   FILTER_OPERATORS,
   type FieldDefinition,
@@ -38,10 +41,66 @@ function formatOperators(): string {
   return lines.join("\n");
 }
 
-export function generateSchemaContext(): string {
+/** Most options listed per question; a longer list is cut, which only costs the model the tail. */
+const MAX_LISTED_OPTIONS = 30;
+/**
+ * Bounds on what one dataset adds to the prompt (C21). Labels and keys are survey- and integrator-written
+ * text: without a bound one dataset could make the prompt arbitrarily long (and costly).
+ */
+export const MAX_PROMPT_ANSWER_QUESTIONS = 100;
+export const MAX_PROMPT_LABEL_LENGTH = 120;
+/** A token carries at most this many keys, so a chart can never name more. */
+export const MAX_PROMPT_EMBEDDED_FIELDS = MAX_TOKEN_EMBEDDED_KEYS;
+
+const cut = (text: string): string =>
+  text.length > MAX_PROMPT_LABEL_LENGTH ? `${text.slice(0, MAX_PROMPT_LABEL_LENGTH)}…` : text;
+
+/**
+ * The dataset's embedded-data fields, each by its key's own name (ENG-6893). Keys are respondent- and
+ * integrator-supplied text, so they are quoted as data.
+ */
+function formatEmbeddedFields(dataset: TDatasetChartFields | undefined): string {
+  const fields = (dataset?.embeddedFields ?? []).slice(0, MAX_PROMPT_EMBEDDED_FIELDS);
+  if (fields.length === 0) return "";
+  const lines = fields.map(({ name, key }) => `- ${name}: embedded data ${JSON.stringify(key)}`);
+  return `### Embedded data (this dataset's own fields)
+Values passed in with each response, such as a product, region or account manager. Each is a dimension: group by it, or filter it with the string operators. Values match exactly as collected, case included.
+${lines.join("\n")}`;
+}
+
+function formatAnswerQuestion(question: TAnswerQuestion): string {
+  const options = question.options
+    .slice(0, MAX_LISTED_OPTIONS)
+    .map((option) => `${JSON.stringify(option.value)} = ${JSON.stringify(cut(option.label))}`)
+    .join(", ");
+  const more = question.options.length > MAX_LISTED_OPTIONS ? ", …" : "";
+  return `- ${JSON.stringify(question.id)} (${question.kind}) ${JSON.stringify(cut(question.label))}: ${options}${more}`;
+}
+
+/**
+ * The answer filter (ENG-6894) and the questions it can name, with the recipe the model needs for a
+ * request like "NPS when delivery was late".
+ */
+function formatAnswerFilters(dataset: TDatasetChartFields | undefined): string {
+  const questions = dataset?.answerQuestions ?? [];
+  if (questions.length === 0) return "";
+  const listed = questions.slice(0, MAX_PROMPT_ANSWER_QUESTIONS);
+  const unlisted = questions.length - listed.length;
+  const more = unlisted > 0 ? `\n(${unlisted} more questions are not listed; do not invent their ids.)` : "";
+  return `### Answer filters (how the same response answered another question)
+Filter member \`${ANSWER_MEMBER}\` keeps records whose response answered another question a certain way. Each value is "<questionId>:<valueKey>" using the ids listed below, and one filter names exactly one question.
+- "is" / "contains": operator \`equals\` with one value; "is any of": \`equals\` with several values of the same question.
+- "is not": \`notEquals\` — only for choice and number questions; a multi question has no "does not contain".
+- A response that skipped the question never matches. At most ${MAX_ANSWER_RULES} such filters.
+- Recipe: "NPS when delivery was late" → measure \`${CUBE_NAME}.npsScore\`, filter \`${CUBE_NAME}.fieldType\` equals ["nps"], and filter \`${ANSWER_MEMBER}\` equals ["<delivery question id>:<late option id>"].
+Questions ("id" (kind) "label": "valueKey" = "option label", …):
+${listed.map(formatAnswerQuestion).join("\n")}${more}`;
+}
+
+export function generateSchemaContext(dataset?: TDatasetChartFields): string {
   const measuresText = FEEDBACK_FIELDS.measures.map(formatMeasure).join("\n");
   const dimensionsText = FEEDBACK_FIELDS.dimensions.map(formatDimension).join("\n");
-  const datePresetsText = DATE_PRESETS.map((p) => `"${p.value}"`).join(", ");
+  const datePresetsText = DATE_RANGE_PRESETS.map((preset) => `"${preset}"`).join(", ");
   const operatorsText = formatOperators();
   const chartTypesText = formatChartTypes();
 
@@ -72,23 +131,32 @@ like \`start/end\` in any of these fields.
 - "NPS score" or "net promoter score" means \`${CUBE_NAME}.npsScore\`.
 - "NPS value", "NPS average", or "NPS average rating" means \`${CUBE_NAME}.npsAverage\`.
 - "CSAT score" means \`${CUBE_NAME}.csatScore\`; "CSAT average" means \`${CUBE_NAME}.csatAverage\`.
+- "how many NPS answers" or "NPS responses" means \`${CUBE_NAME}.npsCount\`.
+- "NPS breakdown" or "promoters vs passives vs detractors" means measure \`${CUBE_NAME}.npsCount\`, dimension \`${CUBE_NAME}.valueBand\`, filter \`${CUBE_NAME}.fieldType\` equals ["nps"], chart type \`pie\`.
+- "CSAT breakdown" or "satisfied vs neutral vs dissatisfied" means measure \`${CUBE_NAME}.csatCount\`, dimension \`${CUBE_NAME}.valueBand\`, filter \`${CUBE_NAME}.fieldType\` equals ["csat"], chart type \`pie\`.
 - "CES average" or "CES score" means \`${CUBE_NAME}.cesAverage\`.
 - "rating average" or "average rating" means \`${CUBE_NAME}.ratingAverage\` (rating questions; NPS/CSAT/CES have their own averages).
 - "average sentiment" or "sentiment trend" means \`${CUBE_NAME}.sentimentAverage\` (the aggregate). A per-record "sentiment score" (e.g. filtering records by score) means the \`${CUBE_NAME}.sentimentScore\` dimension.
 
 ### Filter operators by field type
 ${operatorsText}
-
+${[formatEmbeddedFields(dataset), formatAnswerFilters(dataset)]
+  .filter((section) => section.length > 0)
+  .map((section) => `\n${section}\n`)
+  .join("")}
 ## Guidelines
-- Always include at least one measure. If unspecified, default to \`${CUBE_NAME}.count\`.
+- First decide whether the request can be answered from this feedback data at all. Set \`answerable\` to false when it is gibberish (random characters, keyboard mashing) or asks about something the data does not hold (the weather, a joke, general knowledge, writing code). A vague request that is still about the feedback ("show me something useful", "how are we doing") is answerable. When \`answerable\` is false, the rest of the query is ignored: still return every field, as placeholders (null, an empty \`measures\` array, any chart type), rather than inventing a query.
+- Always include at least one measure. If an answerable request names none, default to \`${CUBE_NAME}.count\`.
 - Use dimension IDs exactly as shown (e.g. \`FeedbackRecords.sourceType\`, \`FeedbackRecords.collectedAt\`).
 - Only add a timeDimension when the request actually concerns time: it names a period ("last quarter", "since June"), or it asks for a trend ("over time", "by week"). A request that does neither — "responses by source", "average rating per question" — must omit timeDimensions entirely, so the chart covers all the data. Do not add a default window: a chart is saved and reopened, and a range nobody asked for becomes a silent filter on every later viewing.
 - For time-based filtering (date range only, no time grouping): add a timeDimension with dimension \`${CUBE_NAME}.collectedAt\` and a date range in the form described above. Do NOT include granularity (default is None / filter only).
 - For time-series or trend questions (e.g. "over time", "by day", "weekly", "monthly"): add a timeDimension with dimension, granularity (hour/day/week/month/quarter/year), and a date range.
 - Choose the most appropriate chart type from ${chartTypesText}; use \`big_number\` for single-number queries. There is no separate line type — \`area\` renders as a line through a display setting, so answer requests for a line chart with \`area\`.
+- Use \`matrix\` for a grid of two groupings × one measure — above all "show <matrix question> as a matrix", a Likert grid of statements × scale points, or a cross-tab of two groupings the user asks to see as a grid, table or heatmap ("country × source as a table"). A plain "X by Y" with one grouping is still a bar chart. A matrix needs exactly two dimensions (rows first, then columns), exactly one measure, and no time granularity. For a matrix question use this recipe: filter \`${CUBE_NAME}.fieldGroupLabel\` with the question's text, dimensions \`["${CUBE_NAME}.fieldId", "${CUBE_NAME}.valueId"]\` (statements as rows, scale points as columns), and measure \`${CUBE_NAME}.count\`.
 - Filters must use the exact operator strings from the schema.
 - For human-readable text dimensions (\`${CUBE_NAME}.sourceName\`, \`${CUBE_NAME}.sourceType\`, \`${CUBE_NAME}.fieldLabel\`, \`${CUBE_NAME}.fieldGroupLabel\`, \`${CUBE_NAME}.valueText\`), prefer the \`contains\` operator over \`equals\` unless the user clearly wants an exact full-string match — \`equals\` is an exact match and the stored value may differ in casing or spacing from the user's phrasing.
 - \`${CUBE_NAME}.sentiment\` stores exact machine tokens: very_negative, negative, neutral, positive, very_positive, mixed. Filter it with \`equals\`/\`notEquals\` using those exact lowercase tokens (e.g. "negative feedback" → sentiment equals ["negative", "very_negative"]).
+- \`${CUBE_NAME}.valueBand\` stores exact machine tokens: promoter, passive, detractor (NPS) and satisfied, neutral, dissatisfied (CSAT). Filter it with \`equals\`/\`notEquals\` using those tokens (e.g. "detractor comments" → valueBand equals ["detractor"]).
 - \`${CUBE_NAME}.emotions\` stores a comma-separated multi-label set from: joy, anger, sadness, fear, surprise, disgust. Filter a single emotion with \`contains\` and the exact lowercase token (e.g. "angry feedback" → emotions contains ["anger"]); never use \`equals\` on it.
 - Response context lives on its own dimensions, not on the answer: "on mobile" → \`${CUBE_NAME}.metadataDevice\`, "in Germany" → \`${CUBE_NAME}.metadataCountry\`, "from the app" → \`${CUBE_NAME}.metadataSource\`, "completed" or "finished" → \`${CUBE_NAME}.metadataFinished\` equals true, "how long people took" → \`${CUBE_NAME}.metadataDurationSeconds\`. All of them are empty on records collected before that context was captured, so never add one as a filter unless the user asked for it.
 - Generate a short, descriptive chart name (max 255 characters) that reflects the user's question.`;

@@ -9,7 +9,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 import { ZWorkspace } from "@formbricks/types/workspace";
 import { createWorkspaceAction } from "@/app/(app)/workspaces/[workspaceId]/actions";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { TOrganizationTeam } from "@/modules/ee/teams/team-list/types/team";
 import { Button } from "@/modules/ui/components/button";
 import {
@@ -41,10 +41,10 @@ const ZCreateWorkspaceForm = z.object({
 type TCreateWorkspaceForm = z.infer<typeof ZCreateWorkspaceForm>;
 
 interface CreateWorkspaceModalProps {
-  open: boolean;
-  setOpen: (open: boolean) => void;
-  organizationId: string;
-  isAccessControlAllowed: boolean;
+  readonly open: boolean;
+  readonly setOpen: (open: boolean) => void;
+  readonly organizationId: string;
+  readonly isAccessControlAllowed: boolean;
 }
 
 export const CreateWorkspaceModal = ({

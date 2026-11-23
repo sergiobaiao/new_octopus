@@ -10,7 +10,7 @@ import { TSurveyListPage } from "@/modules/survey/list/lib/v3-surveys-client";
 import { useUpdateSurveyStatus } from "./use-update-survey-status";
 
 function createWrapper(queryClient: QueryClient) {
-  const Wrapper = ({ children }: { children: ReactNode }) =>
+  const Wrapper = ({ children }: { readonly children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
 
   Wrapper.displayName = "UseUpdateSurveyStatusTestWrapper";
@@ -37,6 +37,9 @@ function createQueryData(): { pages: TSurveyListPage[]; pageParams: (string | nu
             completedResponseCount: 5,
             creator: { name: "Alice" },
             singleUse: null,
+            visibility: "workspace",
+            owner: { name: "Test User" },
+            access: { via: "workspace", canManageVisibility: false },
           },
           {
             id: "survey_2",
@@ -52,6 +55,9 @@ function createQueryData(): { pages: TSurveyListPage[]; pageParams: (string | nu
             completedResponseCount: 0,
             creator: { name: "Bob" },
             singleUse: null,
+            visibility: "workspace",
+            owner: { name: "Test User" },
+            access: { via: "workspace", canManageVisibility: false },
           },
         ],
         meta: {
@@ -73,6 +79,7 @@ const queryKeyInput = {
     name: "",
     status: [] as never[],
     type: [] as never[],
+    visibility: [] as never[],
     sortBy: "relevance" as const,
   },
 };

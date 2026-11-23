@@ -1,34 +1,86 @@
 "use client";
 
-import { type Dispatch, type SetStateAction, useCallback, useEffect, useRef, useState } from "react";
-import { ActionClass, Language, OrganizationRole, Workspace } from "@formbricks/database/prisma-browser";
+import { useRouter } from "next/navigation";
+import {
+  type Dispatch,
+  type SetStateAction,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { ActionClass, Language, OrganizationRole } from "@formbricks/database/prisma-browser";
 import { TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
 import { TSurveyQuota } from "@formbricks/types/quota";
 import { TSegment } from "@formbricks/types/segment";
-import { TSurvey, TSurveyEditorTabs, TSurveyStyling } from "@formbricks/types/surveys/types";
+import type { TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
+import {
+  TSurvey,
+  TSurveyEditorTabs,
+  TSurveyStyling,
+  TSurveyVisibility,
+} from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
 import { extractLanguageCodes, getEnabledLanguages } from "@/lib/i18n/utils";
 import { structuredClone } from "@/lib/pollyfills/structuredClone";
+import { type TStylingAppearance } from "@/lib/styling/dark-mode";
+import type { TSurveyAccess } from "@/lib/survey/visibility/access";
+import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useDocumentVisibility } from "@/lib/useDocumentVisibility";
+import { isDeepEqual } from "@/lib/utils/object";
+import { useCustomCssValidation } from "@/modules/custom-css/components/hooks/use-custom-css-validation";
+import { useLiveWorkspaceCustomCss } from "@/modules/custom-css/components/hooks/use-live-workspace-custom-css";
+import { getCustomCssSource, toCustomCssDraft } from "@/modules/custom-css/components/lib/draft";
+import { type TSurveyCustomCssEditorConfig } from "@/modules/custom-css/components/types";
+import { isSurveyCustomCssApplied } from "@/modules/custom-css/lib/survey-css-gate";
+import { useSurveyLinkedCreatives } from "@/modules/ee/creatives/hooks/use-survey-linked-creatives";
+import type { TSurveyLinkedCreative } from "@/modules/ee/creatives/lib/survey-side";
+import type { TSurveyDataRetentionContext } from "@/modules/ee/data-retention/types";
 import { TTeamPermission } from "@/modules/ee/teams/workspace-teams/types/team";
 import { EditPublicSurveyAlertDialog } from "@/modules/survey/components/edit-public-survey-alert-dialog";
 import { ElementsView } from "@/modules/survey/editor/components/elements-view";
+import { EMBEDDED_DATA_CARD_ID } from "@/modules/survey/editor/components/embedded-data-card";
+import { FlowView } from "@/modules/survey/editor/components/flow-view";
 import { LoadingSkeleton } from "@/modules/survey/editor/components/loading-skeleton";
 import { SettingsView } from "@/modules/survey/editor/components/settings-view";
 import { StylingView } from "@/modules/survey/editor/components/styling-view";
 import { SurveyEditorTabs } from "@/modules/survey/editor/components/survey-editor-tabs";
 import { SurveyMenuBar } from "@/modules/survey/editor/components/survey-menu-bar";
+import { describeRuleSummary } from "@/modules/survey/editor/lib/flow-outline-text";
+import { hasSeenFlowTab, markFlowTabSeen } from "@/modules/survey/editor/lib/flow-tab-notice";
+import { scrollElementCardIntoView } from "@/modules/survey/editor/lib/utils";
+import { type TEditorWorkspace } from "@/modules/survey/editor/lib/workspace";
 import { TFollowUpEmailToUser } from "@/modules/survey/editor/types/survey-follow-up";
 import { FollowUpsView } from "@/modules/survey/follow-ups/components/follow-ups-view";
 import { shouldShowFollowUpsTab } from "@/modules/survey/follow-ups/lib/deprecation";
 import { LanguageView } from "@/modules/survey/multi-language-surveys/components/language-view";
 import { type TSurveySchedulingConfig } from "@/modules/survey/scheduling/lib/config";
+import { RestrictedSurveyBanner } from "@/modules/survey/visibility/components/restricted-survey-banner";
+import { showRestrictedBanner } from "@/modules/survey/visibility/lib/markers";
+import {
+  type TSurveyVisibilityUiGate,
+  isOutboundBlocked,
+  withoutVisibilityControls,
+} from "@/modules/survey/visibility/lib/state";
 import { PreviewSurvey } from "@/modules/ui/components/preview-survey";
 import { getWorkspaceLanguagesAction, refetchWorkspaceAction } from "../actions";
 
+// How long the preview trails the editor. Every preview render re-mounts the whole survey bundle, so
+// following each keystroke made typing lag on large surveys (ENG-991).
+const PREVIEW_DEBOUNCE_MS = 300;
+// Memoized so the editor's per-keystroke re-renders skip the preview while its debounced inputs are
+// unchanged; without it the preview would still re-render (and re-mount the survey) every time.
+const MemoizedPreviewSurvey = memo(PreviewSurvey);
+// The "Logic has moved" flag changes only through this editor, which tracks it in state as well.
+const subscribeToNothing = () => () => {};
+
 interface SurveyEditorProps {
   survey: TSurvey;
-  workspace: Workspace;
+  workspace: TEditorWorkspace;
   actionClasses: ActionClass[];
   contactAttributeKeys: TContactAttributeKey[];
   segments: TSegment[];
@@ -56,6 +108,16 @@ interface SurveyEditorProps {
   isExternalUrlsAllowed: boolean;
   publicDomain: string;
   enterpriseLicenseRequestFormUrl: string;
+  surveyVisibilityGate: TSurveyVisibilityUiGate;
+  /** The effective visibility (a change in flight counts as restricted), not the stored flag. */
+  visibility: TSurveyVisibility;
+  surveyAccess: TSurveyAccess | null;
+  ownerName: string | null;
+  customCssEditor: TSurveyCustomCssEditorConfig;
+  /** Null when the organisation isn't entitled to data retention. */
+  dataRetention: TSurveyDataRetentionContext;
+  /** The creatives that open this survey, read on the server (a survey they open publishes without a trigger). */
+  linkedCreatives: TSurveyLinkedCreative[];
 }
 
 export const SurveyEditor = ({
@@ -88,7 +150,19 @@ export const SurveyEditor = ({
   isExternalUrlsAllowed,
   publicDomain,
   enterpriseLicenseRequestFormUrl,
+  surveyVisibilityGate,
+  visibility,
+  surveyAccess,
+  ownerName,
+  customCssEditor,
+  dataRetention,
+  linkedCreatives: initialLinkedCreatives,
 }: Readonly<SurveyEditorProps>) => {
+  const linkedCreatives = useSurveyLinkedCreatives({
+    workspaceId: survey.workspaceId,
+    surveyId: survey.id,
+    initialData: initialLinkedCreatives,
+  });
   const isFollowUpsTabVisible = shouldShowFollowUpsTab({
     followUpCount: survey.followUps.length,
     isSurveyFollowUpsAllowed,
@@ -97,13 +171,37 @@ export const SurveyEditor = ({
 
   const [activeView, setActiveView] = useState<TSurveyEditorTabs>("elements");
   const [activeElementId, setActiveElementId] = useState<string | null>(null);
+  // ENG-6929: the one-time "Logic has moved" notice, shown until the Flow tab has been opened once in
+  // this browser. Read from storage on the client only (the server snapshot says "seen", so the notice
+  // never flashes in and out on hydration); opening the Flow tab hides it for this page view even
+  // where storage is refused.
+  const hasSeenFlowInBrowser = useSyncExternalStore(subscribeToNothing, hasSeenFlowTab, () => true);
+  const [hasOpenedFlow, setHasOpenedFlow] = useState(false);
+  if (activeView === "flow" && !hasOpenedFlow) setHasOpenedFlow(true);
+  useEffect(() => {
+    if (activeView === "flow") markFlowTabSeen();
+  }, [activeView]);
+  const showLogicMovedNotice = !hasSeenFlowInBrowser && !hasOpenedFlow;
+  // Set value's field picker, when the survey has no Calculated field: the card where one is added.
+  const openEmbeddedDataCard = useCallback(() => {
+    setActiveView("elements");
+    setActiveElementId(EMBEDDED_DATA_CARD_ID);
+    scrollElementCardIntoView(EMBEDDED_DATA_CARD_ID);
+  }, []);
   // `localSurvey` must stay a structural clone of `survey`: the menu bar compares the two with
   // `isDeepEqual` to gate the draft auto-save, the back-navigation dialog and the beforeunload
-  // prompt, and that comparison short-circuits on differing key counts. ENG-1837 therefore does NOT
-  // strip the inlined `embeddedFields` here — editor surfaces read their definitions through
-  // `getDeclaredEmbeddedFields` instead, which ignores the rows and derives from the cards.
+  // prompt, and that comparison short-circuits on differing key counts. The inlined
+  // `embeddedFields` is the editor's Embedded Data state (ENG-2628) — the Variables and Hidden
+  // Fields cards edit it and every editor surface reads it — so it must arrive here exactly as the
+  // server sent it and be sent back the same way, which is also what keeps that comparison honest.
   const [localSurvey, setLocalSurvey] = useState<TSurvey | null>(() => structuredClone(survey));
+  // Only the preview trails; the editor panes keep reading `localSurvey` so input stays immediate.
+  const debouncedPreviewSurvey = useDebouncedValue(localSurvey, PREVIEW_DEBOUNCE_MS);
   const [invalidElements, setInvalidElements] = useState<string[] | null>(null);
+  // The Flow tab's open blocks, kept here because the tab unmounts on every switch: coming back keeps
+  // what was opened and closed. It opens with every block collapsed.
+  const [flowExpandedBlockIds, setFlowExpandedBlockIds] = useState<Set<string>>(() => new Set());
+  const flowHandledInvalidRef = useRef<string[] | null>(null);
   const [hasIncompleteTranslations, setHasIncompleteTranslations] = useState(false);
   // Set when a save or publish is blocked by a missing trigger, so the Survey Trigger card can say
   // so (ENG-2581). The card itself stops showing the error once the survey has a trigger.
@@ -111,8 +209,28 @@ export const SurveyEditor = ({
 
   const [selectedLanguageCode, setSelectedLanguageCode] = useState<string>("default");
 
-  // `isFollowUpsTabVisible` tracks the server `survey` prop, which a save refreshes
-  // (`survey-menu-bar` calls `router.refresh()`). Deleting the last follow-up therefore hides the
+  // ENG-3395. Visibility is changed through its own endpoint, never by a survey save, and the server
+  // decides together what is now enforced and why this user can see the survey. So after a change the
+  // route is refreshed and the banner, the Follow-ups tab and the menu bar all render from the one
+  // server answer (effective visibility, pending value, access), instead of patching one of them
+  // locally. The refresh leaves `localSurvey` alone, and the dirty check ignores the visibility
+  // columns (`unsaved-changes.ts`), so it never makes the editor look dirty.
+  const router = useRouter();
+  const [isVisibilityTurnedOff, setIsVisibilityTurnedOff] = useState(false);
+  // `visibility_not_enabled` takes the controls away at once; what is still enforced comes back from
+  // the refresh, so the banner and the Follow-ups notice follow the server rather than this answer.
+  const visibilityGate = isVisibilityTurnedOff
+    ? withoutVisibilityControls(surveyVisibilityGate)
+    : surveyVisibilityGate;
+  const handleVisibilityChanged = useCallback(() => router.refresh(), [router]);
+  // Stable: the Collaborate modal runs it from an effect.
+  const handleVisibilityNotEnabled = useCallback(() => {
+    setIsVisibilityTurnedOff(true);
+    router.refresh();
+  }, [router]);
+
+  // `isFollowUpsTabVisible` tracks the server `survey` prop, which a manual save refreshes
+  // (`updateSurveyAction` revalidates the route; the draft save calls `router.refresh()`). Deleting the last follow-up therefore hides the
   // tab while `activeView` — client state — still points at it, leaving an empty main pane with no
   // tab selected. Fall back to the elements view so the deletion flow cannot dead-end.
   useEffect(() => {
@@ -121,11 +239,52 @@ export const SurveyEditor = ({
     }
   }, [isFollowUpsTabVisible, activeView]);
   const surveyEditorRef = useRef(null);
-  const [localWorkspace, setLocalWorkspace] = useState<Workspace>(workspace);
+  const [localWorkspace, setLocalWorkspace] = useState<TEditorWorkspace>(workspace);
   const [localWorkspaceLanguages, setLocalWorkspaceLanguages] = useState<Language[]>(workspaceLanguages);
 
   const [styling, setStyling] = useState<TSurveyStyling | null>(localSurvey?.styling ?? null);
   const [localStylingChanges, setLocalStylingChanges] = useState<TSurveyStyling | null>(null);
+  // Light / Dark selector of the Styling tab (D14). The preview follows it while that tab is open.
+  const [stylingAppearance, setStylingAppearance] = useState<TStylingAppearance>("light");
+
+  // Survey Custom CSS is checked here rather than in the Styling tab because the preview needs its
+  // output on every tab: the preview only ever renders CSS the server validated for the current draft
+  // (ENG-3553). Workspace CSS always applies; the survey's own only while its style overrides do.
+  const surveyCustomCssValidation = useCustomCssValidation({
+    workspaceId: workspace.id,
+    scope: "survey",
+    surveyId: survey.id,
+    draft: toCustomCssDraft(getCustomCssSource(localSurvey?.customCss)),
+    enabled: true,
+  });
+  // Workspace CSS saved in another tab reaches the preview and the inherited panel without a reload.
+  const liveWorkspaceCss = useLiveWorkspaceCustomCss({
+    workspaceId: workspace.id,
+    enabled: true,
+    initial: { source: customCssEditor.workspace.source, compiled: customCssEditor.workspace.compiled },
+  });
+  const workspaceCompiledCss = liveWorkspaceCss.compiled;
+  const liveCustomCssEditor = useMemo(
+    () => ({
+      ...customCssEditor,
+      workspace: {
+        ...customCssEditor.workspace,
+        source: liveWorkspaceCss.source,
+        compiled: workspaceCompiledCss,
+      },
+    }),
+    [customCssEditor, liveWorkspaceCss.source, workspaceCompiledCss]
+  );
+  const isSurveyCssApplied = isSurveyCustomCssApplied({
+    allowStyleOverwrite: workspace.styling.allowStyleOverwrite,
+    overwriteThemeStyling: localSurvey?.styling?.overwriteThemeStyling,
+  });
+  const surveyPreviewCss = isSurveyCssApplied ? surveyCustomCssValidation.previewCss : null;
+  // Stable, so the memoized preview re-mounts the survey only when the validated CSS changes.
+  const previewCustomCss = useMemo(
+    () => ({ workspace: workspaceCompiledCss, survey: surveyPreviewCss }),
+    [workspaceCompiledCss, surveyPreviewCss]
+  );
 
   const fetchLatestWorkspaceData = useCallback(async () => {
     const [refetchWorkspaceResponse, refetchLanguagesResponse] = await Promise.all([
@@ -133,12 +292,17 @@ export const SurveyEditor = ({
       getWorkspaceLanguagesAction({ workspaceId: localWorkspace.id }),
     ]);
 
-    if (refetchWorkspaceResponse?.data) {
-      setLocalWorkspace(refetchWorkspaceResponse.data);
+    // Kept by identity when nothing changed: a new object re-renders every block card and the preview.
+    const workspaceData = refetchWorkspaceResponse?.data;
+    if (workspaceData) {
+      setLocalWorkspace((current) => (isDeepEqual(current, workspaceData) ? current : workspaceData));
     }
 
-    if (refetchLanguagesResponse?.data) {
-      setLocalWorkspaceLanguages(refetchLanguagesResponse.data);
+    const languagesData = refetchLanguagesResponse?.data;
+    if (languagesData) {
+      setLocalWorkspaceLanguages((current) =>
+        isDeepEqual(current, languagesData) ? current : languagesData
+      );
     }
   }, [localWorkspace.id]);
 
@@ -159,24 +323,6 @@ export const SurveyEditor = ({
     setLocalSurvey((current) => current ?? structuredClone(survey));
   }, [survey]);
 
-  useEffect(() => {
-    const listener = () => {
-      if (document.visibilityState === "visible") {
-        const fetchLatestWorkspace = async () => {
-          const refetchWorkspaceResponse = await refetchWorkspaceAction({ workspaceId: localWorkspace.id });
-          if (refetchWorkspaceResponse?.data) {
-            setLocalWorkspace(refetchWorkspaceResponse.data);
-          }
-        };
-        fetchLatestWorkspace();
-      }
-    };
-    document.addEventListener("visibilitychange", listener);
-    return () => {
-      document.removeEventListener("visibilitychange", listener);
-    };
-  }, [localWorkspace.id]);
-
   // when the survey type changes, we need to reset the active element id to the first element
   useEffect(() => {
     const firstBlock = localSurvey?.blocks[0];
@@ -194,12 +340,23 @@ export const SurveyEditor = ({
     }
   }, [localSurvey?.languages, selectedLanguageCode]);
 
+  // How the preview's banner reads a rule before the first question that screened it out: as the
+  // Flow tab writes it (ENG-6969 T13 ①).
+  const { t, i18n } = useTranslation();
+  const textLocale = i18n.resolvedLanguage ?? i18n.language ?? "en-US";
+  const describeStartRule = useCallback(
+    (rule: TSurveyBlockLogic, previewed: TSurvey) =>
+      describeRuleSummary(rule, previewed, t, { locale: textLocale }),
+    [t, textLocale]
+  );
+
   if (!localSurvey) {
     return <LoadingSkeleton />;
   }
 
   // After the null guard, we can safely narrow the setter type for child components
   const setLocalSurveyNonNull = setLocalSurvey as Dispatch<SetStateAction<TSurvey>>;
+  const previewSurvey = debouncedPreviewSurvey ?? localSurvey;
 
   return (
     <div className="flex h-full w-full flex-col">
@@ -219,7 +376,23 @@ export const SurveyEditor = ({
         locale={locale}
         setIsCautionDialogOpen={setIsCautionDialogOpen}
         isStorageConfigured={isStorageConfigured}
+        visibilityGate={visibilityGate}
+        effectiveVisibility={visibility}
+        onVisibilityChanged={handleVisibilityChanged}
+        onVisibilityNotEnabled={handleVisibilityNotEnabled}
+        surveyAccess={surveyAccess}
+        ownerName={ownerName}
+        customCssValidationStatus={surveyCustomCssValidation.status}
+        isOpenedByCreative={linkedCreatives.length > 0}
       />
+      {showRestrictedBanner({
+        enforced: visibilityGate.enforced,
+        visibility,
+        access: surveyAccess,
+      }) && (
+        // A full-width strip under the menu bar, like the bar itself.
+        <RestrictedSurveyBanner ownerName={ownerName} className="rounded-none border-x-0 border-t-0 px-5" />
+      )}
       <div className="relative z-0 flex flex-1 overflow-hidden">
         <main
           className="relative z-0 w-full overflow-y-auto bg-slate-50 focus:outline-hidden md:w-2/3"
@@ -237,6 +410,7 @@ export const SurveyEditor = ({
             <ElementsView
               localSurvey={localSurvey}
               setLocalSurvey={setLocalSurveyNonNull}
+              persistedSurvey={survey}
               activeElementId={activeElementId}
               setActiveElementId={setActiveElementId}
               workspace={localWorkspace}
@@ -247,10 +421,24 @@ export const SurveyEditor = ({
               isCxMode={isCxMode}
               locale={locale}
               responseCount={responseCount}
-              setIsCautionDialogOpen={setIsCautionDialogOpen}
               isStorageConfigured={isStorageConfigured}
               quotas={quotas}
               isExternalUrlsAllowed={isExternalUrlsAllowed}
+              showLogicMovedNotice={showLogicMovedNotice}
+              onOpenFlow={() => setActiveView("flow")}
+            />
+          )}
+
+          {activeView === "flow" && (
+            <FlowView
+              localSurvey={localSurvey}
+              setLocalSurvey={setLocalSurveyNonNull}
+              invalidElements={invalidElements}
+              setInvalidElements={setInvalidElements}
+              expandedBlockIds={flowExpandedBlockIds}
+              handledInvalidRef={flowHandledInvalidRef}
+              onAddCalculatedField={openEmbeddedDataCard}
+              setExpandedBlockIds={setFlowExpandedBlockIds}
             />
           )}
 
@@ -268,12 +456,18 @@ export const SurveyEditor = ({
               isUnsplashConfigured={isUnsplashConfigured}
               isCxMode={isCxMode}
               isStorageConfigured={isStorageConfigured}
+              appearance={stylingAppearance}
+              setAppearance={setStylingAppearance}
+              customCssEditor={liveCustomCssEditor}
+              customCssValidation={surveyCustomCssValidation}
+              savedCustomCss={survey.customCss ?? null}
             />
           )}
 
           {activeView === "language" && (
             <LanguageView
               localSurvey={localSurvey}
+              persistedSurvey={survey}
               setLocalSurvey={setLocalSurveyNonNull}
               workspaceLanguages={localWorkspaceLanguages}
               locale={locale}
@@ -283,6 +477,7 @@ export const SurveyEditor = ({
 
           {activeView === "settings" && (
             <SettingsView
+              dataRetention={dataRetention}
               localSurvey={localSurvey}
               setLocalSurvey={setLocalSurveyNonNull}
               actionClasses={actionClasses}
@@ -302,6 +497,7 @@ export const SurveyEditor = ({
               appSetupCompleted={localWorkspace.appSetupCompleted}
               enterpriseLicenseRequestFormUrl={enterpriseLicenseRequestFormUrl}
               hasTriggerError={hasTriggerError}
+              linkedCreatives={linkedCreatives}
             />
           )}
 
@@ -317,21 +513,31 @@ export const SurveyEditor = ({
               userEmail={userEmail}
               teamMemberDetails={teamMemberDetails}
               locale={locale}
+              isRestricted={isOutboundBlocked(visibilityGate.enforced, { visibility })}
+              workspaceName={localWorkspace.name}
             />
           )}
         </main>
 
         <aside className="group hidden w-1/3 shrink-0 items-center justify-center overflow-hidden border-l border-slate-200 bg-slate-100 shadow-inner md:flex md:flex-col">
-          <PreviewSurvey
-            survey={localSurvey}
-            elementId={activeElementId}
+          <MemoizedPreviewSurvey
+            survey={previewSurvey}
+            // The Flow tab's preview is for trying the flow: editing a rule there must not pull it
+            // back to the question last active on the Questions tab.
+            elementId={activeView === "flow" ? null : activeElementId}
             workspace={localWorkspace}
-            previewType={localSurvey.type === "app" ? "modal" : "fullwidth"}
+            previewType={previewSurvey.type === "app" ? "modal" : "fullwidth"}
             languageCode={selectedLanguageCode}
             setLanguageCode={setSelectedLanguageCode}
             locale={locale}
             isSpamProtectionAllowed={isSpamProtectionAllowed}
             publicDomain={publicDomain}
+            appearance={activeView === "styling" ? stylingAppearance : "light"}
+            onAppearanceChange={
+              activeView === "styling" && previewSurvey.type === "app" ? setStylingAppearance : undefined
+            }
+            customCss={previewCustomCss}
+            describeStartRule={describeStartRule}
           />
         </aside>
       </div>

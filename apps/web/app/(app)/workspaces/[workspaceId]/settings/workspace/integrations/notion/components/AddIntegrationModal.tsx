@@ -1,13 +1,18 @@
 "use client";
 
 import { createId } from "@paralleldrive/cuid2";
+import { useQueryClient } from "@tanstack/react-query";
 import Image from "next/image";
 import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
-import { getComputedEmbeddedFields, getIngestedStorageKeys } from "@formbricks/types/embedded-data-resolver";
+import { labelEmbeddedFields } from "@formbricks/types/embedded-data-label";
+import {
+  getComputedEmbeddedFields,
+  getIngestedEmbeddedFields,
+} from "@formbricks/types/embedded-data-resolver";
 import { TIntegrationInput } from "@formbricks/types/integration";
 import {
   TIntegrationNotion,
@@ -18,15 +23,21 @@ import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { getTextContent } from "@formbricks/types/surveys/validation";
 import { createOrUpdateIntegrationAction } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/actions";
+import { integrationKeys } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/lib/query";
 import {
   MappingRow,
   TMapping,
   createEmptyMapping,
 } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/notion/components/MappingRow";
 import NotionLogo from "@/images/notion.png";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { recallToHeadline } from "@/lib/utils/recall";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import {
+  RestrictedSurveyHint,
+  RestrictedSurveysNote,
+} from "@/modules/survey/visibility/components/restricted-survey-hint";
+import { isRestrictedSurveyPick } from "@/modules/survey/visibility/lib/outbound";
 import { Button } from "@/modules/ui/components/button";
 import {
   Dialog,
@@ -43,6 +54,7 @@ import { Label } from "@/modules/ui/components/label";
 interface AddIntegrationModalProps {
   workspaceId: string;
   surveys: TSurvey[];
+  surveyVisibilityEnabled: boolean;
   open: boolean;
   setOpen: React.Dispatch<React.SetStateAction<boolean>>;
   notionIntegration: TIntegrationNotion;
@@ -54,15 +66,21 @@ interface AddIntegrationModalProps {
 export const AddIntegrationModal = ({
   workspaceId,
   surveys,
+  surveyVisibilityEnabled,
   open,
   setOpen,
   notionIntegration,
   databases,
   selectedIntegration,
   contactAttributeKeys,
-}: AddIntegrationModalProps) => {
+}: Readonly<AddIntegrationModalProps>) => {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const refetchIntegration = () =>
+    queryClient.invalidateQueries({ queryKey: integrationKeys.byType(workspaceId, "notion") });
   const { handleSubmit } = useForm();
+  // The mapping being edited keeps its survey selectable even if it has since been restricted.
+  const attachedSurveyIds = selectedIntegration ? [selectedIntegration.surveyId] : [];
   const [selectedDatabase, setSelectedDatabase] = useState<TIntegrationNotionDatabase | null>();
   const [selectedSurvey, setSelectedSurvey] = useState<TSurvey | null>(null);
   const [mapping, setMapping] = useState<TMapping[]>([createEmptyMapping()]);
@@ -91,7 +109,8 @@ export const AddIntegrationModal = ({
     type: "notion",
     config: {
       key: notionIntegration?.config?.key,
-      data: notionIntegration.config?.data || [],
+      // A copy: the save and delete paths edit this array, and the original is the query cache's.
+      data: [...(notionIntegration.config?.data ?? [])],
     },
   };
 
@@ -133,9 +152,8 @@ export const AddIntegrationModal = ({
         }))
       : [];
 
-    // ENG-1837: the mapping list must name the same things the pipeline exports, and
-    // `handle-integrations.ts` labels a computed field by `field.name` and an ingested one by its
-    // storage key — so both come from the survey's Embedded Data definitions, not the legacy columns.
+    // ENG-1837: the mapping list must name the same things the pipeline exports, so both come from
+    // the survey's Embedded Data definitions, not the legacy columns.
     const variables = selectedSurvey
       ? getComputedEmbeddedFields(selectedSurvey).map(({ field, link }) => ({
           id: link.storageKey,
@@ -144,10 +162,12 @@ export const AddIntegrationModal = ({
         }))
       : [];
 
+    // ENG-3233: shown by name, still MAPPED by storage key — `id` is the address
+    // `buildNotionPayloadProperties` reads the value from, so it is what the saved mapping stores.
     const hiddenFields = selectedSurvey
-      ? getIngestedStorageKeys(selectedSurvey).map((storageKey) => ({
-          id: storageKey,
-          name: `${t("common.hidden_field")} : ${storageKey}`,
+      ? labelEmbeddedFields(getIngestedEmbeddedFields(selectedSurvey)).map(({ link, label }) => ({
+          id: link.storageKey,
+          name: `${t("common.hidden_field")} : ${label}`,
           type: TSurveyElementTypeEnum.OpenText,
         }))
       : [];
@@ -259,6 +279,7 @@ export const AddIntegrationModal = ({
       }
       resetForm();
       setOpen(false);
+      void refetchIntegration();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Unknown error occurred");
     } finally {
@@ -280,6 +301,7 @@ export const AddIntegrationModal = ({
       }
       toast.success(t("workspace.integrations.integration_removed_successfully"));
       setOpen(false);
+      void refetchIntegration();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Unknown error occurred");
     } finally {
@@ -357,6 +379,15 @@ export const AddIntegrationModal = ({
                     selectedItem={selectedSurvey}
                     setSelectedItem={setSelectedSurvey}
                     disabled={surveys.length === 0}
+                    isItemDisabled={(survey: TSurvey) =>
+                      isRestrictedSurveyPick(surveyVisibilityEnabled, survey, attachedSurveyIds)
+                    }
+                    disabledItemHint={<RestrictedSurveyHint kind="restricted" />}
+                  />
+                  <RestrictedSurveysNote
+                    surveyVisibilityEnabled={surveyVisibilityEnabled}
+                    surveys={surveys}
+                    attachedSurveyIds={attachedSurveyIds}
                   />
                   <p className="m-1 text-xs text-slate-500">
                     {surveys.length === 0 && t("workspace.integrations.create_survey_warning")}

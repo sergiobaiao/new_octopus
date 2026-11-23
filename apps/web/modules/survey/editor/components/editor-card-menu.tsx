@@ -1,15 +1,18 @@
 "use client";
 
 import { createId } from "@paralleldrive/cuid2";
-import { ArrowDownIcon, ArrowRightIcon, ArrowUpIcon, CopyIcon, EllipsisIcon, TrashIcon } from "lucide-react";
-import { useState } from "react";
+import { ArrowDownIcon, ArrowUpIcon, CopyIcon, EllipsisIcon, LockIcon, TrashIcon } from "lucide-react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Workspace } from "@formbricks/database/prisma-browser";
 import { TI18nString } from "@formbricks/types/i18n";
 import { TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurvey, TSurveyEndScreenCard, TSurveyRedirectUrlCard } from "@formbricks/types/surveys/types";
+import { type TWorkspaceWithoutCustomCss } from "@/modules/custom-css/lib/types";
+import { useCopyId } from "@/modules/survey/editor/components/copy-id-button";
+import { LOCK_TOOLTIP_DELAY_MS } from "@/modules/survey/editor/components/published-lock-notice";
 import { getBlockDisplayName } from "@/modules/survey/editor/lib/blocks";
+import { getChoiceTypeSwitchUpdate } from "@/modules/survey/editor/lib/element-type-switch";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
 import { getElementDefaults, getGroupedElementTypes } from "@/modules/survey/lib/elements";
 import { Button } from "@/modules/ui/components/button";
@@ -17,6 +20,7 @@ import { ConfirmationModal } from "@/modules/ui/components/confirmation-modal";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -34,22 +38,24 @@ type EditorCardMenuSurveyElement = TSurveyElement & {
 };
 
 interface EditorCardMenuProps {
-  survey: TSurvey;
-  cardIdx: number;
-  lastCard: boolean;
-  blockId?: string;
-  elementIdx?: number; // Index of element within its block
-  duplicateCard: (cardIdx: number) => void;
-  deleteCard: (cardIdx: number) => void;
-  moveCard: (cardIdx: number, up: boolean) => void;
-  card: EditorCardMenuSurveyElement | TSurveyEndScreenCard | TSurveyRedirectUrlCard;
-  updateCard: (cardIdx: number, updatedAttributes: any) => void;
-  addCard: (element: any, index?: number) => void;
-  addCardToBlock?: (element: TSurveyElement, blockId: string, afterElementIdx: number) => void;
-  moveElementToBlock?: (elementId: string, targetBlockId: string) => void;
-  cardType: "element" | "ending";
-  workspace?: Workspace;
-  isCxMode?: boolean;
+  readonly survey: TSurvey;
+  readonly cardIdx: number;
+  readonly lastCard: boolean;
+  readonly blockId?: string;
+  readonly elementIdx?: number; // Index of element within its block
+  readonly duplicateCard: (cardIdx: number) => void;
+  readonly deleteCard: (cardIdx: number) => void;
+  readonly moveCard: (cardIdx: number, up: boolean) => void;
+  readonly card: EditorCardMenuSurveyElement | TSurveyEndScreenCard | TSurveyRedirectUrlCard;
+  readonly updateCard: (cardIdx: number, updatedAttributes: any) => void;
+  readonly addCard: (element: any, index?: number) => void;
+  readonly addCardToBlock?: (element: TSurveyElement, blockId: string, afterElementIdx: number) => void;
+  readonly moveElementToBlock?: (elementId: string, targetBlockId: string) => void;
+  readonly cardType: "element" | "ending";
+  readonly workspace?: TWorkspaceWithoutCustomCss;
+  readonly isCxMode?: boolean;
+  /** The question existed when the survey was published: its type can no longer change. */
+  readonly isTypeLocked?: boolean;
 }
 
 export const EditorCardMenu = ({
@@ -69,9 +75,12 @@ export const EditorCardMenu = ({
   moveElementToBlock,
   cardType,
   isCxMode = false,
+  isTypeLocked = false,
 }: EditorCardMenuProps) => {
   const { t } = useTranslation();
+  const copyId = useCopyId();
   const [logicWarningModal, setLogicWarningModal] = useState(false);
+  const menuId = useId();
   const [changeToType, setChangeToType] = useState(() => {
     if (card.type !== "endScreen" && card.type !== "redirectToUrl") {
       return card.type;
@@ -94,24 +103,9 @@ export const EditorCardMenu = ({
 
     const elementDefaults = getElementDefaults(type, workspace, t);
 
-    if (
-      (type === TSurveyElementTypeEnum.MultipleChoiceSingle &&
-        card.type === TSurveyElementTypeEnum.MultipleChoiceMulti) ||
-      (type === TSurveyElementTypeEnum.MultipleChoiceMulti &&
-        card.type === TSurveyElementTypeEnum.MultipleChoiceSingle) ||
-      (type === TSurveyElementTypeEnum.MultipleChoiceMulti && card.type === TSurveyElementTypeEnum.Ranking) ||
-      (type === TSurveyElementTypeEnum.Ranking && card.type === TSurveyElementTypeEnum.MultipleChoiceMulti) ||
-      (type === TSurveyElementTypeEnum.MultipleChoiceSingle &&
-        card.type === TSurveyElementTypeEnum.Ranking) ||
-      (type === TSurveyElementTypeEnum.Ranking && card.type === TSurveyElementTypeEnum.MultipleChoiceSingle)
-    ) {
-      updateCard(cardIdx, {
-        choices: card.choices,
-        type,
-        logic: undefined,
-        validation: undefined,
-      });
-
+    const choiceSwitch = getChoiceTypeSwitchUpdate(card as EditorCardMenuSurveyElement, type);
+    if (choiceSwitch) {
+      updateCard(cardIdx, choiceSwitch);
       return;
     }
 
@@ -223,12 +217,33 @@ export const EditorCardMenu = ({
           <EllipsisIcon className="mx-auto size-4 text-slate-700 hover:text-slate-600" />
         </DropdownMenuTrigger>
 
-        <DropdownMenuContent>
+        <DropdownMenuContent className="w-56">
           <div className="flex flex-col">
-            {cardType === "element" && (
+            {cardType === "element" && isTypeLocked && (
+              <TooltipRenderer
+                delayDuration={LOCK_TOOLTIP_DELAY_MS}
+                triggerClass="block"
+                className="max-w-xs text-xs leading-relaxed"
+                tooltipContent={
+                  <>
+                    <p className="mb-1 font-semibold">
+                      {t("workspace.surveys.edit.locked_after_publishing")}
+                    </p>
+                    <p>{t("workspace.surveys.edit.lock_explanation_type")}</p>
+                  </>
+                }>
+                <DropdownMenuItem
+                  disabled
+                  data-testid="change-question-type-locked"
+                  icon={<LockIcon className="size-4" />}>
+                  {t("workspace.surveys.edit.change_question_type")}
+                </DropdownMenuItem>
+              </TooltipRenderer>
+            )}
+            {cardType === "element" && !isTypeLocked && (
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger
-                  className="cursor-pointer text-sm text-slate-600 hover:text-slate-700"
+                  className="min-h-8 cursor-pointer text-slate-700"
                   onClick={(e) => e.preventDefault()}>
                   {t("workspace.surveys.edit.change_question_type")}
                 </DropdownMenuSubTrigger>
@@ -241,9 +256,13 @@ export const EditorCardMenu = ({
                     }))
                     .filter((group) => group.elements.length > 0)
                     .map((group, index) => (
-                      <div key={group.category.id}>
+                      <DropdownMenuGroup
+                        key={group.category.id}
+                        aria-labelledby={`${menuId}-change-${group.category.id}`}>
                         {index > 0 && <DropdownMenuSeparator />}
-                        <DropdownMenuLabel className="pt-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">
+                        <DropdownMenuLabel
+                          id={`${menuId}-change-${group.category.id}`}
+                          className="pt-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">
                           {group.category.label}
                         </DropdownMenuLabel>
                         {group.elements.map((elementType) => (
@@ -262,7 +281,7 @@ export const EditorCardMenu = ({
                             <span className="ml-2">{elementType.label}</span>
                           </DropdownMenuItem>
                         ))}
-                      </div>
+                      </DropdownMenuGroup>
                     ))}
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
@@ -280,15 +299,21 @@ export const EditorCardMenu = ({
 
             {cardType === "element" && (
               <DropdownMenuSub>
-                <DropdownMenuSubTrigger className="cursor-pointer" onClick={(e) => e.preventDefault()}>
+                <DropdownMenuSubTrigger
+                  className="min-h-8 cursor-pointer text-slate-700"
+                  onClick={(e) => e.preventDefault()}>
                   {t("workspace.surveys.edit.add_question_below")}
                 </DropdownMenuSubTrigger>
 
                 <DropdownMenuSubContent className="ml-2">
                   {groupedElementTypes.map((group, index) => (
-                    <div key={group.category.id}>
+                    <DropdownMenuGroup
+                      key={group.category.id}
+                      aria-labelledby={`${menuId}-add-${group.category.id}`}>
                       {index > 0 && <DropdownMenuSeparator />}
-                      <DropdownMenuLabel className="pt-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">
+                      <DropdownMenuLabel
+                        id={`${menuId}-add-${group.category.id}`}
+                        className="pt-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">
                         {group.category.label}
                       </DropdownMenuLabel>
                       {group.elements.map((elementType) => (
@@ -305,14 +330,16 @@ export const EditorCardMenu = ({
                           <span className="ml-2">{elementType.label}</span>
                         </DropdownMenuItem>
                       ))}
-                    </div>
+                    </DropdownMenuGroup>
                   ))}
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
             )}
             {cardType === "element" && moveElementToBlock && survey.blocks.length > 1 && (
               <DropdownMenuSub>
-                <DropdownMenuSubTrigger className="cursor-pointer" onClick={(e) => e.preventDefault()}>
+                <DropdownMenuSubTrigger
+                  className="min-h-8 cursor-pointer text-slate-700"
+                  onClick={(e) => e.preventDefault()}>
                   {t("workspace.surveys.edit.move_question_to_block")}
                 </DropdownMenuSubTrigger>
 
@@ -329,38 +356,36 @@ export const EditorCardMenu = ({
                         onClick={(e) => {
                           e.stopPropagation();
                           moveElementToBlock(card.id, block.id);
-                        }}
-                        icon={<ArrowRightIcon className="size-4" />}>
-                        <span className="ml-2">{blockName}</span>
+                        }}>
+                        {blockName}
                       </DropdownMenuItem>
                     );
                   })}
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
             )}
-            <DropdownMenuItem
-              onClick={(e) => {
-                if (cardIdx !== 0) {
-                  e.stopPropagation();
-                  moveCard(cardIdx, true);
-                }
-              }}
-              icon={<ArrowUpIcon className="size-4" />}
-              disabled={cardIdx === 0}>
-              <span>{t("common.move_up")}</span>
-            </DropdownMenuItem>
-
-            <DropdownMenuItem
-              onClick={(e) => {
-                if (!lastCard) {
-                  e.stopPropagation();
-                  moveCard(cardIdx, false);
-                }
-              }}
-              icon={<ArrowDownIcon className="size-4" />}
-              disabled={lastCard}>
-              <span>{t("common.move_down")}</span>
-            </DropdownMenuItem>
+            {cardType === "element" && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="h-auto min-h-8 items-start bg-slate-100 py-1.5"
+                  data-testid="copy-question-id"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void copyId(card.id);
+                  }}
+                  icon={<CopyIcon className="mt-0.5 size-4" />}>
+                  <span className="flex flex-col">
+                    <span>{t("workspace.surveys.edit.copy_question_id")}</span>
+                    <span
+                      className="font-mono text-xs font-normal text-slate-500"
+                      data-testid="question-id-value">
+                      {card.id}
+                    </span>
+                  </span>
+                </DropdownMenuItem>
+              </>
+            )}
           </div>
         </DropdownMenuContent>
       </DropdownMenu>

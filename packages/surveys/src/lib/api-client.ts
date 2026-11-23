@@ -2,10 +2,11 @@ import { TDisplayCreateInput } from "@formbricks/types/displays";
 import { Result } from "@formbricks/types/error-handlers";
 import { type ApiErrorResponse, FILE_UPLOAD_ERROR_NAMES } from "@formbricks/types/errors";
 import { TSurveyQuotaAction } from "@formbricks/types/quota";
-import { TResponseInput, TResponseUpdateInput } from "@formbricks/types/responses";
+import { TClientResponseInput, TClientResponseUpdateInput } from "@formbricks/types/responses";
 import {
   STORAGE_CONFIGURATION_ERROR_CODES,
   type TStorageApiErrorDetails,
+  type TUploadFileAccess,
   type TUploadFileConfig,
   type TUploadFileResponse,
 } from "@formbricks/types/storage";
@@ -74,7 +75,7 @@ export class ApiClient {
   }
 
   async createResponse(
-    responseInput: Omit<TResponseInput, "workspaceId"> & {
+    responseInput: Omit<TClientResponseInput, "workspaceId"> & {
       contactId: string | null;
       recaptchaToken?: string;
     }
@@ -98,7 +99,9 @@ export class ApiClient {
     variables,
     language,
     pinAuthToken,
-  }: TResponseUpdateInput & { responseId: string }): Promise<
+    markLowQuality,
+    notShown,
+  }: TClientResponseUpdateInput & { responseId: string }): Promise<
     Result<TResponseUpdateResponse, ApiErrorResponse>
   > {
     return makeRequest(this.appUrl, `/api/v1/client/${this.workspaceId}/responses/${responseId}`, "PUT", {
@@ -109,6 +112,8 @@ export class ApiClient {
       variables,
       language,
       pinAuthToken,
+      markLowQuality,
+      notShown,
     });
   }
 
@@ -118,7 +123,14 @@ export class ApiClient {
       name: string;
       base64: string;
     },
-    { allowedFileExtensions, surveyId, elementId }: TUploadFileConfig | undefined = {}
+    {
+      allowedFileExtensions,
+      surveyId,
+      elementId,
+      pinAuthToken,
+      singleUseId,
+      url,
+    }: (TUploadFileConfig & TUploadFileAccess) | undefined = {}
   ): Promise<string> {
     if (!file.name || !file.type || !file.base64) {
       throw new Error(`Invalid file object`);
@@ -130,6 +142,9 @@ export class ApiClient {
       allowedFileExtensions,
       surveyId,
       elementId,
+      pinAuthToken,
+      singleUseId,
+      url,
     };
 
     const response = await fetch(`${this.appUrl}/api/v1/client/${this.workspaceId}/storage`, {

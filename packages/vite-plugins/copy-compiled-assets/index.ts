@@ -1,4 +1,4 @@
-import { access, copyFile, mkdir, readdir, stat } from "node:fs/promises";
+import { access, copyFile, mkdir, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { type Plugin, type ResolvedConfig } from "vite";
 
@@ -6,6 +6,8 @@ interface CopyCompiledAssetsPluginOptions {
   filename: string;
   distDir: string;
   skipDirectoryCheck?: boolean; // New option to skip checking non-existent directories
+  localesDir?: string; // Locale JSON to publish beside the bundle for on-demand loading
+  fontsDir?: string; // Font files (and their licenses) to publish beside the bundle for on-demand loading
 }
 
 const ensureDirectoryExists = async (dirPath: string): Promise<void> => {
@@ -18,6 +20,30 @@ const ensureDirectoryExists = async (dirPath: string): Promise<void> => {
       throw error;
     }
   }
+};
+
+/**
+ * Replace `destDir` with the files of `srcDir` that `include` accepts, returning how many were copied.
+ *
+ * Replaced rather than copied over. Turbo captures every file the directory's output glob matches after
+ * the task runs, whoever wrote it, so a file left behind by an older build (a renamed locale, a dropped
+ * font) would be captured into the cache entry and restored on every hit — outliving its source, and
+ * making the same cache key hold different bytes run to run.
+ */
+const replaceDirectory = async (
+  srcDir: string,
+  destDir: string,
+  include: (file: string) => boolean
+): Promise<number> => {
+  await rm(destDir, { recursive: true, force: true });
+  await ensureDirectoryExists(destDir);
+
+  const files = (await readdir(srcDir)).filter(include);
+  for (const file of files) {
+    await copyFile(path.resolve(srcDir, file), path.resolve(destDir, file));
+  }
+
+  return files.length;
 };
 
 export function copyCompiledAssetsPlugin(options: CopyCompiledAssetsPluginOptions): Plugin {
@@ -84,6 +110,33 @@ export function copyCompiledAssetsPlugin(options: CopyCompiledAssetsPluginOption
         }
 
         console.log(`Copied ${String(copiedFiles)} files to ${outputDir} (${options.filename})`);
+
+        // The survey runtime fetches these at display time instead of carrying all of them in the
+        // bundle, so they are a build output like the bundle itself — see `loadLanguage`. Declared in
+        // turbo.json alongside it, or a cached build would restore the bundle without them and every
+        // non-English survey would quietly render English.
+        if (options.localesDir) {
+          const localesOutputDir = path.resolve(outputDir, "locales");
+          const copied = await replaceDirectory(options.localesDir, localesOutputDir, (file) =>
+            file.endsWith(".json")
+          );
+
+          console.log(`Copied ${String(copied)} locale files to ${localesOutputDir}`);
+        }
+
+        // The survey runtime fetches the typed-signature font only when a respondent opens a Signature
+        // element's Type tab, so it stays out of the bundle and is copied beside it like the locales —
+        // and, for the same reason, replaced rather than copied over, and declared in turbo.json.
+        if (options.fontsDir) {
+          const fontsOutputDir = path.resolve(outputDir, "fonts");
+          const copied = await replaceDirectory(
+            options.fontsDir,
+            fontsOutputDir,
+            (file) => file.endsWith(".woff2") || file.endsWith(".txt")
+          );
+
+          console.log(`Copied ${String(copied)} font files to ${fontsOutputDir}`);
+        }
       } catch (error) {
         if (options.skipDirectoryCheck) {
           console.error(

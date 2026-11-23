@@ -1,4 +1,5 @@
 import "server-only";
+import { logger } from "@formbricks/logger";
 import { type StorageError, StorageErrorCode } from "@formbricks/storage";
 import { TResponseData } from "@formbricks/types/responses";
 import {
@@ -11,12 +12,21 @@ import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import { responses } from "@/app/lib/api/response";
 import { WEBAPP_URL } from "@/lib/constants";
 import { getPublicDomain } from "@/lib/getPublicUrl";
-import { type TFileUploadCandidate, getSurveyFileUploadConfigs } from "./survey-file-upload-elements";
+import {
+  type TStringUploadElementKind,
+  type TSurveyUploadElementIds,
+  type TUploadElementCandidate,
+  createEmptyUploadElementIds,
+  getSurveyUploadElementConfigs,
+  getUploadElementAllowedExtensions,
+  mapUploadElementTypes,
+  uploadElementKinds,
+} from "./survey-upload-elements";
 import { getOriginalFileNameFromUrl } from "./url-helpers";
 
 // Re-exports for backward compatibility with server-side code
 export { getOriginalFileNameFromUrl } from "./url-helpers";
-export { getSurveyFileUploadConfigs } from "./survey-file-upload-elements";
+export { getSurveyUploadElementConfigs } from "./survey-upload-elements";
 
 /**
  * Sanitize a provided file name to a safe subset.
@@ -92,7 +102,7 @@ export const isAllowedFileExtension = (fileName: string): boolean => {
 
 export const validateSingleFile = (
   fileUrl: string,
-  allowedFileExtensions?: TAllowedFileExtension[]
+  allowedFileExtensions?: readonly TAllowedFileExtension[]
 ): boolean => {
   const fileName = getOriginalFileNameFromUrl(fileUrl);
   if (!fileName) return false;
@@ -101,13 +111,17 @@ export const validateSingleFile = (
   return !allowedFileExtensions || allowedFileExtensions.includes(extension as TAllowedFileExtension);
 };
 
-export type TSurveyFileUploadPermissionResult =
+export type TSurveyUploadPermissionResult =
   | {
       ok: true;
     }
   | {
       ok: false;
-      reason: "no_file_upload_element" | "file_upload_element_not_found" | "file_extension_not_allowed";
+      reason:
+        | "no_file_upload_element"
+        | "file_upload_element_not_found"
+        | "file_extension_not_allowed"
+        | "file_name_not_allowed";
     };
 
 const getAllowedFileExtensionFromFileName = (fileName: string): TAllowedFileExtension | null => {
@@ -122,53 +136,202 @@ const getAllowedFileExtensionFromFileName = (fileName: string): TAllowedFileExte
 /**
  * The ids of the elements whose answers hold storage URLs.
  *
- * Every response-file delete path needs the id set rather than the configs, and it must come from the
+ * Every response-file delete path needs the id sets rather than the configs, and they must come from the
  * union of `blocks` and `questions` — the same source write-time validation reads — because keying off
  * a single shape silently skips deletes for the other.
  *
- * Split from `collectResponseFileUrls` so a caller scanning many responses builds the set once, and so
- * it can skip its scan entirely when the set is empty.
+ * Split from `collectResponseFileUrls` so a caller scanning many responses builds the sets once. Empty
+ * sets do not mean there is nothing to collect: a survey-scoped key is collected without them. Only a
+ * scan that wants flat keys alone may skip on an empty `fileUpload` set.
  */
-export const getSurveyFileUploadElementIds = (survey: {
+export const getSurveyUploadElementIds = (survey: {
   blocks?: TSurveyBlock[] | null;
-  questions?: readonly TFileUploadCandidate[] | null;
-}): Set<string> =>
-  new Set(
-    getSurveyFileUploadConfigs({ blocks: survey.blocks, questions: survey.questions }).map(
-      (config) => config.id
-    )
+  questions?: readonly TUploadElementCandidate[] | null;
+}): TSurveyUploadElementIds => {
+  const configs = getSurveyUploadElementConfigs({ blocks: survey.blocks, questions: survey.questions });
+
+  return mapUploadElementTypes(
+    (type) => new Set(configs.filter((config) => config.type === type).map((config) => config.id))
   );
+};
+
+/** A percent-encoded `/`, `\` or `.`: the characters a key's segments are split on or stepped out of by. */
+const hasEncodedPathSeparator = (value: string): boolean => /%(?:2f|5c|2e)/i.test(value);
+
+/** A literal `.` or `..` path segment, which an absolute URL's parser would silently resolve away. */
+const hasDotSegment = (value: string): boolean =>
+  value
+    .split(/[?#]/)[0]
+    .split("/")
+    .some((segment) => segment === "." || segment === "..");
 
 /**
- * Pulls the storage URLs out of one response's answers, ready to hand to `deleteResponseFileUrls`.
+ * Whose file one storage URL found in the answer to `elementId` is, when cleaning up `surveyId`.
  *
- * Only file-upload answers hold storage URLs, and they are always stored as an array of strings.
- * Anything else under a matching key is skipped rather than cast, so malformed data cannot produce a
- * bogus delete target.
+ * A key filed under a survey (`{id}/private/surveys/{surveyId}/elements/{elementId}/…`, every upload
+ * since #8044) names the survey and element it was uploaded for, so the key decides, not whether that
+ * element still exists. It is `own` only when both match: the answer it sits under is the element's, and
+ * write-time validation (`isScopedPrivateUploadUrl`) only ever stores a key under its own element. So a
+ * deleted element's files are still collected, while a same-survey URL pasted into another answer (a
+ * multi-select "Other", say) is not.
+ *
+ * Anything else filed under a survey is `refused`. That covers a same-workspace URL planted under a key
+ * that only later became an upload element (the ENG-2291 flip), which passes `deleteResponseFileUrls`'
+ * workspace check, so the binding is enforced here. A public key is never a response upload.
+ *
+ * A flat pre-#8044 key (`{prefix}/private/{file}`) names no survey, so it is trusted only under a current
+ * upload element. One left by a deleted element stays in storage: an accepted legacy leak, since every
+ * upload since #8044 gets a scoped key.
+ */
+const getResponseFileUrlOwner = ({
+  fileUrl,
+  elementId,
+  isFileUploadAnswer,
+  isBareString,
+  surveyId,
+}: {
+  fileUrl: string;
+  elementId: string;
+  isFileUploadAnswer: boolean;
+  isBareString: boolean;
+  surveyId: string;
+}): "own" | "refused" | "none" => {
+  // `getStorageUrlSurveyId`'s reading, with the URL parsed once: a name that does not decode names no
+  // survey.
+  const parsed = parseStorageFileUrl(fileUrl);
+  const fileName = parsed ? decodeStorageUrlFileName(parsed.fileName) : null;
+  const scope = fileName === null ? undefined : getStorageFileNameScope(fileName);
+
+  // The upload route never emits an encoded separator or a dot segment, so a bare string holding one was
+  // written by hand, not uploaded. It is refused outright rather than read.
+  // Arrays are left as they were: older File upload names may hold one.
+  if (parsed && isBareString && (hasEncodedPathSeparator(fileUrl) || hasDotSegment(fileUrl))) {
+    return "refused";
+  }
+  if (!parsed || !scope?.surveyId) return isFileUploadAnswer ? "own" : "none";
+  if (parsed.accessType !== "private") return "none";
+  return scope.surveyId === surveyId && scope.elementId === elementId ? "own" : "refused";
+};
+
+/**
+ * Pulls the storage URLs one response of `surveyId` owns out of its answers, ready to hand to
+ * `deleteResponseFileUrls`. Which URLs count is `getResponseFileUrlOwner`'s rule.
+ *
+ * File-upload answers are stored as an array of strings, so an array answer is read under any id, and
+ * only its string entries. A Signature answer is one string (ADR 0023), and a bare string is read under
+ * any id, live or not, of any element type: what makes it a target is its key, not its element. A key
+ * filed under this survey and the answer's own element id (`getResponseFileUrlOwner`) can only have been
+ * written for that element, which only held an upload while it was a File upload or a Signature, so a
+ * deleted element or one retyped to Free text still has its image removed with the response. The same
+ * answer holding a pasted URL for another survey or element, a public key or a flat pre-#8044 key is
+ * not a target, so a text answer cannot aim a delete at someone else's file.
+ *
+ * A bare string never owns a flat pre-#8044 key: only File upload arrays have that history, so a flat
+ * key counts only inside an array under a current File upload id.
+ *
+ * URLs refused for naming another survey or element are logged as a count, never the URLs: they are the
+ * trace a planted URL leaves.
  *
  * `data` is deliberately `unknown`: callers hand this a raw `Prisma.JsonValue` column or an already
  * typed `TResponseData`, and the shape is checked here either way rather than cast at each call site.
  */
-export const collectResponseFileUrls = (data: unknown, fileUploadElementIds: Set<string>): string[] => {
-  if (fileUploadElementIds.size === 0 || !data || typeof data !== "object" || Array.isArray(data)) {
+export const collectResponseFileUrls = (
+  data: unknown,
+  elementIds: TSurveyUploadElementIds,
+  surveyId: string
+): string[] => {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
     return [];
   }
 
   const fileUrls: string[] = [];
+  let refusedCount = 0;
   // Typed rather than left as `Object.entries`' implicit `any` values, so the guards below are the only
   // thing that narrows an answer to a string.
   const answers: [string, unknown][] = Object.entries(data);
 
   for (const [elementId, answer] of answers) {
-    if (fileUploadElementIds.has(elementId) && Array.isArray(answer)) {
-      fileUrls.push(...answer.filter((url): url is string => typeof url === "string"));
+    let answerUrls: unknown[];
+    if (Array.isArray(answer)) {
+      answerUrls = answer;
+    } else if (typeof answer === "string") {
+      answerUrls = [answer];
+    } else {
+      continue;
     }
+
+    const isBareString = typeof answer === "string";
+    const isFileUploadAnswer = !isBareString && elementIds.fileUpload.has(elementId);
+    for (const fileUrl of answerUrls) {
+      if (typeof fileUrl !== "string") continue;
+
+      const owner = getResponseFileUrlOwner({
+        fileUrl,
+        elementId,
+        isFileUploadAnswer,
+        isBareString,
+        surveyId,
+      });
+      if (owner === "own") fileUrls.push(fileUrl);
+      if (owner === "refused") refusedCount++;
+    }
+  }
+
+  if (refusedCount > 0) {
+    logger.warn({ surveyId, refusedCount }, "Refusing response files filed under another survey or element");
   }
 
   return fileUrls;
 };
 
-export const validateSurveyAllowsFileUpload = ({
+/** The key a storage URL names, so a relative and an absolute spelling of one file compare equal. */
+const getStorageFileKey = (fileUrl: string): string => {
+  const parsed = parseStorageFileUrl(fileUrl);
+  return parsed ? `${parsed.storageId}/${parsed.accessType}/${parsed.fileName}` : fileUrl;
+};
+
+/**
+ * The Signature images a write to a response leaves behind: the old file of each Signature answer the
+ * write cleared, removed or replaced by another file (ADR 0023). Clearing a signature is the respondent
+ * withdrawing it, and a replaced one is never shown again, so neither image should outlive the answer.
+ *
+ * `nextData` is what the response holds after the write (the merged data for a merging update, the new
+ * data for a replacing one), so an answer the write did not touch compares equal and is kept, as is the
+ * same file spelled as a relative and as an absolute URL (a client re-submitting what a read returned).
+ * Only Signature ids are read: a File upload's array keeps its behaviour. A URL still has to be filed
+ * under this survey and the answer's own element id (`collectResponseFileUrls`), so a write cannot aim a
+ * delete at another survey's, another element's or a flat key's file.
+ */
+export const collectReplacedSignatureFileUrls = ({
+  previousData,
+  nextData,
+  signatureElementIds,
+  surveyId,
+}: {
+  previousData: unknown;
+  nextData: unknown;
+  signatureElementIds: ReadonlySet<string>;
+  surveyId: string;
+}): string[] => {
+  if (!previousData || typeof previousData !== "object" || Array.isArray(previousData)) return [];
+  const next: Record<string, unknown> =
+    nextData && typeof nextData === "object" && !Array.isArray(nextData) ? { ...nextData } : {};
+  const noUploadElementIds = createEmptyUploadElementIds();
+
+  const fileUrls: string[] = [];
+  for (const [elementId, previous] of Object.entries(previousData)) {
+    if (!signatureElementIds.has(elementId) || typeof previous !== "string" || previous === "") continue;
+
+    const current = next[elementId];
+    if (typeof current === "string" && getStorageFileKey(current) === getStorageFileKey(previous)) continue;
+
+    fileUrls.push(...collectResponseFileUrls({ [elementId]: previous }, noUploadElementIds, surveyId));
+  }
+
+  return fileUrls;
+};
+
+export const validateSurveyAllowsUpload = ({
   fileName,
   elementId,
   blocks,
@@ -177,20 +340,20 @@ export const validateSurveyAllowsFileUpload = ({
   fileName: string;
   elementId: string;
   blocks?: TSurveyBlock[] | null;
-  questions?: readonly TFileUploadCandidate[] | null;
-}): TSurveyFileUploadPermissionResult => {
-  const fileUploadConfigs = getSurveyFileUploadConfigs({ blocks, questions });
+  questions?: readonly TUploadElementCandidate[] | null;
+}): TSurveyUploadPermissionResult => {
+  const uploadElementConfigs = getSurveyUploadElementConfigs({ blocks, questions });
 
-  if (fileUploadConfigs.length === 0) {
+  if (uploadElementConfigs.length === 0) {
     return {
       ok: false,
       reason: "no_file_upload_element",
     };
   }
 
-  const fileUploadConfig = fileUploadConfigs.find((config) => config.id === elementId);
+  const uploadElementConfig = uploadElementConfigs.find((config) => config.id === elementId);
 
-  if (!fileUploadConfig) {
+  if (!uploadElementConfig) {
     return {
       ok: false,
       reason: "file_upload_element_not_found",
@@ -206,16 +369,28 @@ export const validateSurveyAllowsFileUpload = ({
     };
   }
 
-  const { allowedFileExtensions } = fileUploadConfig;
+  const allowedFileExtensions = getUploadElementAllowedExtensions(uploadElementConfig);
   const isFileExtensionAllowed =
     allowedFileExtensions === undefined || allowedFileExtensions.includes(fileExtension);
 
-  return isFileExtensionAllowed
-    ? { ok: true }
-    : {
-        ok: false,
-        reason: "file_extension_not_allowed",
-      };
+  if (!isFileExtensionAllowed) {
+    return {
+      ok: false,
+      reason: "file_extension_not_allowed",
+    };
+  }
+
+  // A kind that stores one fixed name (a Signature) accepts only that name, so the stored file is one a
+  // later write accepts.
+  const kind = uploadElementKinds[uploadElementConfig.type];
+  if (kind.answerShape === "string" && fileName !== kind.uploadFileName) {
+    return {
+      ok: false,
+      reason: "file_name_not_allowed",
+    };
+  }
+
+  return { ok: true };
 };
 
 // Origins that may legitimately prefix an absolute storage URL. A response GET resolves stored
@@ -265,13 +440,10 @@ type TParsedStorageFileUrl = {
 };
 
 export const parseStorageFileUrl = (fileUrl: string): TParsedStorageFileUrl | null => {
-  let pathname: string;
-
-  try {
-    pathname = fileUrl.startsWith("/storage/") ? fileUrl : new URL(fileUrl).pathname;
-  } catch {
-    return null;
-  }
+  // `URL.parse` returns null instead of throwing. Response-file collection runs this on every string of
+  // every array answer, so a throw per non-URL string would add up fast on a row holding thousands.
+  const pathname = fileUrl.startsWith("/storage/") ? fileUrl : URL.parse(fileUrl)?.pathname;
+  if (!pathname) return null;
 
   const pathWithoutSearch = pathname.split(/[?#]/)[0];
   if (!pathWithoutSearch.startsWith("/storage/")) return null;
@@ -291,6 +463,56 @@ export const parseStorageFileUrl = (fileUrl: string): TParsedStorageFileUrl | nu
   }
 
   return { storageId, accessType, fileName };
+};
+
+/**
+ * The survey a storage URL's object key is filed under: the `{surveyId}` of a current upload
+ * (`{id}/private/surveys/{surveyId}/…`), or `null` for a key that names no survey — the flat
+ * pre-#8044 keys, and anything that does not parse.
+ *
+ * Reads the key the way the delete path builds it. `deleteResponseFileUrls` decodes the file name
+ * before deleting, so the check decodes too: on the raw URL, `%73urveys/{other}/…` or
+ * `surveys%2F{other}%2F…` would read as a flat key and still delete `surveys/{other}/…`. A name that
+ * does not decode returns `null`, because the delete path fails on it the same way and deletes
+ * nothing.
+ */
+export const getStorageUrlSurveyId = (fileUrl: string): string | null => {
+  const parsed = parseStorageFileUrl(fileUrl);
+  const fileName = parsed ? decodeStorageUrlFileName(parsed.fileName) : null;
+
+  return fileName === null ? null : getStorageFileNameScope(fileName).surveyId;
+};
+
+/**
+ * A storage URL carries its file name percent-encoded once, and the object is stored under the decoded
+ * name. Returns null for a name that does not decode: the delete path fails on it too, so it reaches no
+ * object.
+ */
+const decodeStorageUrlFileName = (encodedFileName: string): string | null => {
+  try {
+    return decodeURIComponent(encodedFileName);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Which survey (and, for an upload, which element) an object key's file name is filed under.
+ *
+ * `fileName` is the name as the storage layer uses it to build the key, so this does not decode: a URL's
+ * file part is decoded first (`decodeStorageUrlFileName`), and the route's catch-all segments, which the
+ * router has already decoded once, are joined with `/` and passed as they are.
+ */
+export const getStorageFileNameScope = (
+  fileName: string
+): { isSurveyScope: boolean; surveyId: string | null; elementId: string | null } => {
+  const [scope, surveyId, elementsSegment, elementId] = fileName.split("/");
+  const isSurveyScope = scope === "surveys" && fileName.includes("/");
+  return {
+    isSurveyScope,
+    surveyId: isSurveyScope && surveyId ? surveyId : null,
+    elementId: isSurveyScope && elementsSegment === "elements" && elementId ? elementId : null,
+  };
 };
 
 const isScopedPrivateUploadUrl = ({
@@ -360,6 +582,87 @@ const isScopedPrivateUploadUrl = ({
   return false;
 };
 
+/**
+ * A bare-string answer (a Signature, ADR 0023) is valid when it is a skipped `""` (if the element type
+ * allows that) or one URL, filed under this workspace, survey and element, whose file name is the one the
+ * upload route gives the type's export (`fileNamePattern`), with no encoded separator or dot anywhere.
+ * This checks the URL, not the object: whether the file exists is not read on a public write route.
+ * Anything else under such an id (an array, a number, a URL for another element) is refused: the id
+ * decides what shape is accepted, and the URL decides whose file it is.
+ */
+const isValidBareStringAnswer = ({
+  answer,
+  kind,
+  workspaceId,
+  surveyId,
+  elementId,
+}: {
+  answer: unknown;
+  kind: TStringUploadElementKind;
+  workspaceId: string;
+  surveyId: string;
+  elementId: string;
+}): boolean => {
+  if (typeof answer !== "string") return false;
+  if (answer === "" && kind.emptyStringIsSkipped) return true;
+  if (hasEncodedPathSeparator(answer) || hasDotSegment(answer)) return false;
+  // No empty path segment (`//`): a store or proxy that merges them would read a different key than the
+  // one validated here. A query or hash after the name stays accepted, as in the URL a GET returns.
+  if (
+    answer
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+      .split(/[?#]/)[0]
+      .includes("//")
+  )
+    return false;
+
+  return (
+    validateSingleFile(answer, kind.fixedAllowedExtensions) &&
+    isScopedPrivateUploadUrl({ fileUrl: answer, workspaceId, surveyId, elementId }) &&
+    // Whatever the key's other segments say, the stored file must carry the name the upload route gives
+    // this kind's export, so a hand-made value cannot stand in for a signature.
+    kind.fileNamePattern.test(getStorageUrlPathSegments(answer)?.at(-1) ?? "")
+  );
+};
+
+type TUploadElementConfig = ReturnType<typeof getSurveyUploadElementConfigs>[number];
+
+/** One URL string per element (ADR 0023) or an array of URLs, as the element's kind says. */
+const isValidUploadElementAnswer = ({
+  answer,
+  config,
+  workspaceId,
+  surveyId,
+  legacyOwnedStoragePrefixes,
+}: {
+  answer: unknown;
+  config: TUploadElementConfig;
+  workspaceId: string;
+  surveyId: string;
+  legacyOwnedStoragePrefixes?: string[];
+}): boolean => {
+  const kind = uploadElementKinds[config.type];
+
+  if (kind.answerShape === "string") {
+    // Never a pre-#8044 flat key: no legacy prefixes.
+    return isValidBareStringAnswer({ answer, kind, workspaceId, surveyId, elementId: config.id });
+  }
+
+  if (!Array.isArray(answer) || !answer.every((url) => typeof url === "string")) return false;
+
+  return answer.every(
+    (fileUrl) =>
+      validateSingleFile(fileUrl, getUploadElementAllowedExtensions(config)) &&
+      isScopedPrivateUploadUrl({
+        fileUrl,
+        workspaceId,
+        surveyId,
+        elementId: config.id,
+        legacyOwnedStoragePrefixes,
+      })
+  );
+};
+
 export const validateClientFileUploads = ({
   data,
   workspaceId,
@@ -372,7 +675,7 @@ export const validateClientFileUploads = ({
   workspaceId: string;
   surveyId: string;
   blocks?: TSurveyBlock[] | null;
-  questions?: readonly TFileUploadCandidate[] | null;
+  questions?: readonly TUploadElementCandidate[] | null;
   // Passed by the management routes (see getWorkspaceLegacyEnvironmentId) so a replayed old response
   // whose file URL predates the scoped shape still validates against a prefix the workspace owns.
   // Omitted by the client widget path, which stays strict on the scoped shape.
@@ -380,31 +683,11 @@ export const validateClientFileUploads = ({
 }): boolean => {
   if (!data) return true;
 
-  const fileUploadConfigs = getSurveyFileUploadConfigs({ blocks, questions });
-
-  for (const fileUploadConfig of fileUploadConfigs) {
-    const fileUrls = data[fileUploadConfig.id];
-
-    if (fileUrls === undefined) continue;
-    if (!Array.isArray(fileUrls) || !fileUrls.every((url) => typeof url === "string")) return false;
-
-    for (const fileUrl of fileUrls) {
-      if (!validateSingleFile(fileUrl, fileUploadConfig.allowedFileExtensions)) return false;
-      if (
-        !isScopedPrivateUploadUrl({
-          fileUrl,
-          workspaceId,
-          surveyId,
-          elementId: fileUploadConfig.id,
-          legacyOwnedStoragePrefixes,
-        })
-      ) {
-        return false;
-      }
-    }
-  }
-
-  return true;
+  return getSurveyUploadElementConfigs({ blocks, questions }).every((config) => {
+    const answer = data[config.id];
+    if (answer === undefined) return true;
+    return isValidUploadElementAnswer({ answer, config, workspaceId, surveyId, legacyOwnedStoragePrefixes });
+  });
 };
 
 export const isValidImageFile = (fileUrl: string): boolean => {

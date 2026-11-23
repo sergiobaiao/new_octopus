@@ -12,7 +12,7 @@ import { TUser } from "@formbricks/types/user";
 import { SettingsCard } from "@/app/(app)/workspaces/[workspaceId]/settings/components/SettingsCard";
 import { cn } from "@/lib/cn";
 import { isExternalImageSrc } from "@/lib/image-hosts";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import {
   removeOrganizationEmailLogoUrlAction,
   sendTestEmailAction,
@@ -30,15 +30,15 @@ import { ModalButton, UpgradePrompt } from "@/modules/ui/components/upgrade-prom
 const allowedFileExtensions: TAllowedFileExtension[] = ["jpeg", "png", "jpg", "webp"];
 
 interface EmailCustomizationSettingsProps {
-  organization: TOrganization;
-  hasWhiteLabelPermission: boolean;
-  workspaceId: string;
-  isReadOnly: boolean;
-  isFormbricksCloud: boolean;
-  user: TUser | null;
-  fbLogoUrl: string;
-  isStorageConfigured: boolean;
-  enterpriseLicenseRequestFormUrl: string;
+  readonly organization: TOrganization;
+  readonly hasWhiteLabelPermission: boolean;
+  readonly workspaceId: string;
+  readonly isReadOnly: boolean;
+  readonly isFormbricksCloud: boolean;
+  readonly user: TUser | null;
+  readonly fbLogoUrl: string;
+  readonly isStorageConfigured: boolean;
+  readonly enterpriseLicenseRequestFormUrl: string;
 }
 
 export const EmailCustomizationSettings = ({

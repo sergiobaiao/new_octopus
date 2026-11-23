@@ -1,8 +1,11 @@
 import "server-only";
 import { createId } from "@paralleldrive/cuid2";
+import { AI_DEFAULT_TIMEOUT_MS } from "@formbricks/types/ai-timeout";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/constants";
+import { fillMissingCodes } from "@formbricks/types/surveys/fill-missing-codes";
 import type { InvalidParam } from "@/app/api/v3/lib/response";
 import { generateOrganizationAIObject } from "@/lib/ai/service";
+import { getAITimeoutMs } from "@/lib/ai/timeout";
 import { AI_TRACING_FEATURE } from "@/lib/posthog/ai-tracing-feature";
 import { type TV3SurveyPrepareResult, prepareV3SurveyCreateInput } from "../prepare";
 import { DEFAULT_V3_SURVEY_LANGUAGE, type TV3CreateSurveyBody, formatV3ZodInvalidParams } from "../schemas";
@@ -15,9 +18,9 @@ import {
   type TGeneratedSurveyDraft,
   type TGeneratedSurveyElement,
   type TV3SurveyGenerateBody,
-  V3_SURVEY_GENERATE_ALLOWED_LOCALES,
   ZGeneratedSurveyDraft,
-  ZGeneratedSurveyDraftForAI,
+  getGeneratedSurveyDraftForAISchema,
+  getV3SurveyGenerateDraftLanguages,
 } from "./schemas";
 
 export type TV3SurveyGenerateValidation = {
@@ -32,7 +35,7 @@ export type TV3SurveyGenerateResult = {
   validation: TV3SurveyGenerateValidation;
 };
 
-const V3_SURVEY_GENERATION_TIMEOUT_MS = 45_000;
+const V3_SURVEY_GENERATION_TIMEOUT_MS = AI_DEFAULT_TIMEOUT_MS;
 
 // Gemini 2.5 Flash spends a large share of the output budget on reasoning tokens before emitting
 // the survey JSON; 8192 leaves headroom for both so long prompts don't stop with finishReason
@@ -342,11 +345,15 @@ function buildCreatePayload(input: TV3SurveyGenerateBody, generatedSurvey: TGene
             showResponseCount: false,
           }
         : { enabled: false },
-    blocks: generatedSurvey.blocks.map((block) => ({
-      id: createId(),
-      name: block.name,
-      elements: block.questions.map((element) => buildElement(element, questionIndex++, language)),
-    })),
+    // ENG-6782: generated questions and options arrive without codes; give them the defaults.
+    blocks: fillMissingCodes(
+      generatedSurvey.blocks.map((block) => ({
+        id: createId(),
+        name: block.name,
+        elements: block.questions.map((element) => buildElement(element, questionIndex++, language)),
+      })),
+      []
+    ),
     endings: [
       {
         id: createId(),
@@ -396,23 +403,26 @@ export function assertV3SurveyGeneratePrompt(prompt: string): void {
  * hand-copied temperature.
  */
 export function buildV3SurveyGenerationRequest(input: TV3SurveyGenerateBody) {
+  const draftLanguages = getV3SurveyGenerateDraftLanguages(input);
+
   return {
     // Deliberately the *ForAI* schema (string ranges), not ZGeneratedSurveyDraft, which
     // z.preprocess-coerces them to numbers. z.preprocess does not survive JSON-Schema conversion,
     // so swapping the two here breaks provider structured output.
-    schema: ZGeneratedSurveyDraftForAI,
+    schema: getGeneratedSurveyDraftForAISchema(draftLanguages),
     schemaName: "FormbricksSurveyDraft",
     schemaDescription: "A concise Formbricks survey draft that can be converted to a v3 create payload.",
-    system: buildV3SurveyGenerationSystemPrompt(V3_SURVEY_GENERATE_ALLOWED_LOCALES, input.type),
+    system: buildV3SurveyGenerationSystemPrompt(draftLanguages, input.type, input.surveyLanguage),
     prompt: buildV3SurveyGenerationPrompt(
       input.prompt,
       input.type,
       input.language ?? DEFAULT_V3_SURVEY_LANGUAGE,
-      V3_SURVEY_GENERATE_ALLOWED_LOCALES
+      draftLanguages,
+      input.surveyLanguage
     ),
     temperature: 0.2,
     maxOutputTokens: V3_SURVEY_GENERATION_MAX_OUTPUT_TOKENS,
-    timeout: V3_SURVEY_GENERATION_TIMEOUT_MS,
+    timeout: getAITimeoutMs(V3_SURVEY_GENERATION_TIMEOUT_MS),
   };
 }
 
@@ -445,6 +455,22 @@ export function buildV3SurveyCreatePayloadFromDraft(
     throw new V3SurveyGeneratedPayloadValidationError(
       formatV3ZodInvalidParams(generatedSurvey.error, "generatedSurvey")
     );
+  }
+
+  // The narrowed schema only binds a provider that enforces structured output; a local model may
+  // ignore it, and a draft under a language code the request did not allow must not be relabelled or
+  // passed on. This checks the declared code only — the text itself is not language-detected, which is
+  // what the review step before "Save and continue" is for.
+  const draftLanguages = getV3SurveyGenerateDraftLanguages(input);
+  if (!draftLanguages.includes(generatedSurvey.data.language)) {
+    throw new V3SurveyGeneratedPayloadValidationError([
+      {
+        name: "generatedSurvey.language",
+        reason: input.surveyLanguage
+          ? `Expected the requested survey language '${input.surveyLanguage}', got '${generatedSurvey.data.language}'`
+          : `Language '${generatedSurvey.data.language}' was not requested; pass it as language or surveyLanguage`,
+      },
+    ]);
   }
 
   const normalizedGeneratedSurvey = normalizeGeneratedSurveyBlocks(generatedSurvey.data);

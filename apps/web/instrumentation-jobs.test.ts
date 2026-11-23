@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+const online = vi.hoisted(() => ({ enabled: true }));
+vi.mock("@/lib/upgrade/compatibility", () => ({ isNewReleaseWorkEnabled: async () => online.enabled }));
+
 const mockStartJobsRuntime = vi.fn();
 const mockRemoveSurveyScheduling = vi.fn();
 const mockUpsertSurveyScheduling = vi.fn();
@@ -13,6 +16,10 @@ const mockRemoveWorkflowsUsageSnapshot = vi.fn();
 const mockUpsertWorkflowsUsageSnapshot = vi.fn();
 const mockUpsertAuthzedProjectionDelivery = vi.fn();
 const mockUpsertAuthzedReconciliationAudit = vi.fn();
+const mockUpsertDeletionCleanupDrain = vi.fn();
+const mockUpsertDataRetentionSweep = vi.fn();
+const mockUpsertCreativeStatsFlush = vi.fn();
+const mockUpsertEmailAuditMaintenance = vi.fn();
 const mockDebug = vi.fn();
 const mockError = vi.fn();
 const mockWarn = vi.fn();
@@ -26,7 +33,14 @@ const mockProcessWorkflowRunJob = vi.fn();
 const mockProcessWorkflowRunReconcileJob = vi.fn();
 const mockProcessWorkflowsUsageSnapshotJob = vi.fn();
 const mockProcessAuthzedProjectionDeliveryJob = vi.fn();
+const mockObserveAuthzedOutboxHealth = vi.fn();
+const mockStartAuthzedOutboxSafetyNet = vi.fn();
+const mockStopAuthzedOutboxSafetyNet = vi.fn();
 const mockProcessAuthzedScheduledReconciliationJob = vi.fn();
+const mockProcessDeletionCleanupDrainJob = vi.fn();
+const mockProcessDataRetentionSweepJob = vi.fn();
+const mockProcessCreativeStatsFlushJob = vi.fn();
+const mockProcessEmailAuditMaintenanceJob = vi.fn();
 const TEST_TIMEOUT_MS = 15_000;
 
 const slowTest = (name: string, fn: () => Promise<void>): void => {
@@ -37,10 +51,24 @@ const slowTest = (name: string, fn: () => Promise<void>): void => {
 // handles, so the env-derived timing it pairs with each job stays under test.
 vi.mock("@formbricks/jobs", () => ({
   ONE_SHOT_JOB_NAMES: {
+    attachmentExport: "attachment-export.process",
     responsePipeline: "response-pipeline.process",
+    webhookDelivery: "webhook-delivery.process",
     workflowRun: "workflow-run.process",
   },
   recurringJobs: {
+    attachmentExportReconcile: {
+      name: "attachment-export.reconcile",
+      scheduleId: "attachment-export-reconcile",
+      scope: "global",
+      upsert: vi.fn(),
+    },
+    emailAuditMaintenance: {
+      name: "email-audit.maintain",
+      scheduleId: "email-audit-maintenance",
+      scope: "global",
+      upsert: mockUpsertEmailAuditMaintenance,
+    },
     authzedProjectionDelivery: {
       name: "authzed-projection.deliver",
       scheduleId: "authzed-projection-delivery",
@@ -52,6 +80,30 @@ vi.mock("@formbricks/jobs", () => ({
       scheduleId: "authzed-reconciliation-audit",
       scope: "global",
       upsert: mockUpsertAuthzedReconciliationAudit,
+    },
+    authzedSurveyAudit: {
+      name: "authzed-survey.audit",
+      scheduleId: "daily-authzed-survey-audit",
+      scope: "global",
+      upsert: vi.fn(),
+    },
+    creativeStatsFlush: {
+      name: "creative-stats.flush",
+      scheduleId: "creative-stats-flush",
+      scope: "global",
+      upsert: mockUpsertCreativeStatsFlush,
+    },
+    dataRetentionSweep: {
+      name: "data-retention.sweep",
+      scheduleId: "daily-data-retention-sweep",
+      scope: "global",
+      upsert: mockUpsertDataRetentionSweep,
+    },
+    deletionCleanupDrain: {
+      name: "deletion-cleanup.drain",
+      scheduleId: "deletion-cleanup-drain",
+      scope: "global",
+      upsert: mockUpsertDeletionCleanupDrain,
     },
     surveyArchivePurge: {
       name: "survey-archive-purge.process",
@@ -106,6 +158,12 @@ vi.mock("@formbricks/logger", () => ({
   },
 }));
 
+vi.mock("@/modules/storage/attachment-export/process-attachment-export-job", () => ({
+  processAttachmentExportJob: vi.fn(),
+}));
+vi.mock("@/modules/storage/attachment-export/process-attachment-export-reconcile-job", () => ({
+  processAttachmentExportReconcileJob: vi.fn(),
+}));
 vi.mock("@/modules/response-pipeline/lib/process-response-pipeline-job", () => ({
   processResponsePipelineJob: mockProcessResponsePipelineJob,
 }));
@@ -134,18 +192,43 @@ vi.mock("@/modules/ee/workflows/lib/analytics/process-workflows-usage-snapshot-j
   processWorkflowsUsageSnapshotJob: mockProcessWorkflowsUsageSnapshotJob,
 }));
 
+vi.mock("@/modules/ee/data-retention/sweep/process-data-retention-sweep-job", () => ({
+  processDataRetentionSweepJob: mockProcessDataRetentionSweepJob,
+}));
+
+vi.mock("@/modules/ee/creatives/lib/process-creative-stats-flush-job", () => ({
+  CREATIVE_STATS_FLUSH_INTERVAL_MS: 60_000,
+  processCreativeStatsFlushJob: mockProcessCreativeStatsFlushJob,
+}));
+
+vi.mock("@/modules/deletion-cleanup/lib/process-deletion-cleanup-drain-job", () => ({
+  processDeletionCleanupDrainJob: mockProcessDeletionCleanupDrainJob,
+}));
+
+vi.mock("@/modules/email/lib/email-audit-maintenance", () => ({
+  processEmailAuditMaintenanceJob: mockProcessEmailAuditMaintenanceJob,
+}));
+
 vi.mock("@/lib/authzed/outbox-processor", () => ({
+  observeAuthzedOutboxHealth: mockObserveAuthzedOutboxHealth,
   processAuthzedProjectionDeliveryJob: mockProcessAuthzedProjectionDeliveryJob,
+}));
+
+vi.mock("@/lib/authzed/outbox-safety-net", () => ({
+  startAuthzedOutboxSafetyNet: mockStartAuthzedOutboxSafetyNet,
+  stopAuthzedOutboxSafetyNet: mockStopAuthzedOutboxSafetyNet,
 }));
 
 vi.mock("@/lib/authzed/scheduled-reconciliation", () => ({
   processAuthzedScheduledReconciliationJob: mockProcessAuthzedScheduledReconciliationJob,
+  processAuthzedSurveyAuditJob: vi.fn(),
 }));
 
 describe("instrumentation-jobs", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    online.enabled = true;
     vi.useFakeTimers();
     mockRemoveSurveyScheduling.mockResolvedValue(true);
     mockRemoveSurveyArchivePurge.mockResolvedValue(true);
@@ -208,6 +291,8 @@ describe("instrumentation-jobs", () => {
     expect(result).toBeNull();
     expect(mockStartJobsRuntime).not.toHaveBeenCalled();
     expect(mockUpsertSurveyScheduling).not.toHaveBeenCalled();
+    expect(mockObserveAuthzedOutboxHealth).not.toHaveBeenCalled();
+    expect(mockStartAuthzedOutboxSafetyNet).not.toHaveBeenCalled();
     expect(mockDebug).toHaveBeenCalledWith("BullMQ worker startup skipped");
   });
 
@@ -238,13 +323,22 @@ describe("instrumentation-jobs", () => {
     expect(second).toBe(mockRuntime);
     expect(mockStartJobsRuntime).toHaveBeenCalledTimes(1);
     expect(mockStartJobsRuntime).toHaveBeenCalledWith({
+      manageSignals: true,
       concurrency: 4,
       jobHandlerOverrides: {
+        "attachment-export.process": expect.any(Function),
+        "attachment-export.reconcile": expect.any(Function),
         "authzed-projection.deliver": expect.any(Function),
         "authzed-reconciliation.audit": expect.any(Function),
+        "authzed-survey.audit": expect.any(Function),
+        "creative-stats.flush": expect.any(Function),
+        "data-retention.sweep": expect.any(Function),
+        "deletion-cleanup.drain": expect.any(Function),
+        "email-audit.maintain": expect.any(Function),
         "response-pipeline.process": expect.any(Function),
         "survey-scheduling.reconcile": expect.any(Function),
         "survey-archive-purge.process": expect.any(Function),
+        "webhook-delivery.process": expect.any(Function),
         "workflow-run.process": expect.any(Function),
         "test-log.process": mockExistingOverride,
         "usage-telemetry.process": expect.any(Function),
@@ -442,6 +536,21 @@ describe("instrumentation-jobs", () => {
       { retryDelayMs: 30_000 },
       "BullMQ worker registration retry scheduled"
     );
+    // Outbox health keeps reporting from PostgreSQL even though the runtime never reached Redis
+    // (ENG-3764): a Redis outage is one of the ways delivery stops.
+    expect(mockObserveAuthzedOutboxHealth).toHaveBeenCalled();
+    // So does delivery: the safety net drains the outbox from PostgreSQL while Redis is unreachable,
+    // and stops taking work once the server starts draining.
+    expect(mockStartAuthzedOutboxSafetyNet).toHaveBeenCalledTimes(1);
+    const shouldRun = mockStartAuthzedOutboxSafetyNet.mock.calls[0][0] as () => boolean;
+    expect(shouldRun()).toBe(true);
+    const lifecycleGlobal = globalThis as { formbricksServerLifecycle?: { draining: boolean } };
+    lifecycleGlobal.formbricksServerLifecycle = { draining: true };
+    try {
+      expect(shouldRun()).toBe(false);
+    } finally {
+      delete lifecycleGlobal.formbricksServerLifecycle;
+    }
   });
 
   slowTest("retries worker startup after a transient failure", async () => {
@@ -468,6 +577,49 @@ describe("instrumentation-jobs", () => {
 
     expect(mockStartJobsRuntime).toHaveBeenCalledTimes(2);
     await expect(registerJobsWorker()).resolves.toBe(recoveredRuntime);
+  });
+
+  test("keeps the survey audit scheduler inactive until durable activation is observed", async () => {
+    online.enabled = false;
+    mockGetJobsQueueingConfig.mockReturnValue({ enabled: true, redisUrl: "redis://localhost:6379" });
+    const { registerRecurringJobs } = await import("./instrumentation-jobs");
+    const { RECURRING_JOB_REGISTRATIONS_BY_KEY } = await import("@/lib/jobs/recurring-registrations");
+    const audit = RECURRING_JOB_REGISTRATIONS_BY_KEY.authzedSurveyAudit.job.upsert;
+    await registerRecurringJobs();
+    expect(audit).not.toHaveBeenCalled();
+    online.enabled = true;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(audit).toHaveBeenCalledOnce();
+    await registerRecurringJobs();
+    expect(audit).toHaveBeenCalledOnce();
+  });
+
+  test("schedules the data retention sweep and cleanup drain only once the release is activated, but AuthZed delivery at once", async () => {
+    online.enabled = false;
+    mockGetJobsQueueingConfig.mockReturnValue({ enabled: true, redisUrl: "redis://localhost:6379" });
+    const { registerRecurringJobs } = await import("./instrumentation-jobs");
+    const { RECURRING_JOB_REGISTRATIONS_BY_KEY } = await import("@/lib/jobs/recurring-registrations");
+    const sweep = RECURRING_JOB_REGISTRATIONS_BY_KEY.dataRetentionSweep.job.upsert;
+    const drain = RECURRING_JOB_REGISTRATIONS_BY_KEY.deletionCleanupDrain.job.upsert;
+    const emailAudit = RECURRING_JOB_REGISTRATIONS_BY_KEY.emailAuditMaintenance.job.upsert;
+    const creativeStats = RECURRING_JOB_REGISTRATIONS_BY_KEY.creativeStatsFlush.job.upsert;
+    const delivery = RECURRING_JOB_REGISTRATIONS_BY_KEY.authzedProjectionDelivery.job.upsert;
+
+    await registerRecurringJobs();
+    expect(sweep).not.toHaveBeenCalled();
+    expect(drain).not.toHaveBeenCalled();
+    expect(emailAudit).not.toHaveBeenCalled();
+    // Replicas of the previous release have no handler for the creative counter flush.
+    expect(creativeStats).not.toHaveBeenCalled();
+    // Revocations must keep reaching SpiceDB throughout the upgrade, or every check fails closed.
+    expect(delivery).toHaveBeenCalled();
+
+    online.enabled = true;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sweep).toHaveBeenCalledOnce();
+    expect(drain).toHaveBeenCalledOnce();
+    expect(emailAudit).toHaveBeenCalledOnce();
+    expect(creativeStats).toHaveBeenCalledOnce();
   });
 
   slowTest(
@@ -503,6 +655,9 @@ describe("instrumentation-jobs", () => {
         await import("@/modules/ee/workflows/lib/runner/reconcile-constants");
       const { WORKFLOWS_USAGE_SNAPSHOT_DAILY_CRON_PATTERN, WORKFLOWS_USAGE_SNAPSHOT_TIME_ZONE } =
         await import("@/modules/ee/workflows/lib/analytics/constants");
+      const { DELETION_CLEANUP_DRAIN_INTERVAL_MS } = await import("@/modules/deletion-cleanup/lib/constants");
+      const { DATA_RETENTION_SWEEP_DAILY_CRON_PATTERN, DATA_RETENTION_SWEEP_TIME_ZONE } =
+        await import("@/modules/ee/data-retention/sweep/constants");
 
       await registerRecurringJobs();
       await registerRecurringJobs();
@@ -520,6 +675,27 @@ describe("instrumentation-jobs", () => {
         everyMs: 6 * 60 * 60 * 1_000,
         kind: "every",
       });
+      expect(mockUpsertDataRetentionSweep).toHaveBeenCalledOnce();
+      expect(mockUpsertDataRetentionSweep).toHaveBeenCalledWith({
+        cronPattern: DATA_RETENTION_SWEEP_DAILY_CRON_PATTERN,
+        kind: "cron",
+        timeZone: DATA_RETENTION_SWEEP_TIME_ZONE,
+      });
+      // After the night's scheduling, before the archive purge at 01:30, in the same zone.
+      expect(DATA_RETENTION_SWEEP_TIME_ZONE).toBe(SURVEY_SCHEDULING_TIME_ZONE);
+      expect(mockUpsertDeletionCleanupDrain).toHaveBeenCalledOnce();
+      expect(mockUpsertDeletionCleanupDrain).toHaveBeenCalledWith({
+        everyMs: DELETION_CLEANUP_DRAIN_INTERVAL_MS,
+        kind: "every",
+      });
+      expect(mockUpsertEmailAuditMaintenance).toHaveBeenCalledOnce();
+      expect(mockUpsertEmailAuditMaintenance).toHaveBeenCalledWith({
+        everyMs: 5 * 60_000,
+        kind: "every",
+      });
+      // Creative counts reach the stats operation within about a minute (ENG-4000).
+      expect(mockUpsertCreativeStatsFlush).toHaveBeenCalledOnce();
+      expect(mockUpsertCreativeStatsFlush).toHaveBeenCalledWith({ everyMs: 60_000, kind: "every" });
       expect(mockUpsertSurveyScheduling).toHaveBeenCalledTimes(1);
       expect(mockUpsertSurveyScheduling).toHaveBeenCalledWith({
         cronPattern: SURVEY_SCHEDULING_DAILY_CRON_PATTERN,
@@ -618,7 +794,22 @@ describe("instrumentation-jobs", () => {
       await import("./instrumentation-jobs");
 
     await expect(registerJobsWorker()).resolves.toBe(failingRuntime);
-    await expect(resetJobsWorkerRegistrationForTests()).resolves.toBeUndefined();
+    // The reset waits for the safety net to stop, so a drain it started cannot outlive the test.
+    let releaseSafetyNet!: () => void;
+    mockStopAuthzedOutboxSafetyNet.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        releaseSafetyNet = resolve;
+      })
+    );
+    let reset = false;
+    const resetting = resetJobsWorkerRegistrationForTests().then(() => {
+      reset = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockStopAuthzedOutboxSafetyNet).toHaveBeenCalledOnce();
+    expect(reset).toBe(false);
+    releaseSafetyNet();
+    await resetting;
     await expect(registerJobsWorker()).resolves.toBe(nextRuntime);
 
     expect(mockStartJobsRuntime).toHaveBeenCalledTimes(2);

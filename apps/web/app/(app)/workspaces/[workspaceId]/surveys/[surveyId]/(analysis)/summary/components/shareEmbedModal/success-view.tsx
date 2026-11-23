@@ -12,15 +12,15 @@ import {
 import { ShareSurveyLink } from "@/modules/analysis/components/ShareSurveyLink";
 
 interface SuccessViewProps {
-  survey: TSurvey;
-  surveyUrl: string;
-  publicDomain: string;
-  setSurveyUrl: (url: string) => void;
-  user: TUser;
-  tabs: { id: ShareViaType | ShareSettingsType; label: string; icon: React.ElementType }[];
-  handleViewChange: (view: "start" | "share") => void;
-  handleEmbedViewWithTab: (tabId: ShareViaType | ShareSettingsType) => void;
-  isReadOnly: boolean;
+  readonly survey: TSurvey;
+  readonly surveyUrl: string;
+  readonly publicDomain: string;
+  readonly setSurveyUrl: (url: string) => void;
+  readonly user: TUser;
+  readonly tabs: { id: ShareViaType | ShareSettingsType; label: string; icon: React.ElementType }[];
+  readonly handleViewChange: (view: "start" | "share") => void;
+  readonly handleEmbedViewWithTab: (tabId: ShareViaType | ShareSettingsType) => void;
+  readonly isReadOnly: boolean;
 }
 
 export const SuccessView: React.FC<SuccessViewProps> = ({
@@ -41,7 +41,7 @@ export const SuccessView: React.FC<SuccessViewProps> = ({
       {survey.type === "link" && (
         <div className="flex h-2/5 w-full flex-col items-center justify-center gap-8 py-[100px] text-center">
           <p className="text-xl font-semibold text-slate-900">
-            {t("workspace.surveys.summary.your_survey_is_public")} 🎉
+            {t("workspace.surveys.summary.your_survey_is_active")} 🎉
           </p>
           <ShareSurveyLink
             survey={survey}

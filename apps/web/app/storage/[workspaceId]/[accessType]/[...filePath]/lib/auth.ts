@@ -1,14 +1,39 @@
 import { NextRequest } from "next/server";
 import { Result, err, ok } from "@formbricks/types/error-handlers";
 import { authenticateRequest } from "@/app/api/v1/auth";
-import { can } from "@/lib/authorization";
+import { type TAuthorizationActor, can } from "@/lib/authorization";
 import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { SURVEY_ACTION_FOR_METHOD } from "@/lib/survey/visibility/api-key";
 import { getSession } from "@/modules/auth/lib/session";
+import { getStorageFileNameScope } from "@/modules/storage/utils";
+
+/**
+ * ENG-3282: a file under `surveys/{surveyId}/…` belongs to that survey, so once visibility is enforced
+ * the survey has to be reachable too — a restricted survey's uploads are its owner's and the organization
+ * administrators'. Legacy paths name no survey and keep the workspace check alone.
+ *
+ * The survey is read from the joined name as given — the key the storage read and delete build — not
+ * from the individual segments: the router decodes each segment once, so `surveys%2F{id}%2F…` in the URL
+ * is already the single segment `surveys/{id}/…` here, and storage reads that same name. The name is not
+ * decoded again, because storage does not either: a literal `%` is part of the file name. A `surveys/` key
+ * with an empty survey segment is refused: it names no survey the caller could be checked against.
+ */
+const canReachSurveyFile = async (
+  actor: TAuthorizationActor,
+  filePath: ReadonlyArray<string>,
+  action: "GET" | "DELETE"
+): Promise<boolean> => {
+  const scope = getStorageFileNameScope(filePath.join("/"));
+  if (!scope.isSurveyScope) return true;
+  if (!scope.surveyId) return false;
+  return can(actor, SURVEY_ACTION_FOR_METHOD[action], { type: "survey", id: scope.surveyId });
+};
 
 export const authorizePrivateDownload = async (
   request: NextRequest,
   workspaceId: string,
-  action: "GET" | "DELETE"
+  action: "GET" | "DELETE",
+  filePath: ReadonlyArray<string>
 ): Promise<
   Result<
     { authType: "session"; userId: string } | { authType: "apiKey"; apiKeyId: string },
@@ -25,7 +50,10 @@ export const authorizePrivateDownload = async (
       getWorkspaceAuthorizationActionForMethod(action),
       { type: "workspace", id: workspaceId }
     );
-    if (!isUserAuthorized) {
+    if (
+      !isUserAuthorized ||
+      !(await canReachSurveyFile({ type: "user", id: session.user.id }, filePath, action))
+    ) {
       return err({
         unauthorized: true,
       });
@@ -48,7 +76,8 @@ export const authorizePrivateDownload = async (
     !(await can({ type: "apiKey", id: auth.apiKeyId }, getWorkspaceAuthorizationActionForMethod(action), {
       type: "workspace",
       id: workspaceId,
-    }))
+    })) ||
+    !(await canReachSurveyFile({ type: "apiKey", id: auth.apiKeyId }, filePath, action))
   ) {
     return err({
       unauthorized: true,

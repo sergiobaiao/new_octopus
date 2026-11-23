@@ -4,7 +4,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { createId } from "@paralleldrive/cuid2";
 import {
   ArrowDownIcon,
-  EyeOffIcon,
+  FileType2Icon,
   HandshakeIcon,
   MailIcon,
   TriangleAlertIcon,
@@ -67,17 +67,17 @@ import {
 import { cn } from "@/modules/ui/lib/utils";
 
 interface AddFollowUpModalProps {
-  localSurvey: TSurvey;
-  open: boolean;
-  setOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  selectedLanguageCode: string;
-  mailFrom: string;
-  defaultValues?: Partial<TCreateSurveyFollowUpForm & { surveyFollowUpId: string }>;
-  mode?: "create" | "edit";
-  userEmail: string;
-  teamMemberDetails: TFollowUpEmailToUser[];
-  setLocalSurvey: React.Dispatch<React.SetStateAction<TSurvey>>;
-  locale: TUserLocale;
+  readonly localSurvey: TSurvey;
+  readonly open: boolean;
+  readonly setOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  readonly selectedLanguageCode: string;
+  readonly mailFrom: string;
+  readonly defaultValues?: Partial<TCreateSurveyFollowUpForm & { surveyFollowUpId: string }>;
+  readonly mode?: "create" | "edit";
+  readonly userEmail: string;
+  readonly teamMemberDetails: TFollowUpEmailToUser[];
+  readonly setLocalSurvey: React.Dispatch<React.SetStateAction<TSurvey>>;
+  readonly locale: TUserLocale;
 }
 
 export const FollowUpModal = ({
@@ -96,6 +96,7 @@ export const FollowUpModal = ({
   const { t } = useTranslation();
   const ELEMENTS_ICON_MAP = getElementIconMap(t);
   const containerRef = useRef<HTMLDivElement>(null);
+  const wasOpen = useRef(false);
   const [firstRender, setFirstRender] = useState(true);
 
   const emailSendToOptions: EmailSendToOption[] = useMemo(
@@ -285,7 +286,7 @@ export const FollowUpModal = ({
   }, [open, firstRender]);
 
   useEffect(() => {
-    if (open && defaultValues) {
+    if (open && !wasOpen.current && defaultValues) {
       // Same builder as the initial `defaultValues` above: two hand-maintained copies of this object
       // is what shipped #7218, and this one had already drifted — its `subject` fallback was a
       // hardcoded English string, so a non-English author editing a follow-up with no stored subject
@@ -299,6 +300,9 @@ export const FollowUpModal = ({
         })
       );
     }
+    // Parent renders recreate defaultValues and recipient options. Only initialize on opening;
+    // resetting an already-open form would silently replace the user's unsaved edits.
+    wasOpen.current = open;
   }, [open, defaultValues, emailSendToOptions, form, userEmail, locale, t]);
 
   const handleModalClose = (open: boolean) => {
@@ -324,7 +328,13 @@ export const FollowUpModal = ({
       case "verifiedEmail":
         return { icon: <MailIcon className="size-4" /> };
       case "hiddenField":
-        return { icon: <EyeOffIcon className="size-4" /> };
+        // Same truncation as the other user-named labels: the row is `w-full` and a flex item does
+        // not shrink below its content unless it clips, so a long field name would otherwise squeeze
+        // the library key beside it (`secondaryLabel`) down to nothing.
+        return {
+          icon: <FileType2Icon className="size-4" />,
+          textClass: "overflow-hidden text-ellipsis whitespace-nowrap",
+        };
       case "user":
         return {
           icon: <UserIcon className="size-4" />,
@@ -348,9 +358,15 @@ export const FollowUpModal = ({
 
     return (
       <SelectItem key={option.id} value={option.id}>
-        <div className="flex items-center gap-x-2">
+        <div className="flex w-full items-center gap-x-2">
           {icon}
           <span className={textClass}>{option.label}</span>
+          {/* A shared Embedded Data field's library key — see `EmailSendToOption.secondaryLabel`. */}
+          {option.secondaryLabel ? (
+            <span className="ml-auto truncate pl-2 font-mono text-xs text-slate-500">
+              {option.secondaryLabel}
+            </span>
+          ) : null}
         </div>
       </SelectItem>
     );
@@ -620,10 +636,19 @@ export const FollowUpModal = ({
                                           </div>
                                         ) : null}
 
+                                        {/*
+                                          Ingested fields only, under the whole category's name:
+                                          `buildEmailSendToOptions` lists `getIngestedEmbeddedFields`,
+                                          because an address a recipient is read from arrives with the
+                                          response rather than being computed during it. The heading
+                                          names the category the rows belong to, not everything in it.
+                                        */}
                                         {emailSendToHiddenFieldOptions.length > 0 ? (
                                           <div className="flex flex-col">
                                             <div className="flex gap-x-2 p-2">
-                                              <p className="text-sm text-slate-500">Hidden Fields</p>
+                                              <p className="text-sm text-slate-500">
+                                                {t("common.embedded_data")}
+                                              </p>
                                             </div>
 
                                             {emailSendToHiddenFieldOptions.map((option) =>
@@ -635,7 +660,7 @@ export const FollowUpModal = ({
                                         {userSendToEmailOptions.length > 0 ? (
                                           <div className="flex flex-col">
                                             <div className="flex gap-x-2 p-2">
-                                              <p className="text-sm text-slate-500">Users</p>
+                                              <p className="text-sm text-slate-500">{t("common.users")}</p>
                                             </div>
 
                                             {userSendToEmailOptions.map((option) => renderSelectItem(option))}

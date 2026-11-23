@@ -1,18 +1,23 @@
 "use client";
 
 import { MotionConfig, motion } from "framer-motion";
-import { ExpandIcon, GlobeIcon, MonitorIcon, ShrinkIcon, SmartphoneIcon } from "lucide-react";
+import { ExpandIcon, GlobeIcon, ShrinkIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Workspace } from "@formbricks/database/prisma-browser";
 import { getLanguageLabel } from "@formbricks/i18n-utils/utils";
-import { getDeclaredEmbeddedFields } from "@formbricks/types/embedded-data-resolver";
+import type { TRendererCustomCss } from "@formbricks/types/custom-css";
+import { resolveDarkColors } from "@formbricks/types/dark-palette";
+import { resolveOverlayAppearance } from "@formbricks/types/overlay";
 import { getLinkSurveyCardMaxWidth } from "@formbricks/types/styling";
+import type { TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import { TSurvey, TSurveyLanguage, TSurveyStyling } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
 import { TWorkspaceStyling } from "@formbricks/types/workspace";
 import { cn } from "@/lib/cn";
+import { type TStylingAppearance } from "@/lib/styling/dark-mode";
 import { toJsWorkspaceStateSurvey } from "@/lib/survey/client-utils";
+import { type TWorkspaceWithoutCustomCss } from "@/modules/custom-css/lib/types";
+import { findReservedFieldUse } from "@/modules/survey/editor/lib/utils";
 import { isRTLLanguage } from "@/modules/survey/link/lib/utils";
 import { CardlessPreviewLogo } from "@/modules/ui/components/cardless-preview-logo";
 import { ClientLogo } from "@/modules/ui/components/client-logo";
@@ -26,7 +31,24 @@ import { MediaBackground } from "@/modules/ui/components/media-background";
 import { ResetProgressButton } from "@/modules/ui/components/reset-progress-button";
 import { SurveyInline } from "@/modules/ui/components/survey";
 import { Modal } from "./components/modal";
-import { TabOption } from "./components/tab-option";
+import { PreviewModeSwitches, PreviewWindowBar } from "./components/preview-frame";
+import { StartScreenOutBanner } from "./components/start-screen-out-banner";
+import {
+  type TTestValuesOpenRequest,
+  TestValuesControl,
+  TestValuesStrip,
+} from "./components/test-values-control";
+import { PREVIEW_BOUNDARY_CLASS_NAME, previewBoundaryProps } from "./lib/containment";
+import { INITIAL_FOLLOW_STATE, followActiveElement } from "./lib/follow-active-element";
+import { findStartScreenOut, getScreenOutFieldKey } from "./lib/start-screen-out";
+import {
+  PAGE_URL_TEST_VALUE_KEY,
+  getPreviewStartKey,
+  getTestValueEntries,
+  getTestValueFields,
+  restartsPreviewOnFinish,
+  withPageUrlField,
+} from "./lib/test-values";
 import { mirrorPlacementForDir } from "./lib/utils";
 
 type TPreviewType = "modal" | "fullwidth" | "email";
@@ -35,12 +57,27 @@ interface PreviewSurveyProps {
   survey: TSurvey;
   elementId?: string | null;
   previewType?: TPreviewType;
-  workspace: Workspace;
+  workspace: TWorkspaceWithoutCustomCss;
   languageCode: string;
   setLanguageCode?: (code: string) => void;
   locale?: TUserLocale;
   isSpamProtectionAllowed: boolean;
   publicDomain: string;
+  /** Dark only applies to app surveys; link previews stay light (D4). */
+  appearance?: TStylingAppearance;
+  /** Shows the sun / moon switch next to the device toggle when set. */
+  onAppearanceChange?: (appearance: TStylingAppearance) => void;
+  /**
+   * Compiled workspace + survey custom CSS to preview (ENG-3552): the editor's validated draft. Passed
+   * straight to the renderer, which applies CSS from this prop only — never from `survey`.
+   */
+  customCss?: TRendererCustomCss;
+  /**
+   * The rule before the first question that screened the preview out, as one line ("If @panel_id is
+   * not set → …"), for the banner that explains the ending (ENG-6969 T13 ①). The survey editor says
+   * how a rule reads; without it, no banner.
+   */
+  describeStartRule?: (rule: TSurveyBlockLogic, survey: TSurvey) => string;
 }
 
 let surveyNameTemp: string;
@@ -56,21 +93,16 @@ export const PreviewSurvey = ({
   locale,
   isSpamProtectionAllowed,
   publicDomain,
-}: PreviewSurveyProps) => {
-  // ENG-1837: the preview is an authoring surface — the Variables and Hidden Fields cards are the
-  // live source of truth, and the saved EmbeddedData rows only catch up on save. Overriding the
-  // inlined definitions with the card-derived ones is what makes a rename or a new field show up in
-  // the preview's recall and logic on the next render, without a reload.
-  const previewSurvey = useMemo(
-    () => ({
-      ...survey,
-      embeddedFields: getDeclaredEmbeddedFields({
-        variables: survey.variables,
-        hiddenFields: survey.hiddenFields,
-      }),
-    }),
-    [survey]
-  );
+  appearance = "light",
+  onAppearanceChange,
+  customCss,
+  describeStartRule,
+}: Readonly<PreviewSurveyProps>) => {
+  // Both callers hand over a survey that already carries its `embeddedFields`: the editor's working
+  // copy is rows-native (ENG-2628), and the templates gallery builds its never-written survey through
+  // `getTemplatePreviewSurvey`, which adapts the preset's legacy keys at that boundary (ENG-2404).
+  const jsSurvey = useMemo(() => toJsWorkspaceStateSurvey(survey), [survey]);
+  const jsLinkSurvey = useMemo(() => toJsWorkspaceStateSurvey({ ...survey, type: "link" }), [survey]);
 
   const [isModalOpen, setIsModalOpen] = useState(true);
   const [isFullScreenPreview, setIsFullScreenPreview] = useState(false);
@@ -78,13 +110,101 @@ export const PreviewSurvey = ({
   const [appSetupCompleted, setAppSetupCompleted] = useState(false);
 
   const [previewMode, setPreviewMode] = useState("desktop");
+
+  // "Test values" (ENG-6932): URL parameters and hidden fields for the preview, empty by default. The
+  // rules before the first question run when the survey loads, so the preview is keyed by the values
+  // and those rules, and starts over whenever they change.
+  const [testValues, setTestValues] = useState<Record<string, string>>({});
+  const testValueFields = useMemo(
+    () =>
+      withPageUrlField(
+        getTestValueFields(survey),
+        findReservedFieldUse(survey, PAGE_URL_TEST_VALUE_KEY) !== null
+      ),
+    [survey]
+  );
+  // What the preview runs with: each value as its field's link would carry it (ENG-6953).
+  const testValueEntries = useMemo(
+    () => getTestValueEntries(testValues, testValueFields),
+    [testValues, testValueFields]
+  );
+  // The page address is not a hidden field: the renderer reads it as the page it runs on.
+  const pageUrlField = testValueFields.find((field) => field.isPageUrl);
+  const previewPageUrl = pageUrlField ? testValues[PAGE_URL_TEST_VALUE_KEY]?.trim() || undefined : undefined;
+  const hiddenFieldsRecord = useMemo(
+    () =>
+      Object.fromEntries(
+        testValueEntries.filter(([key]) => !(pageUrlField && key === PAGE_URL_TEST_VALUE_KEY))
+      ),
+    [testValueEntries, pageUrlField]
+  );
+  // The strip's Clear (ENG-6969 T13 ②): no values means a new start key, so the preview restarts.
+  const clearTestValues = () => setTestValues({});
+  // Bumped when an app survey without endings finishes, to start it over (see `onFinished`).
+  const [previewRun, setPreviewRun] = useState(0);
+  const previewStartKey = useMemo(
+    () =>
+      getPreviewStartKey(
+        previewPageUrl
+          ? { ...hiddenFieldsRecord, [PAGE_URL_TEST_VALUE_KEY]: previewPageUrl }
+          : hiddenFieldsRecord,
+        survey.startLogic ?? [],
+        previewRun
+      ),
+    [hiddenFieldsRecord, previewPageUrl, survey.startLogic, previewRun]
+  );
+  // "Set test values" on the banner opens the Test values panel on the field its rule reads.
+  const [testValuesOpenRequest, setTestValuesOpenRequest] = useState<TTestValuesOpenRequest>();
+  // Whether the preview left where it started to show a question the author picked (see the follow
+  // effect below): the banner then no longer describes what the preview shows. A new start resets it.
+  const [hasFollowedQuestion, setHasFollowedQuestion] = useState(false);
+  const [followResetKey, setFollowResetKey] = useState(previewStartKey);
+  if (followResetKey !== previewStartKey) {
+    setFollowResetKey(previewStartKey);
+    setHasFollowedQuestion(false);
+  }
+  // Why the preview opened on an ending (ENG-6969 T13 ①): the rule before the first question that
+  // screened it out with these test values, worked out here as the renderer decides it. Endings
+  // reached later, by a block's rule, aren't explained: they depend on the answers typed in the preview.
+  const startScreenOut = useMemo(
+    () =>
+      findStartScreenOut({
+        survey: jsSurvey,
+        hiddenFieldsRecord,
+        languageCode,
+        // The renderer runs in the editor's page, so a reserved `url` reads the editor's address,
+        // unless Test values give one.
+        meta: { url: previewPageUrl ?? (typeof window === "undefined" ? undefined : window.location.href) },
+      }),
+    [jsSurvey, hiddenFieldsRecord, languageCode, previewPageUrl]
+  );
+  const startScreenOutSummary =
+    startScreenOut && describeStartRule ? describeStartRule(startScreenOut.rule, survey) : undefined;
+  const openTestValuesForScreenOut =
+    startScreenOut && testValueFields.length > 0
+      ? () =>
+          setTestValuesOpenRequest((current) => ({
+            id: (current?.id ?? 0) + 1,
+            fieldKey: getScreenOutFieldKey(
+              startScreenOut.rule,
+              testValueFields.map(({ key }) => key)
+            ),
+          }))
+      : undefined;
+  const renderScreenOutBanner = (className?: string) =>
+    startScreenOutSummary && !hasFollowedQuestion ? (
+      <StartScreenOutBanner
+        ruleSummary={startScreenOutSummary}
+        onSetTestValues={openTestValuesForScreenOut}
+        className={className}
+      />
+    ) : null;
   const ContentRef = useRef<HTMLDivElement | null>(null);
   const enabledLanguages = useMemo(() => survey.languages.filter((l) => l.enabled), [survey.languages]);
   const showLanguageSelector = setLanguageCode && enabledLanguages.length > 1;
   const { workspaceOverwrites } = survey || {};
 
   const { placement: surveyPlacement } = workspaceOverwrites || {};
-  const { overlay: surveyOverlay } = workspaceOverwrites || {};
   const { clickOutsideClose: surveyClickOutsideClose } = workspaceOverwrites || {};
 
   // Placement mirrors with the previewed language, exactly as the shipped widget does — see
@@ -131,9 +251,13 @@ export const PreviewSurvey = ({
 
   const placement = mirrorPlacementForDir(
     surveyPlacement || workspace.placement,
-    isRTLLanguage(toJsWorkspaceStateSurvey(survey), activeLanguageCode) ? "rtl" : "ltr"
+    isRTLLanguage(jsSurvey, activeLanguageCode) ? "rtl" : "ltr"
   );
-  const overlay = surveyOverlay ?? workspace.overlay;
+  const {
+    overlay,
+    color: overlayColor,
+    opacity: overlayOpacity,
+  } = resolveOverlayAppearance(workspaceOverwrites, workspace);
   const clickOutsideClose = surveyClickOutsideClose ?? workspace.clickOutsideClose;
 
   const styling: TSurveyStyling | TWorkspaceStyling = useMemo(() => {
@@ -156,7 +280,15 @@ export const PreviewSurvey = ({
     return workspace.styling;
   }, [workspace.styling, survey.styling]);
 
+  // Page font (ENG-3864): the app survey takes the font of the page around it, here the editor's.
+  const pageFont = (styling.pageFont ?? workspace.styling.pageFont) === true;
+
   const isCardless = styling.cardArrangement?.linkSurveys === "cardless";
+  // The mock modal paints its own card color around the survey, so it has to follow the dark palette.
+  const modalBackground =
+    appearance === "dark"
+      ? resolveDarkColors(styling).cardBackgroundColor
+      : styling.cardBackgroundColor?.light;
   const linkSurveyCardMaxWidth = getLinkSurveyCardMaxWidth(styling.linkSurveyCardWidth);
 
   const updateElementId = useCallback(
@@ -192,20 +324,26 @@ export const PreviewSurvey = ({
     [survey.welcomeCard.enabled, survey.blocks, survey.endings]
   );
 
+  // The preview follows the question the author works on, but opens like the live survey: the
+  // question the editor activates by itself is not followed, so the rules before the first question
+  // and the welcome card decide the first card here too (ENG-6932, see `followActiveElement`).
+  const followStateRef = useRef(INITIAL_FOLLOW_STATE);
   useEffect(() => {
-    if (elementId) {
+    const { state, follow } = followActiveElement(followStateRef.current, elementId ?? null);
+    followStateRef.current = state;
+    if (follow && elementId) {
       updateElementId(elementId);
+      setHasFollowedQuestion(true);
     }
   }, [elementId, updateElementId]);
 
   const onFinished = () => {
-    // close modal if there are no elements left
-    if (survey.type === "app" && survey.endings.length === 0) {
+    // close modal if there are no elements left, then start over: a remount runs the rules before the
+    // first question and the first page's show-if again, as the live survey does for a new respondent.
+    if (restartsPreviewOnFinish(survey)) {
       setIsModalOpen(false);
       setTimeout(() => {
-        if (survey.blocks[0]) {
-          setBlockId(survey.blocks[0].id);
-        }
+        setPreviewRun((run) => run + 1);
         setIsModalOpen(true);
       }, 500);
     }
@@ -221,6 +359,8 @@ export const PreviewSurvey = ({
   }, [survey]);
 
   const resetProgress = () => {
+    // A restart runs the rules before the first question again, so the banner may apply again.
+    setHasFollowedQuestion(false);
     let storePreviewMode = previewMode;
     setPreviewMode("null");
     setTimeout(() => {
@@ -263,7 +403,7 @@ export const PreviewSurvey = ({
   const handlePreviewModeChange = (mode: "mobile" | "desktop") => {
     setPreviewMode(mode);
     requestAnimationFrame(() => {
-      if (elementId) {
+      if (elementId && followStateRef.current.picked) {
         updateElementId(elementId);
       }
     });
@@ -307,7 +447,7 @@ export const PreviewSurvey = ({
           )}>
           {previewMode === "mobile" && (
             <>
-              <p className="absolute top-0 left-0 m-2 rounded-sm bg-slate-100 px-2 py-1 text-xs text-slate-400">
+              <p className="absolute top-0 left-0 m-2 rounded-sm bg-slate-100 px-2 py-1 text-xs text-slate-600">
                 {t("common.preview")}
               </p>
               <div className="absolute top-0 right-0 m-2 flex items-center gap-1">
@@ -319,7 +459,22 @@ export const PreviewSurvey = ({
                     locale={locale}
                   />
                 )}
+                <TestValuesControl
+                  fields={testValueFields}
+                  values={testValues}
+                  activeCount={testValueEntries.length}
+                  onApply={setTestValues}
+                  openRequest={testValuesOpenRequest}
+                />
                 <ResetProgressButton onClick={resetProgress} />
+              </div>
+              <div className="absolute inset-x-2 top-10 z-20 flex flex-col gap-1">
+                <TestValuesStrip
+                  entries={testValueEntries}
+                  onClear={clearTestValues}
+                  className="w-auto rounded-md border"
+                />
+                {renderScreenOutBanner("w-auto rounded-md border")}
               </div>
               <MediaBackground
                 surveyType={survey.type}
@@ -333,17 +488,28 @@ export const PreviewSurvey = ({
                     placement={placement}
                     previewMode="mobile"
                     overlay={overlay}
+                    overlayColor={overlayColor}
+                    overlayOpacity={overlayOpacity}
                     clickOutsideClose={clickOutsideClose}
                     borderRadius={styling?.roundness ?? 8}
-                    background={styling?.cardBackgroundColor?.light}>
+                    background={modalBackground}>
                     <SurveyInline
+                      key={previewStartKey}
+                      hiddenFieldsRecord={hiddenFieldsRecord}
+                      previewPageUrl={previewPageUrl}
                       appUrl={publicDomain}
                       isPreviewMode={true}
-                      survey={toJsWorkspaceStateSurvey(previewSurvey)}
+                      // The preview restarts when a rule before the first question changes; a card focusing itself then
+                      // would take focus from the editor field being typed in. Cards focus once the author clicks Next or Back.
+                      autoFocus={false}
+                      customCss={customCss}
+                      survey={jsSurvey}
+                      appearance={appearance}
                       isBrandingEnabled={workspace.inAppSurveyBranding}
                       isRedirectDisabled={true}
                       languageCode={activeLanguageCode}
                       styling={styling}
+                      pageFont={pageFont}
                       isCardBorderVisible={!styling.highlightBorderColor?.light}
                       onClose={handlePreviewModalClose}
                       getSetBlockId={(f: (value: string) => void) => {
@@ -357,8 +523,10 @@ export const PreviewSurvey = ({
                   </Modal>
                 ) : (
                   <div
+                    {...previewBoundaryProps}
                     className={cn(
                       "flex h-full w-full flex-col px-1",
+                      PREVIEW_BOUNDARY_CLASS_NAME,
                       isCardless ? "min-h-0 overflow-hidden" : "justify-center"
                     )}>
                     {!styling.isLogoHidden && !isCardless && (
@@ -385,10 +553,17 @@ export const PreviewSurvey = ({
                           !isCardless && "justify-center"
                         )}>
                         <SurveyInline
+                          key={previewStartKey}
+                          hiddenFieldsRecord={hiddenFieldsRecord}
+                          previewPageUrl={previewPageUrl}
                           appUrl={publicDomain}
                           isPreviewMode={true}
+                          // The preview restarts when a rule before the first question changes; a card focusing itself then
+                          // would take focus from the editor field being typed in. Cards focus once the author clicks Next or Back.
+                          autoFocus={false}
+                          customCss={customCss}
                           isBrandingEnabled={workspace.linkSurveyBranding}
-                          survey={toJsWorkspaceStateSurvey({ ...previewSurvey, type: "link" })}
+                          survey={jsLinkSurvey}
                           isRedirectDisabled={true}
                           languageCode={languageCode}
                           responseCount={42}
@@ -408,145 +583,161 @@ export const PreviewSurvey = ({
           )}
           {previewMode === "desktop" && (
             <div className="flex h-full min-h-0 w-full flex-1 flex-col overflow-hidden">
-              <div className="flex h-8 w-full items-center rounded-t-lg bg-slate-100">
-                <div className="ml-6 flex gap-x-2">
-                  <div className="size-3 rounded-full bg-red-500"></div>
-                  <div className="size-3 rounded-full bg-amber-500"></div>
-                  <button
-                    type="button"
-                    className="size-3 cursor-pointer rounded-full bg-emerald-500"
-                    onClick={() => {
-                      if (isFullScreenPreview) {
-                        setIsFullScreenPreview(false);
-                      } else {
-                        setIsFullScreenPreview(true);
-                      }
-                    }}
-                    aria-label={
-                      isFullScreenPreview
-                        ? t("workspace.surveys.edit.shrink_preview")
-                        : t("workspace.surveys.edit.expand_preview")
-                    }></button>
-                </div>
-                <div className="ml-4 flex w-full justify-between font-mono text-sm text-slate-400">
-                  <p>
-                    {previewType === "modal" ? t("workspace.surveys.edit.your_web_app") : t("common.preview")}
-                  </p>
-
-                  <div className="flex items-center">
-                    {showLanguageSelector && (
-                      <LanguageSelector
-                        languages={enabledLanguages}
-                        languageCode={languageCode}
-                        setLanguageCode={handleChromeLanguageChange}
-                        locale={locale}
-                      />
-                    )}
-                    {isFullScreenPreview ? (
-                      <ShrinkIcon
-                        className="mr-1 size-[22px] cursor-pointer rounded-md bg-white p-1 text-slate-500 hover:text-slate-700"
-                        onClick={() => {
-                          setIsFullScreenPreview(false);
-                        }}
-                      />
-                    ) : (
-                      <ExpandIcon
-                        className="mr-1 size-[22px] cursor-pointer rounded-md bg-white p-1 text-slate-500 hover:text-slate-700"
-                        onClick={() => {
-                          setIsFullScreenPreview(true);
-                        }}
-                      />
-                    )}
-                    <ResetProgressButton onClick={resetProgress} />
-                  </div>
-                </div>
-              </div>
-
-              {previewType === "modal" ? (
-                <Modal
-                  isOpen={isModalOpen}
-                  placement={placement}
-                  clickOutsideClose={clickOutsideClose}
-                  overlay={overlay}
-                  previewMode="desktop"
-                  borderRadius={styling.roundness ?? 8}
-                  background={styling.cardBackgroundColor?.light}>
-                  <SurveyInline
-                    appUrl={publicDomain}
-                    isPreviewMode={true}
-                    survey={toJsWorkspaceStateSurvey(previewSurvey)}
-                    isBrandingEnabled={workspace.inAppSurveyBranding}
-                    isRedirectDisabled={true}
-                    languageCode={activeLanguageCode}
-                    styling={styling}
-                    isCardBorderVisible={!styling.highlightBorderColor?.light}
-                    onClose={handlePreviewModalClose}
-                    getSetBlockId={(f: (value: string) => void) => {
-                      setBlockId = f;
-                    }}
-                    onFinished={onFinished}
-                    onLanguageChange={setActiveLanguageCode}
-                    isSpamProtectionEnabled={isSpamProtectionEnabled}
-                    placement={placement}
+              <PreviewWindowBar
+                title={
+                  previewType === "modal" ? t("workspace.surveys.edit.your_web_app") : t("common.preview")
+                }
+                expand={{
+                  isExpanded: isFullScreenPreview,
+                  onToggle: () => setIsFullScreenPreview(!isFullScreenPreview),
+                  label: isFullScreenPreview
+                    ? t("workspace.surveys.edit.shrink_preview")
+                    : t("workspace.surveys.edit.expand_preview"),
+                }}>
+                {showLanguageSelector && (
+                  <LanguageSelector
+                    languages={enabledLanguages}
+                    languageCode={languageCode}
+                    setLanguageCode={handleChromeLanguageChange}
+                    locale={locale}
                   />
-                </Modal>
-              ) : (
-                <MediaBackground
-                  surveyType={survey.type}
-                  styling={styling}
-                  ContentRef={ContentRef as React.RefObject<HTMLDivElement>}
-                  isEditorView
-                  useNaturalHeight={isCardless}>
-                  <div
-                    className={cn(
-                      "flex w-full justify-center",
-                      isCardless
-                        ? "h-full min-h-0 flex-1 flex-col items-stretch overflow-hidden"
-                        : "h-full items-center"
-                    )}>
-                    {!styling.isLogoHidden && !isCardless && (
-                      <div className="absolute top-5 left-5">
-                        <ClientLogo
-                          workspaceLogo={workspace.logo}
-                          workspaceId={workspace.id}
-                          surveyLogo={styling.logo}
-                          previewSurvey
-                        />
-                      </div>
-                    )}
+                )}
+                {isFullScreenPreview ? (
+                  <ShrinkIcon
+                    className="mr-1 size-[22px] cursor-pointer rounded-md bg-white p-1 text-slate-500 hover:text-slate-700"
+                    onClick={() => {
+                      setIsFullScreenPreview(false);
+                    }}
+                  />
+                ) : (
+                  <ExpandIcon
+                    className="mr-1 size-[22px] cursor-pointer rounded-md bg-white p-1 text-slate-500 hover:text-slate-700"
+                    onClick={() => {
+                      setIsFullScreenPreview(true);
+                    }}
+                  />
+                )}
+                <TestValuesControl
+                  fields={testValueFields}
+                  values={testValues}
+                  activeCount={testValueEntries.length}
+                  onApply={setTestValues}
+                  openRequest={testValuesOpenRequest}
+                />
+                <ResetProgressButton onClick={resetProgress} />
+              </PreviewWindowBar>
+
+              <TestValuesStrip entries={testValueEntries} onClear={clearTestValues} />
+              {renderScreenOutBanner()}
+
+              {/* The trusted box the survey is contained in, below the chrome and its controls. */}
+              <div
+                {...previewBoundaryProps}
+                className={cn("flex min-h-0 w-full flex-1 flex-col", PREVIEW_BOUNDARY_CLASS_NAME)}>
+                {previewType === "modal" ? (
+                  <Modal
+                    isOpen={isModalOpen}
+                    placement={placement}
+                    clickOutsideClose={clickOutsideClose}
+                    overlay={overlay}
+                    overlayColor={overlayColor}
+                    overlayOpacity={overlayOpacity}
+                    previewMode="desktop"
+                    borderRadius={styling.roundness ?? 8}
+                    background={modalBackground}>
+                    <SurveyInline
+                      key={previewStartKey}
+                      hiddenFieldsRecord={hiddenFieldsRecord}
+                      previewPageUrl={previewPageUrl}
+                      appUrl={publicDomain}
+                      isPreviewMode={true}
+                      // The preview restarts when a rule before the first question changes; a card focusing itself then
+                      // would take focus from the editor field being typed in. Cards focus once the author clicks Next or Back.
+                      autoFocus={false}
+                      customCss={customCss}
+                      survey={jsSurvey}
+                      appearance={appearance}
+                      isBrandingEnabled={workspace.inAppSurveyBranding}
+                      isRedirectDisabled={true}
+                      languageCode={activeLanguageCode}
+                      styling={styling}
+                      pageFont={pageFont}
+                      isCardBorderVisible={!styling.highlightBorderColor?.light}
+                      onClose={handlePreviewModalClose}
+                      getSetBlockId={(f: (value: string) => void) => {
+                        setBlockId = f;
+                      }}
+                      onFinished={onFinished}
+                      onLanguageChange={setActiveLanguageCode}
+                      isSpamProtectionEnabled={isSpamProtectionEnabled}
+                      placement={placement}
+                    />
+                  </Modal>
+                ) : (
+                  <MediaBackground
+                    surveyType={survey.type}
+                    styling={styling}
+                    ContentRef={ContentRef as React.RefObject<HTMLDivElement>}
+                    isEditorView
+                    useNaturalHeight={isCardless}>
                     <div
                       className={cn(
-                        "w-full",
+                        "flex w-full justify-center",
                         isCardless
-                          ? "flex min-h-0 w-full flex-1 flex-col"
-                          : "z-0 mx-auto rounded-lg border-transparent"
+                          ? "h-full min-h-0 flex-1 flex-col items-stretch overflow-hidden"
+                          : "h-full items-center"
+                      )}>
+                      {!styling.isLogoHidden && !isCardless && (
+                        <div className="absolute top-5 left-5">
+                          <ClientLogo
+                            workspaceLogo={workspace.logo}
+                            workspaceId={workspace.id}
+                            surveyLogo={styling.logo}
+                            previewSurvey
+                          />
+                        </div>
                       )}
-                      style={isCardless ? undefined : { maxWidth: linkSurveyCardMaxWidth }}>
                       <div
                         className={cn(
-                          "flex min-h-0 w-full flex-1 flex-col",
-                          !isCardless && "justify-center"
-                        )}>
-                        <SurveyInline
-                          appUrl={publicDomain}
-                          isPreviewMode={true}
-                          survey={toJsWorkspaceStateSurvey({ ...previewSurvey, type: "link" })}
-                          isBrandingEnabled={workspace.linkSurveyBranding}
-                          isRedirectDisabled={true}
-                          languageCode={languageCode}
-                          responseCount={42}
-                          styling={styling}
-                          showCardlessPreviewLogoSlot={!styling.isLogoHidden}
-                          getSetBlockId={(f: (value: string) => void) => {
-                            setBlockId = f;
-                          }}
-                          isSpamProtectionEnabled={isSpamProtectionEnabled}
-                        />
+                          "w-full",
+                          isCardless
+                            ? "flex min-h-0 w-full flex-1 flex-col"
+                            : "z-0 mx-auto rounded-lg border-transparent"
+                        )}
+                        style={isCardless ? undefined : { maxWidth: linkSurveyCardMaxWidth }}>
+                        <div
+                          className={cn(
+                            "flex min-h-0 w-full flex-1 flex-col",
+                            !isCardless && "justify-center"
+                          )}>
+                          <SurveyInline
+                            key={previewStartKey}
+                            hiddenFieldsRecord={hiddenFieldsRecord}
+                            previewPageUrl={previewPageUrl}
+                            appUrl={publicDomain}
+                            isPreviewMode={true}
+                            // The preview restarts when a rule before the first question changes; a card focusing itself then
+                            // would take focus from the editor field being typed in. Cards focus once the author clicks Next or Back.
+                            autoFocus={false}
+                            customCss={customCss}
+                            survey={jsLinkSurvey}
+                            isBrandingEnabled={workspace.linkSurveyBranding}
+                            isRedirectDisabled={true}
+                            languageCode={languageCode}
+                            responseCount={42}
+                            styling={styling}
+                            showCardlessPreviewLogoSlot={!styling.isLogoHidden}
+                            getSetBlockId={(f: (value: string) => void) => {
+                              setBlockId = f;
+                            }}
+                            isSpamProtectionEnabled={isSpamProtectionEnabled}
+                          />
+                        </div>
                       </div>
                     </div>
-                  </div>
-                </MediaBackground>
-              )}
+                  </MediaBackground>
+                )}
+              </div>
             </div>
           )}
         </motion.div>
@@ -560,19 +751,12 @@ export const PreviewSurvey = ({
           />
         )}
 
-        {/* for toggling between mobile and desktop mode  */}
-        <div className="mt-2 flex rounded-full border-2 border-slate-300 p-1">
-          <TabOption
-            active={previewMode === "mobile"}
-            icon={<SmartphoneIcon className="mx-4 my-2 size-4 text-slate-700" />}
-            onClick={() => handlePreviewModeChange("mobile")}
-          />
-          <TabOption
-            active={previewMode === "desktop"}
-            icon={<MonitorIcon className="mx-4 my-2 size-4 text-slate-700" />}
-            onClick={() => handlePreviewModeChange("desktop")}
-          />
-        </div>
+        <PreviewModeSwitches
+          previewMode={previewMode === "mobile" || previewMode === "desktop" ? previewMode : null}
+          onPreviewModeChange={handlePreviewModeChange}
+          appearance={appearance}
+          onAppearanceChange={onAppearanceChange}
+        />
       </div>
     </MotionConfig>
   );
@@ -584,10 +768,10 @@ const LanguageSelector = ({
   setLanguageCode,
   locale,
 }: {
-  languages: TSurveyLanguage[];
-  languageCode: string;
-  setLanguageCode: (code: string) => void;
-  locale?: TUserLocale;
+  readonly languages: TSurveyLanguage[];
+  readonly languageCode: string;
+  readonly setLanguageCode: (code: string) => void;
+  readonly locale?: TUserLocale;
 }) => {
   const { t } = useTranslation();
   return (

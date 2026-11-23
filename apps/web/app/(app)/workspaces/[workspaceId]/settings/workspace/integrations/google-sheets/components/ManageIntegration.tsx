@@ -1,5 +1,6 @@
 "use client";
 
+import { useQueryClient } from "@tanstack/react-query";
 import { RefreshCcwIcon, Trash2Icon } from "lucide-react";
 import { useState } from "react";
 import toast from "react-hot-toast";
@@ -8,10 +9,14 @@ import {
   TIntegrationGoogleSheets,
   TIntegrationGoogleSheetsConfigData,
 } from "@formbricks/types/integration/google-sheet";
+import { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
 import { deleteIntegrationAction } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/actions";
+import { integrationKeys } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/lib/query";
 import { timeSince } from "@/lib/time";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
+import { RestrictedSurveyHint } from "@/modules/survey/visibility/components/restricted-survey-hint";
+import { hasRestrictedAttachedSurvey } from "@/modules/survey/visibility/lib/outbound";
 import { Alert, AlertButton, AlertDescription } from "@/modules/ui/components/alert";
 import { Button } from "@/modules/ui/components/button";
 import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
@@ -20,6 +25,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/modu
 
 interface ManageIntegrationProps {
   googleSheetIntegration: TIntegrationGoogleSheets;
+  surveys: TSurvey[];
+  surveyVisibilityEnabled: boolean;
   setOpenAddIntegrationModal: (v: boolean) => void;
   setIsConnected: (v: boolean) => void;
   setSelectedIntegration: (v: (TIntegrationGoogleSheetsConfigData & { index: number }) | null) => void;
@@ -30,14 +37,17 @@ interface ManageIntegrationProps {
 
 export const ManageIntegration = ({
   googleSheetIntegration,
+  surveys,
+  surveyVisibilityEnabled,
   setOpenAddIntegrationModal,
   setIsConnected,
   setSelectedIntegration,
   showReconnectButton,
   handleGoogleAuthorization,
   locale,
-}: ManageIntegrationProps) => {
+}: Readonly<ManageIntegrationProps>) => {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [isDeleteIntegrationModalOpen, setIsDeleteIntegrationModalOpen] = useState(false);
   let integrationArray: TIntegrationGoogleSheetsConfigData[] = [];
   if (googleSheetIntegration?.config.data) {
@@ -55,6 +65,11 @@ export const ManageIntegration = ({
     if (deleteIntegrationActionResult?.data) {
       toast.success(t("workspace.integrations.integration_removed_successfully"));
       setIsConnected(false);
+      // The layout's query cache outlives this page; drop the deleted connection so a revisit cannot show it.
+      queryClient.setQueryData(
+        integrationKeys.byType(googleSheetIntegration.workspaceId, "googleSheets"),
+        null
+      );
     } else {
       const errorMessage = getFormattedErrorMessage(deleteIntegrationActionResult);
       toast.error(errorMessage);
@@ -138,7 +153,12 @@ export const ManageIntegration = ({
                   onClick={() => {
                     editIntegration(index);
                   }}>
-                  <div className="col-span-2 text-center">{data.surveyName}</div>
+                  <div className="col-span-2 flex items-center justify-center gap-x-2 text-center">
+                    {data.surveyName}
+                    {hasRestrictedAttachedSurvey(surveyVisibilityEnabled, [data.surveyId], surveys) && (
+                      <RestrictedSurveyHint kind="paused" />
+                    )}
+                  </div>
                   <div className="col-span-2 text-center">{data.spreadsheetName}</div>
                   <div className="col-span-2 text-center">{data.elements}</div>
                   <div className="col-span-2 text-center">{timeSince(data.createdAt.toString(), locale)}</div>

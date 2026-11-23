@@ -7,7 +7,7 @@ import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TMember } from "@formbricks/types/memberships";
 import { TOrganization } from "@formbricks/types/organizations";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import {
   createInviteTokenAction,
   deleteInviteAction,
@@ -21,13 +21,22 @@ import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
 import { TooltipRenderer } from "@/modules/ui/components/tooltip";
 
 interface MemberActionsProps {
-  organization: TOrganization;
-  member?: TMember;
-  invite?: TInvite;
-  showDeleteButton?: boolean;
+  readonly organization: TOrganization;
+  readonly member?: TMember;
+  readonly invite?: TInvite;
+  readonly showDeleteButton?: boolean;
+  /** Share link and Resend, which the server refuses below the user-management floor. */
+  readonly canManageInvites: boolean;
 }
 
-export const MemberActions = ({ organization, member, invite, showDeleteButton }: MemberActionsProps) => {
+export const MemberActions = ({
+  organization,
+  member,
+  invite,
+  showDeleteButton,
+  canManageInvites,
+}: MemberActionsProps) => {
+  const canActOnInvite = !!invite && canManageInvites;
   const router = useRouter();
   const { t } = useTranslation();
   const [isDeleteMemberModalOpen, setDeleteMemberModalOpen] = useState(false);
@@ -137,12 +146,12 @@ export const MemberActions = ({ organization, member, invite, showDeleteButton }
 
       <TooltipRenderer
         tooltipContent={t("workspace.settings.general.share_invite_link")}
-        shouldRender={!!invite}>
+        shouldRender={canActOnInvite}>
         <Button
           variant="secondary"
           size="icon"
           id="shareInviteButton"
-          disabled={!invite}
+          disabled={!canActOnInvite}
           onClick={() => {
             handleShareInvite();
           }}>
@@ -152,12 +161,12 @@ export const MemberActions = ({ organization, member, invite, showDeleteButton }
 
       <TooltipRenderer
         tooltipContent={t("workspace.settings.general.resend_invitation_email")}
-        shouldRender={!!invite}>
+        shouldRender={canActOnInvite}>
         <Button
           variant="secondary"
           size="icon"
           id="resendInviteButton"
-          disabled={!invite}
+          disabled={!canActOnInvite}
           onClick={() => {
             handleResendInvite();
           }}>

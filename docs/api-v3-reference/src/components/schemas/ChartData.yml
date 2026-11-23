@@ -1,0 +1,22 @@
+type: object
+description: >-
+  What a chart query returns: one row per group, keyed by field name, the label maps to display
+  stored ids with, and the query as it ran.
+required:
+  - rows
+  - optionLabels
+  - fieldLabels
+  - memberLabels
+  - query
+properties:
+  rows:
+    $ref: ./ChartDataRows.yml
+  optionLabels:
+    $ref: ./ChartDataOptionLabels.yml
+  fieldLabels:
+    $ref: ./ChartDataFieldLabels.yml
+  memberLabels:
+    $ref: ./ChartDataMemberLabels.yml
+  query:
+    $ref: ./ChartDataQuery.yml
+additionalProperties: false

@@ -1,12 +1,15 @@
 ---
 title: "MCP Server"
-description: "Configure and use the Formbricks v3 Surveys and Workflows MCP server"
+description: "Configure and use the Formbricks v3 Surveys, Creatives and Workflows MCP server"
 icon: "robot"
 ---
 
+For customer connection instructions and API-key fallback, use [MCP setup](/platform/mcp/setup). This handbook describes implementation and contributor behavior.
+
+
 ## Overview
 
-The Formbricks MCP server exposes v3 Surveys and Workflows tool surfaces for AI agents. It runs inside
+The Formbricks MCP server exposes v3 Surveys, Creatives and Workflows tool surfaces for AI agents. It runs inside
 the Formbricks web app at `/api/mcp` and reuses the same v3 API authentication, authorization,
 rate limiting, response handling, and audit logging paths as the REST routes.
 
@@ -67,8 +70,20 @@ issuer under `/api/auth`.
 
 ### OAuth 2.1
 
-OAuth clients use Authorization Code + PKCE with Dynamic Client Registration. The MCP protected
-resource is:
+OAuth clients use Authorization Code + PKCE with Dynamic Client Registration. Registration is open
+(no initial access token — MCP clients self-register), so it accepts only redirect URIs an attacker
+can never receive an authorization code at:
+
+- `http` loopback — `localhost`, `127.0.0.1` or `[::1]` on any port — which local clients (Claude
+  Code, Codex, MCP Inspector) use.
+- An exact hosted-connector callback: `https://claude.ai/api/mcp/auth_callback`,
+  `https://claude.com/api/mcp/auth_callback` and `https://chatgpt.com/connector_platform_oauth_redirect`
+  (`HOSTED_MCP_CLIENT_REDIRECT_URIS` in `apps/web/modules/auth/lib/mcp-dcr-redirect-policy.ts`), plus
+  any a self-hoster adds with `MCP_DCR_ALLOWED_REDIRECT_URIS`. These match by exact string, so a code
+  can only ever reach the vendor.
+
+Any other redirect URI is refused with `400 invalid_redirect_uri` before Better Auth sees the
+request. `post_logout_redirect_uris` stays loopback-only. The MCP protected resource is:
 
 ```text
 https://app.formbricks.com/api/mcp
@@ -95,12 +110,16 @@ Supported scopes:
 
 | Scope | Use |
 | --- | --- |
-| `surveys:read` | `list_surveys`, `get_survey`, `validate_survey` |
-| `surveys:write` | `create_survey`, `patch_survey`, `delete_survey` |
+| `surveys:read` | `list_surveys`, `get_survey`, `validate_survey`, `get_workspace_custom_css`, `list_creatives`, `get_creative`, `get_creative_stats` |
+| `surveys:write` | `create_survey`, `patch_survey`, `edit_survey_blocks`, `set_survey_block_order`, `delete_survey`, `patch_workspace_custom_css`, `create_creative`, `patch_creative`, `delete_creative`, `duplicate_creative`, `archive_creative`, `restore_creative` |
 | `workflows:read` | `list_workflows`, `get_workflow`, `list_workflow_runs`, `get_workflow_run`, `test_workflow` |
 | `workflows:write` | `create_workflow`, `patch_workflow`, `duplicate_workflow`, `delete_workflow`, and the enable/disable/archive/unarchive mutations |
 | `feedbackRecords:read` | `list_feedback_datasets`, `list_feedback_records`, `count_feedback_records`, `get_feedback_record`, `search_feedback_records`, `find_similar_feedback_records` |
 | `feedbackRecords:write` | `create_feedback_record`, `create_feedback_records`, `update_feedback_record`, `delete_feedback_record` |
+| `responses:read` | `list_responses`, `count_responses`, `get_response` |
+| `responses:write` | `validate_response`, `create_response`, `update_response`, `delete_response`, `batch_delete_responses` |
+| `dashboards:read` | `list_dashboards`, `get_dashboard`; with `feedbackRecords:read`, `list_chart_fields`, `list_charts`, `get_chart`, `get_chart_data`, `list_dashboard_filter_fields`, `list_dashboard_filter_values`, `preview_chart`, `list_chart_field_values` (a Dashboard viewer's token reads `get_chart_data` with a `dashboardId`, `list_dashboard_filter_fields` and `list_dashboard_filter_values` on `dashboards:read` alone) |
+| `dashboards:write` | `create_chart`, `update_chart`, `duplicate_chart`, `create_dashboard`, `update_dashboard`, `duplicate_dashboard`, `update_dashboard_layout`, `set_dashboard_filters`, `add_chart_to_dashboard`, `update_widget`, `remove_chart_from_dashboard` |
 | `openid` | OpenID Connect subject interoperability |
 | `profile` | User profile claims |
 | `email` | User email claim |
@@ -114,12 +133,32 @@ without declaring a scope, so a new tool inherits enforcement by construction �
 group legitimately reaches pass `{ anyOf: [...] }` instead of a plain list, which keeps them on the
 same registration path rather than a hand-rolled gate.
 
-The one current exception is the feedback-record tools, which centralise the gate in their own shared
-read/write handler factories and register through `server.registerTool` directly. Every one of their
-handlers is still gated, but the guarantee is by convention there rather than by construction —
-converging them onto `registerScopedTool` is a known follow-up.
+**There are no exceptions, and tests are what keep it that way.** The feedback-record tools were one
+for a while — they gated inside their own handler factories and registered through
+`server.registerTool` directly, which meant every handler was checked but a _new_ tool added outside
+those factories would have registered unguarded. ENG-2119 moved all ten onto `registerScopedTool` and
+made `guardMcpScopes` / `guardMcpAnyScope` private again, so the guards are no longer reachable from a
+tool module.
 
-**There is no single mandatory baseline scope.** Authentication requires *at least one* resource scope
+Be precise about what that guarantees. Privacy removes the hand-rolled gate, and the compiler stops you
+forgetting `registerScopedTool`'s scope argument — but it cannot stop a module calling
+`server.registerTool(...)` directly, because `server` is an argument to every tool module. No type
+system reaches that. The checks that do: a test pins `registerScopedTool` as the only export of
+`guard-scopes.ts`, and `feedback-records.test.ts` drives all ten tools with the opposite scope, which
+goes red if a tool is registered unguarded _or_ wired to the wrong scope.
+
+**A new scope is advertised only together with a migration that grants it to existing clients.**
+`MCP_RESOURCE_SCOPES` is what the protected-resource metadata and the 401 challenge publish, and a
+spec-following client (the MCP SDK takes its scope from exactly those) asks for everything in it. The
+provider validates that request against the scopes the client _registered_ with, so advertising a scope
+to clients that registered before it existed earns them `invalid_scope`. `responses:read` /
+`responses:write` show the full sequence: added to `MCP_OAUTH_SCOPES` and to the resource's
+`allowedScopes` (ENG-2862), then to each registered client's `scopes` by a data migration that mirrors
+what the client already holds and skips `skipConsent` clients, and only then to `MCP_RESOURCE_SCOPES`
+(ENG-3470). Skip the client migration and every integration registered before the scope existed
+breaks at its next sign-in.
+
+**There is no single mandatory baseline scope.** Authentication requires _at least one_ resource scope
 (`MCP_RESOURCE_SCOPES`), so a workflows-only or `feedbackRecords:read`-only grant is a legitimate MCP
 client. `list_workspaces` — the workspaceId-discovery prerequisite for every resource tool — therefore
 gates on any resource read scope rather than one specific one; its result is derived from the caller's
@@ -128,19 +167,21 @@ own memberships and key grants, so admitting any read scope exposes nothing extr
 The authorization server supports all of the above, but the MCP protected-resource metadata
 (`/.well-known/oauth-protected-resource/api/mcp`) advertises only the resource scopes an MCP client
 needs — `surveys:read`, `surveys:write`, `workflows:read`, `workflows:write`, `feedbackRecords:read`,
-`feedbackRecords:write`, and `offline_access`. Clients derive their Dynamic Client Registration scopes
+`feedbackRecords:write`, `responses:read`, `responses:write`, `dashboards:read`, `dashboards:write`, and
+`offline_access`. Clients derive their Dynamic Client Registration scopes
 from that list, so `offline_access` must be advertised there for clients to be issued refresh tokens
 (`openid`/`profile`/`email` are OIDC scopes the MCP resource does not require).
 
 <Warning>
-  Adding a resource scope breaks already-connected OAuth clients until they re-register. The
-  authorization server validates `/authorize` against the scopes the **client** registered with, so a
-  client registered before the change requests the newly advertised scope and is rejected with
-  `invalid_scope` — it does not fall back to the scopes it already holds, and re-consenting does not help
-  because the same `client_id` is reused. The client has to run Dynamic Client Registration again: remove
-  and re-add the MCP server (for example `claude mcp remove <name>` then `claude mcp add …`), or delete
-  its `oauthClient` row so the next connection re-registers. Ship a release note whenever this list
-  changes.
+  Never advertise a new resource scope without a data migration that grants it to existing `oauthClient`
+  rows. The authorization server validates `/authorize` against the scopes the **client** registered
+  with, so a client registered before the change requests the newly advertised scope and is rejected with
+  `invalid_scope`. It does not fall back to the scopes it already holds, and re-consenting does not help,
+  because the same `client_id` is reused. Ship the migration in the same release as the list change, as
+  `responses:*` did (see [A new scope family](#a-new-scope-family)), and nothing breaks: users see one
+  consent screen naming the new scopes. If a client is already stuck on `invalid_scope`, it recovers by
+  registering again: remove and re-add the MCP server (for example `claude mcp remove <name>`, then
+  `claude mcp add …`).
 </Warning>
 
 OAuth scopes gate MCP tool categories at the token layer. Actual workspace access is still evaluated
@@ -149,7 +190,7 @@ a token scope and a workspace role are independent gates — a call must satisfy
 
 Scope groups are **independent**: a token authenticates as long as it holds at least one resource
 scope, so a `feedbackRecords:read`-only grant is valid and simply can't reach the survey tools.
-`list_workspaces` is the shared discovery tool and accepts either read scope.
+`list_workspaces` is the shared discovery tool and accepts any resource read scope.
 
 ### API-key fallback
 
@@ -172,12 +213,33 @@ API key permissions are enforced through the same workspace access checks as the
 
 | Tool | Minimum Workspace Permission |
 | --- | --- |
+| `list_responses` | `read` |
+| `count_responses` | `read` |
+| `get_response` | `read` |
+| `validate_response` | `write` or `manage` — a dry run, but it resolves the same references the write does |
+| `create_response` | `write` or `manage` |
+| `update_response` | `write` or `manage` |
+| `delete_response` | `manage` |
+| `batch_delete_responses` | `manage` |
 | `list_surveys` | `read` |
 | `get_survey` | `read` |
 | `create_survey` | `write` or `manage` |
 | `validate_survey` | `read` — a dry run; it validates a create or patch payload without writing |
 | `patch_survey` | `write` or `manage` |
+| `edit_survey_blocks` | `write` or `manage` |
+| `set_survey_block_order` | `write` or `manage` |
 | `delete_survey` | `write` or `manage` |
+| `get_workspace_custom_css` | `read` |
+| `patch_workspace_custom_css` | `manage` for an API key; an organization owner or manager for an OAuth user — stricter than `surveys:write` |
+| `list_creatives` | `read` |
+| `get_creative` | `read` |
+| `get_creative_stats` | `read` |
+| `create_creative` | `write` or `manage` |
+| `patch_creative` | `write` or `manage` |
+| `delete_creative` | `write` or `manage` |
+| `duplicate_creative` | `write` or `manage` |
+| `archive_creative` | `write` or `manage` |
+| `restore_creative` | `write` or `manage` |
 | `list_workflows` | `read` |
 | `get_workflow` | `read` |
 | `list_workflow_runs` | `read` |
@@ -201,9 +263,16 @@ API key permissions are enforced through the same workspace access checks as the
 | `create_feedback_records` | `write` or `manage` |
 | `update_feedback_record` | `write` or `manage` |
 | `delete_feedback_record` | `manage` |
+| `list_chart_fields`, `list_charts`, `get_chart`, `list_dashboards`, `get_dashboard` | `read` |
+| `preview_chart`, `get_chart_data`, `list_chart_field_values` | `read`, and read access to the chart's feedback dataset |
+| `list_dashboard_filter_fields` | `read`; a feedback dataset the caller cannot read through the dashboard is left out of the list, and a Dashboard viewer gets only the keys a chart on the dashboard groups by |
+| `list_dashboard_filter_values` | `read`, and read access to each feedback dataset its charts read |
+| `create_chart`, `duplicate_chart` | `write` or `manage`, and write access to the feedback dataset |
+| `update_chart`, `create_dashboard`, `update_dashboard`, `duplicate_dashboard`, `update_dashboard_layout`, `set_dashboard_filters`, `add_chart_to_dashboard`, `update_widget`, `remove_chart_from_dashboard` | `write` or `manage` |
 
-Synthesized MCP scopes for an API key: `surveys:read` + `workflows:read` + `feedbackRecords:read`
-always; the matching `:write` scopes when the key has `write` or `manage` on any workspace. The scope
+Synthesized MCP scopes for an API key: every `:read` scope always (`surveys`, `workflows`,
+`feedbackRecords`, `responses`, `dashboards`); the matching `:write` scopes when the key has `write` or
+`manage` on any workspace — so every existing write key can manage charts and dashboards. The scope
 gate and the per-workspace access check above are independent — a `:write` tool requires **both** the
 `:write` scope on the token and write/manage on the target workspace.
 
@@ -253,14 +322,15 @@ curl -sS -X POST http://localhost:3000/api/auth/oauth2/register \
     "token_endpoint_auth_method": "none",
     "grant_types": ["authorization_code", "refresh_token"],
     "response_types": ["code"],
-    "scope": "openid profile email offline_access surveys:read surveys:write workflows:read workflows:write feedbackRecords:read feedbackRecords:write"
+    "scope": "openid profile email offline_access surveys:read surveys:write workflows:read workflows:write feedbackRecords:read feedbackRecords:write responses:read responses:write dashboards:read dashboards:write"
   }'
 ```
 
 <Note>
   This passes `scope` explicitly, so it does **not** reproduce a real client's behavior — real MCP clients
   register with the scopes from the protected-resource metadata's `scopes_supported` (`surveys:read
-  surveys:write workflows:read workflows:write feedbackRecords:read feedbackRecords:write offline_access`).
+  surveys:write workflows:read workflows:write feedbackRecords:read feedbackRecords:write responses:read
+  responses:write dashboards:read dashboards:write offline_access`, built from `MCP_PROTECTED_RESOURCE_SCOPES`).
   Because the authorization server validates the `/authorize` request against the client's **registered**
   scopes, a client that registers with a narrower set than it later requests (e.g. it registers surveys-only
   but requests `offline_access`) is rejected with `invalid_scope`. To smoke-test the real path, omit `scope`
@@ -268,11 +338,11 @@ curl -sS -X POST http://localhost:3000/api/auth/oauth2/register \
 </Note>
 
 <Note>
-  For the same reason, the `scope` in the MCP endpoint's 401 `WWW-Authenticate` challenge is exactly
-  the metadata's `scopes_supported`, not a subset — a client that hits the 401 before fetching the
-  metadata uses the challenge string as its registration scope. The two are derived from one constant
-  (`MCP_CHALLENGE_SCOPE`) and a test asserts they stay equal; when they diverged, every new client
-  failed its first connect with `invalid_scope` and only succeeded on retry.
+  For the same reason, the `scope` in the MCP endpoint's 401 `WWW-Authenticate` challenge is exactly the
+  metadata's `scopes_supported`, not a subset — a client that hits the 401 before fetching the metadata uses
+  the challenge string as its registration scope. The two are derived from one constant
+  (`MCP_CHALLENGE_SCOPE`) and a test asserts they stay equal; when they diverged, every new client failed its
+  first connect with `invalid_scope` and only succeeded on retry.
 </Note>
 
 The consent screen is served at `/account/authorize`. Users can revoke approved MCP clients from
@@ -523,6 +593,19 @@ Errors are returned as MCP error tool results with a structured v3 problem paylo
 }
 ```
 
+### Declared result shapes
+
+The response tools advertise an `outputSchema`, which no other tool does yet. A client can read the
+result shape off `tools/list` rather than inferring it from an example, and the SDK checks the
+structured result against the same schema it advertised.
+
+One object root with every branch optional, built by `mcpToolOutput`: a tool answers either the
+success payload or the error one, which reads like a union — but a union converts to a root-level
+`anyOf`, and the SDK then wraps the result for a 2025-era client to keep the wire shape legal. An
+object root is identity on both eras, so the same structured payload reaches every client. The cost is
+that the schema cannot say "exactly one of these", which is why the error branch is described in full:
+a client can still tell the two apart by which key is present.
+
 ## Tool Arguments
 
 Every tool input schema is **strict**: an argument a tool does not declare is rejected, not ignored.
@@ -556,13 +639,136 @@ Two kinds of exception:
   invites that, but it is a behaviour change from earlier Formbricks releases, which silently dropped
   such keys.
 
-  Two consequences worth knowing. **Read-modify-write needs trimming:** `update_feedback_record` accepts
-  only the eight mutable fields, so echoing a record straight back from `get_feedback_record` is rejected
-  — strip the provenance (`source_*`, `field_*`, `submission_id`, `collected_at`) and the derived
-  sentiment/emotions/translation first. The error names every key to remove. And **`list_workspaces`
-  takes no arguments at all**, so a client that pads zero-argument calls with a placeholder key will fail
-  on the one tool every other workspace-scoped tool depends on for its `workspaceId`.
+Two consequences worth knowing. **Read-modify-write needs trimming:** `update_feedback_record` accepts
+only the eight mutable fields, so echoing a record straight back from `get_feedback_record` is rejected
+— strip the provenance (`source_*`, `field_*`, `submission_id`, `collected_at`) and the derived
+sentiment/emotions/translation first. The error names every key to remove. And **`list_workspaces`
+takes no arguments at all**, so a client that pads zero-argument calls with a placeholder key will fail
+on the one tool every other workspace-scoped tool depends on for its `workspaceId`.
+
 </Note>
+
+Array arguments are bounded. No array in a tool call may hold more than 1 000 items, and all the arrays
+in one call together at most 50 000 elements, at any depth; and a call may nest at most 256 levels of
+objects and arrays. A call over any of these is refused with a JSON-RPC `-32602` error before its
+arguments are parsed. Fields with a tighter bound advertise it as
+`maxItems` in the tool's input schema — `create_survey`'s `blocks`, `endings`, `variables`, `startLogic` and
+`languages`, `get_survey`'s `lang`, the list filters' `in` arrays, and `create_feedback_records`'
+`records`. A request body may be at most 2 MB, whether or not it declares a `Content-Length`.
+
+## Adding a tool
+
+A tool is a thin adapter over a v3 operation: it parses its input, calls the operation with the caller's
+authentication, and relays the result. It never queries the database or checks tenancy itself — the
+operation owns both — so the MCP surface follows the v3 API rather than growing semantics of its own.
+
+<Steps>
+  <Step title="Start from the operation">
+    Find or add the operation in `apps/web/app/api/v3/<resource>/lib/operations.ts`, with its REST route and
+    OpenAPI entry. Operations **return** a `Response` for every outcome, errors included, and never throw: MCP
+    calls them without the route wrapper. Two families differ: workflow tools call the `@formbricks/workflows`
+    handlers through `app/api/v3/workflows/lib/context.ts`, and feedback-record tools call operations over the
+    Hub service while the REST route proxies straight to the Hub, so they have no one-to-one REST twin.
+  </Step>
+  <Step title="Declare the input">
+    In `tools/schemas.ts` (or `tools/<resource>-schemas.ts`). Use `.strict()` on the object and
+    `z.strictObject` on nested ones, `lengthBoundedArray` for arrays, `.describe()` on every field, and
+    `.extend()` the v3 body schema rather than restating it. `schemas.test.ts` fails on any structured object
+    that is not strict, but only in the modules it spreads into `allExports` — add a new schema module there.
+    Never take a tenant id from input.
+  </Step>
+  <Step title="Declare the output">
+    `outputSchema: mcpToolOutput(<v3 resource schema>)`, built from the v3 resource schema and never
+    retyped. The SDK validates every successful result against it (error results are skipped), so a schema
+    that drifts fails every call that would otherwise have succeeded.
+  </Step>
+  <Step title="Register it">
+    In `tools/<resource>.ts`, through `registerScopedTool` — the only registration path, which runs the scope
+    gate before the handler. Reads call the operation directly:
+
+    ```ts
+    registerScopedTool(
+      server,
+      "get_response",
+      {
+        title: "Get response",
+        description: "Read one survey response in full. Operates on responses, not feedback records.",
+        inputSchema: ZMcpGetResponseInput,
+        outputSchema: ZMcpResponseOutput,
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      },
+      ["responses:read"],
+      async (input: TMcpGetResponseInput, ctx) => {
+        const authInfo = getMcpToolAuthInfo(ctx);
+        const requestId = getMcpRequestId(authInfo);
+        const response = await getV3Response({
+          responseId: input.responseId,
+          authentication: getMcpAuthentication(authInfo),
+          requestId,
+          instance: MCP_API_ROUTE,
+        });
+        return await responseToMcpToolResult(response, requestId);
+      }
+    );
+    ```
+
+    A mutation differs in two places, and both are needed: `audit: { action, targetType, targetIdArg? }` in
+    the config (records a call the scope gate refused) and `runMcpMutation(ctx, { action, resource }, ({
+    authentication, requestId, auditLog }) => operation(...))` in the handler (records the outcome). Gate
+    writes on `<resource>:write`. A dry run is `read` only if it is a pure function of its input
+    (`validate_survey`); one that resolves references is `write` (`validate_response`).
+
+  </Step>
+  <Step title="Test it">
+    Next to the tool, in `tools/<resource>.test.ts`: drive the handler with the opposite scope and assert the
+    403 detail, and assert the roster of registered names (see `responses.test.ts` and
+    `feedback-records.test.ts`). Run `pnpm test`; restart the dev server to see the tool in `tools/list`.
+  </Step>
+  <Step title="Document it">
+    Add its section under [Available Tools](#available-tools), a row in the scope, permission and REST-mapping
+    tables on this page, and in the scope table of `platform/mcp/overview.mdx` if it adds a tool to a scope.
+  </Step>
+</Steps>
+
+### A new scope family
+
+Reusing `<resource>:read` / `<resource>:write` needs nothing more. A new resource family also needs:
+
+1. The scope pair in `MCP_OAUTH_SCOPES` (`modules/auth/lib/oauth-urls.ts`), and a data migration that appends
+   it to existing `oauthResource.allowedScopes` rows — `mcp-oauth-resource-seed.test.ts` fails until the
+   migration is listed in its `REPAIR_MIGRATIONS`. Without it, on every instance that already upgraded, a
+   client asking only for the new scope gets `invalid_scope`, and one asking for it alongside others is
+   silently granted less than it asked for. Neither logs.
+2. API-key scopes in `getMcpScopes` (`modules/mcp/auth.ts`), the consent label in `getOAuthScopeLabel` plus its
+   en-US string (then `pnpm i18n`), and the `anyOf` list on `list_workspaces`.
+3. `registerXTools(server)` in `modules/mcp/server.ts`, before the final `instrumentMcpServerWithTracing`.
+4. Last, `MCP_RESOURCE_SCOPES`, which advertises the scope, in the same release as a data migration that
+   appends the pair to existing `oauthClient.scopes` rows. Mirror read/write (`:read` only for clients that
+   hold a read scope) and skip `skipConsent` clients, as `20261005130000_eng_3470_grant_responses_scopes_to_clients`
+   does. Without it, every client registered before the scope existed requests it and gets `invalid_scope`
+   at its next sign-in (see [Authentication](#authentication)).
+
+### What makes a tool good
+
+- **One tool per operation.** An MCP-only convenience tool is a second surface to document, test and keep in
+  step. When an operation's shape costs the agent real tokens or errors, add a better v3 operation instead —
+  `edit_survey_blocks` is one (`PATCH /api/v3/surveys/{surveyId}/blocks`), addressing blocks by id rather than
+  resending the whole array.
+- **Descriptions are paid for on every session.** `tools/list` ships every description and every field
+  `.describe()` to the model each time. State what the tool does, its side effects, and when to prefer another
+  tool. Spend a long description only where the wrong pick is likely _and_ silent (`list_responses` against
+  feedback records); everywhere else use the one-line form.
+- **Small pages, cheap counts.** Cap `limit` below the REST maximum (default 20, max 50–100 against 250), keep
+  expensive totals opt-in, use opaque cursors, and give list-shaped resources a `count_*` tool so "how many"
+  never means paging.
+- **Concise by default.** Return the handle for the next call, not the whole resource: `response_format:
+"concise"` returns `id` and `updatedAt`, which is the next call's `expectedUpdatedAt`. The projection is
+  MCP-only; REST keeps the full resource.
+- **Errors that say what to do next.** Relay the v3 problem document unchanged: `invalid_params` names the
+  field, a `409` carries `currentUpdatedAt`. Reject unknown keys instead of dropping them.
+- **Honest annotations.** `destructiveHint: true` whenever the previous value is unrecoverable from the
+  result, including whole-subtree replaces. For an irreversible delete, consider confirming first the way
+  `delete_response` does (elicitation, with a `confirm` argument for clients that cannot answer prompts).
 
 ## Available Tools
 
@@ -615,11 +821,16 @@ Output:
   "meta": {
     "limit": 20,
     "nextCursor": null,
-    "totalCount": 1
+    "totalCount": 1,
+    "workspaceSurveyCount": 3
   },
   "requestId": "req_..."
 }
 ```
+
+`totalCount` is the number of surveys matching the filters; `workspaceSurveyCount` is every survey in the
+workspace, archived ones included and independent of the filters, so it can be larger. Both are `null`
+when `includeTotalCount` is `false`.
 
 ### get_survey
 
@@ -641,6 +852,51 @@ codes or configured aliases.
 
 Creates a block-based link survey using the v3 survey document contract. The tool writes data and is
 not idempotent.
+
+A block is `{ name, elements[], id? }`; an element is `{ id, type, headline, ... }`. The element
+`type` is one of `fileUpload`, `openText`, `multipleChoiceSingle`, `multipleChoiceMulti`, `nps`,
+`cta`, `rating`, `consent`, `pictureSelection`, `cal`, `date`, `matrix`, `address`, `ranking`,
+`contactInfo`, `csat`, `ces`, `signature`. Element ids are caller-supplied and become immutable once the survey
+leaves draft; block ids are generated when omitted. Translatable fields are keyed by locale code and
+must carry every configured language — the internal `default` key is rejected.
+
+Once a survey has left `draft` (active, paused, completed, or scheduled, which is paused until its
+publish date), its question codes, answer codes, question types and option text in every language are
+locked, and an option, matrix row or column that existed at launch cannot be deleted. The tools refuse
+such an edit with `immutable_question_code`, `immutable_answer_code`, `immutable_question_type`,
+`immutable_option_text` or `immutable_option_deletion`, naming the field. Adding questions and options is
+still allowed, and an agent can unlock a survey by reverting it to `draft`.
+
+Every element except `cta` may carry an optional **question code**, and every choice, matrix row or
+column and picture choice an optional **answer code**: `{ "id": "satisfaction", "code": "q1", ... }`
+and `{ "id": "c1", "code": "1", "label": { ... } }`. A missing code is not an error. A question code
+starts with a lowercase letter, then lowercase letters, digits and `_` (no `__`, no trailing `_`, at
+most 30 characters); an answer code uses the same characters, may start with a digit and is at most 20
+characters. Neither may be an SPSS reserved word (`all`, `and`, `by`, `eq`, `ge`, `gt`, `le`, `lt`,
+`ne`, `not`, `or`, `to`, `with`) or an export column name (`response_id`, `language`, `outcome`, ...).
+Question codes are unique across the survey, its Embedded Data names and the other questions' ids,
+ignoring case; answer codes are unique within their question, with a matrix's rows and columns checked
+separately. A clash is reported as `invalid_params`, and `validate_survey` runs the same check.
+
+The same list is carried on the tool's own `blocks` description, generated from
+`TSurveyElementTypeEnum` so the two cannot drift. Per-type required fields are not restated here.
+`validate_survey` will reject an element that is missing them, but it reports the element **by its
+position** rather than naming the field: the element schema is an undiscriminated union, so a wrong
+or absent `type` makes every branch fail and the message is a generic `Invalid input`. Send the
+type's own fields with the element rather than expecting the validator to name them.
+
+An optional `startLogic` array holds the **rules before the first question**: the survey runs them as
+soon as it loads, before the welcome card and on start-at links. Each rule has the shape of a block's
+`logic` rule, but may only `jumpToBlock` (to a block, or to an ending to screen the respondent out),
+`calculate` and `markLowQuality`, and may read `hiddenField`, `variable` and `reserved` operands only, since nothing has been
+answered yet. Anything else is refused with the exact path, such as `startLogic.0.actions.1`. On
+`patch_survey`, `null` or `[]` removes them and an omitted `startLogic` is kept; `get_survey` always
+returns the array, `[]` when there are none.
+
+A block rule may also carry a `markLowQuality` action, `{ "id": "<cuid2>", "objective": "markLowQuality" }`
+with no target (ENG-6933). When the rule fires, the respondent sees nothing and the response is marked Low
+quality as a reviewer would mark it. It is allowed in `startLogic` too (ENG-6952), where the flag rides on
+the response's first write, a screen-out's finished response included; `requireAnswer` is refused there.
 
 Input:
 
@@ -697,6 +953,24 @@ Input:
 Output uses the same survey resource shape as `GET /api/v3/surveys/{surveyId}` and includes the MCP
 `requestId`.
 
+#### Typed Embedded Data
+
+`create_survey`, `patch_survey` and `validate_survey` take the survey's Embedded Data as typed
+`embeddedFields` (ADR 0028), next to the legacy `variables` and `hiddenFields`, and `get_survey` returns
+both. An entry is `{ storageKey, key, name, source, dataType, defaultValue, locked }`:
+
+- `source: "computed"` is set by logic. Logic operands of type `variable` and calculate actions name its
+  `storageKey` (a cuid2, generated when omitted). Its `dataType` is `string`, `number` or `date`.
+- `source: "ingested"` arrives by URL parameter or SDK. Operands of type `hiddenField` name its
+  `storageKey`, which defaults to its name. It may be `boolean` too, and only ingested fields can be
+  `locked`.
+- A workspace library field is linked by sending `{ "key": "plan_tier" }` alone: the server fills in the
+  library's definition. A key the library does not have is a `400` at `embeddedFields.<i>.key`.
+
+`embeddedFields` is the complete set, and the legacy pair is derived from it. Either format alone works.
+Sent together, they have to describe the same fields, or the call fails with a `400` naming each path
+where they differ, so an edit made in one format is never silently dropped.
+
 ### validate_survey
 
 Validates a create or patch payload without writing survey changes. The tool is read-only and
@@ -746,16 +1020,48 @@ Patch validation input:
 Validation failures return `200` with `valid: false` and structured `invalid_params`, matching
 `POST /api/v3/surveys/validate`.
 
+Custom CSS validation input — processes CSS alone, for a preview, without saving anything:
+
+```json
+{
+  "data": {
+    "customCss": {
+      "dark": null,
+      "light": "[data-fb-part=\"headline\"] { font-weight: 600; }"
+    }
+  },
+  "operation": "customCss",
+  "scope": "survey",
+  "surveyId": "clsv1234567890123456789012",
+  "workspaceId": "clxx1234567890123456789012"
+}
+```
+
+`scope` is `workspace` or `survey`; `surveyId` is optional, survey scope only, and must belong to
+`workspaceId`. A valid result carries the compiled `customCss` and `warnings` (removed constructs, each with
+a stable `code`, `appearance`, `line`, `column` and `reason`); an invalid one carries `errors` and no compiled
+output. A create or patch payload that includes `customCss` is processed the same way, additively.
+
 ### patch_survey
 
 Updates a survey by ID using the v3 survey patch contract. The tool writes data, can be
 destructive, and is not idempotent. Omitted top-level fields are preserved. Provided top-level
 objects and arrays replace that whole subtree, so omitted nested entries inside a provided subtree
 can be removed. The patch tool does not deep-merge nested objects and does not implement JSON Patch.
+For a change confined to one or a few blocks, prefer `edit_survey_blocks`, which does not require
+resending the others.
+
+The full `get_survey` output may be sent straight back: server-owned fields (`id`, `workspaceId`,
+`type`, `createdAt`, `archivedAt`, `defaultLanguage`, `languages[].alias`) are accepted and verified,
+and changing one is a `422` `read_only_field` rather than a silent ignore. A round-tripped
+`updatedAt` acts as an optimistic-concurrency precondition, so the patch is rejected with `409` if
+the survey changed since your read.
 
 <Note>
   For agent workflows, fetch the current survey first, modify only the intended top-level fields, run
-  `validate_survey` with `operation: "patch"`, and then submit the same patch with `patch_survey`.
+  `validate_survey` with `operation: "patch"`, and then submit the same patch with `patch_survey`. If the
+  change is confined to blocks, stop here and use `edit_survey_blocks` or `set_survey_block_order` instead —
+  they are cheaper and cannot drop a block by omission.
 </Note>
 
 Input:
@@ -778,6 +1084,149 @@ Input:
 Output uses the same survey resource shape as `GET /api/v3/surveys/{surveyId}` and includes the MCP
 `requestId`.
 
+#### Confirmation on surveys with responses
+
+`patch_survey`, `edit_survey_blocks`, `set_survey_block_order` and `delete_survey` take an optional
+`confirm` argument. On a survey that is not a draft and already has at least one response, a call
+without `confirm: true` changes nothing: it returns an error (`status: 428`, "Confirmation required")
+whose `detail` is the caution the editor shows a person — mixed old and new responses for a change, the
+loss of every response for a delete — followed by "Pass confirm: true after the user agrees". The agent
+shows that to the user and retries with `confirm: true` only after they agree. Drafts and surveys
+without responses need nothing. The rule is MCP-only: the v3 HTTP API is unchanged, and an operation
+enforces it only when the tool passes `writeConfirmation`.
+
+`customCss` on `create_survey` and `patch_survey` is source only — `{ "light": "…", "dark": "…" }`, both
+keys, each a string or `null`; `null` clears it, and on a patch an omitted `customCss` is kept. Compiled
+output is computed by the server, and a payload carrying `compiled` or `processorVersion` is rejected. A
+successful write that processed CSS returns the removed constructs as a top-level `warnings` array beside
+`data`; adding or editing CSS on a Cloud organization without the Scale plan is a `403`
+`custom_css_plan_required`, clearing it never is. `get_survey` returns the source in `customCss`.
+
+### get_workspace_custom_css
+
+Reads a workspace's shared survey CSS: `customCss` and `previous` (the one recoverable revision) as
+source, `status` (`ok`, `stale` — recompiled from source because the processor changed — or `withheld`,
+when that source no longer passes and respondents get none of it), and `canEdit` / `planAllowed` for the
+caller. Read-only and idempotent; `surveys:read` plus read access to the workspace.
+
+Input:
+
+```json
+{
+  "workspaceId": "clxx1234567890123456789012"
+}
+```
+
+### patch_workspace_custom_css
+
+Saves or clears the workspace's shared survey CSS. `customCss` replaces both fields; `null` clears all of
+it, and unchanged source writes nothing. Removed constructs come back as top-level `warnings`; CSS the
+processor rejects is a `422` with `details.errors`, and the saved CSS stays in effect. The replaced value
+becomes `previous`, restored by sending its source back.
+
+The scope is `surveys:write` because this is shared survey CSS, but the scope is only the first gate:
+the operation still requires an **organization owner or manager** (OAuth or session user) or an API key
+with **`manage`** on the workspace — a `write` grant is refused — and, on Cloud, the Scale plan to add or
+edit. Both refusals, like a scope refusal, are audited.
+
+Input:
+
+```json
+{
+  "customCss": {
+    "dark": "#fbjs[data-appearance=\"dark\"] { --acme-ink: #e6eef5; }",
+    "light": "[data-fb-part=\"button-primary\"] { border-radius: 999px; }"
+  },
+  "workspaceId": "clxx1234567890123456789012"
+}
+```
+
+Both tools declare an `outputSchema`: the workspace custom CSS resource under `data`, plus `warnings` on
+a write.
+
+### edit_survey_blocks
+
+Edits a survey's blocks in place — update, insert or remove whole blocks without resending the ones
+you are not changing. The tool writes data, can be destructive, and is not idempotent. Operations
+apply in order against a single snapshot and land atomically: either all of them do or none do.
+
+Blocks are addressed by id, never by position, so a concurrent edit cannot redirect an operation onto
+a different block. An `update` replaces the target block entirely, and the replacement must carry
+every language the survey has configured. An `insert` anchors at `start`, `end`, or `after` a block
+id — including one an earlier operation in the same request inserted. `block.id` is optional on
+both: an insert without one gets a server-generated id, returned in the concise response's `applied`
+list, and an update takes it from the operation's `id`.
+
+Removing a block orphans any answers already collected for its elements, and the API cannot undo
+that. The editor shows a human a caution before this, and the tool does the same: on a survey that is
+not a draft and has responses it refuses until the call passes `confirm: true` (see
+[Confirmation on surveys with responses](#confirmation-on-surveys-with-responses)).
+
+<Note>
+  Fetch the survey first and pass its `updatedAt` as `expectedUpdatedAt`. If the survey changed since your
+  read the call returns `409` with both timestamps in `details` — re-read and retry. The concise response
+  carries the new `updatedAt`, so a run of edits chains without fetching again.
+</Note>
+
+Input:
+
+```json
+{
+  "expectedUpdatedAt": "2026-04-21T10:00:00.000Z",
+  "ops": [
+    {
+      "block": {
+        "elements": [
+          {
+            "headline": { "en-US": "How satisfied were you?" },
+            "id": "satisfaction",
+            "inputType": "text",
+            "required": true,
+            "type": "openText"
+          }
+        ],
+        "id": "k1p9wq2m4x7c3v8b5n6t0j2r",
+        "name": "Satisfaction"
+      },
+      "id": "k1p9wq2m4x7c3v8b5n6t0j2r",
+      "op": "update"
+    }
+  ],
+  "response_format": "concise",
+  "surveyId": "clsv1234567890123456789012"
+}
+```
+
+Output defaults to a concise acknowledgement — `id`, `updatedAt`, `blockCount` and the operations
+applied — plus the MCP `requestId`. The full survey resource is ~15k tokens on a large survey, which
+would refill an agent's context as fast as resending the blocks did, so it is opt-in via
+`response_format: "detailed"`. `REST` always returns the full resource.
+
+### set_survey_block_order
+
+Replaces the order of a survey's blocks by listing every current block id exactly once. Block content
+is untouched. The tool writes data and can be destructive, but unlike every other survey write it is
+**idempotent**: the same order yields the same survey, and an order that already matches performs no
+write at all, so `updatedAt` does not move and other callers' preconditions stay valid. A stale
+`expectedUpdatedAt` still returns `409` on that path: the precondition is evaluated before the
+method, so a no-op outcome never reports success to a caller whose view is out of date.
+
+Because the list must be a permutation, a dropped or duplicated block is rejected rather than
+silently applied — the failure that resending the whole `blocks` array cannot catch.
+
+Input:
+
+```json
+{
+  "expectedUpdatedAt": "2026-04-21T10:00:00.000Z",
+  "order": ["b4h8s2d6f0g3j5k7l9z1x3c5", "k1p9wq2m4x7c3v8b5n6t0j2r"],
+  "response_format": "concise",
+  "surveyId": "clsv1234567890123456789012"
+}
+```
+
+Output matches `edit_survey_blocks`: concise by default, echoing the applied `order`.
+
 ### delete_survey
 
 Deletes one survey by ID. The tool is destructive, writes data, and is not idempotent.
@@ -798,6 +1247,70 @@ so callers can correlate the audit trail:
   "requestId": "req_..."
 }
 ```
+
+### Creative tools
+
+Nine tools over the v3 Creatives API, one per documented operation but one: `list_creatives`, `get_creative`,
+`get_creative_stats`, `create_creative`, `patch_creative`, `delete_creative`, `duplicate_creative`,
+`archive_creative` and `restore_creative`. The one operation without a tool is `POST
+/api/v3/creatives/pause`, which pauses every creative a survey opens so the survey screens stay within
+the rate limit however many there are; an agent pauses one with `patch_creative`. A creative is a
+feedback button or banner the web SDK renders
+on a customer's site. Each tool is a thin adapter: it maps its input onto the operation in
+`app/api/v3/creatives/lib/operations.ts` and relays the answer, so validation, status rules and
+authorization are the REST API's, tested once there.
+
+**Scopes.** There is no `creatives:*` scope: reads declare `surveys:read` and writes `surveys:write`, so
+any client that can manage surveys can manage creatives and the consent screen offers nothing new (its
+`surveys:*` lines now say "surveys and creatives"). Splitting the scope later is additive — add
+`creatives:*` and grant it to every client already holding `surveys:*`, as for responses in ENG-3470.
+The workspace permission behind the operation is a separate gate, as for every tool.
+
+**`list_creatives`** takes a required `workspaceId`, `limit` (default 20, at most 50), an opaque `cursor`,
+`filter.name.contains`, `filter.type.in`, `filter.displayStatus.in`, `surveyId` (creatives whose
+Destination is that survey) and `sortBy`. Archived creatives are left out unless
+`filter.displayStatus.in` names `archived`. `meta` carries `limit` and `nextCursor` only: the creative
+list has no total.
+
+```json
+{
+  "workspaceId": "clxx1234567890123456789012",
+  "filter": { "displayStatus": { "in": ["active", "scheduled"] } }
+}
+```
+
+**`create_creative`** takes one flat object. `type` (`feedbackButton` or `banner`) selects the shape of
+`content` and `styling` and can never change (a union cannot be a tool's root, so the shapes are
+advertised side by side); the v3 create body validates the object behind the scenes, so a `content` that
+does not fit the `type` is refused before the operation runs. A creative is
+created as a draft unless `status` is `inProgress`, which publishes it and so needs its Destination and
+default-language text (a `422` names the field). Texts are keyed by locale code.
+
+```json
+{
+  "workspaceId": "clxx1234567890123456789012",
+  "name": "Pricing page feedback",
+  "type": "feedbackButton",
+  "content": { "label": { "en-US": "Feedback" }, "icon": "messageSquare" },
+  "destination": { "type": "survey", "surveyId": "clsv1234567890123456789012" },
+  "status": "inProgress"
+}
+```
+
+**`patch_creative`** takes `{ creativeId, data }`. Each group in `data` (`content`, `styling`,
+`destination`, `distribution`, `schedule`, or `defaultLanguage` with `languages`) replaces the stored group
+as a whole, which is why the tool is `destructiveHint: true`: read the creative with `get_creative` and
+send the complete group. Publish, pause, close and reopen by setting `status`. An archived creative is
+read-only (`422`): restore it first.
+
+**`delete_creative`** is permanent and takes the creative's counts with it; `archive_creative` takes one
+off the site and keeps its history, and `restore_creative` brings it back, always as a draft to publish
+again. Archiving and restoring are idempotent; archiving is annotated destructive, like `archive_workflow`:
+it takes the creative off the site, and its status doesn't come back with it. Restoring is not. `duplicate_creative` copies a creative into a new draft without
+its counts. `get_creative_stats` reads Impressions, Clicks and Click rate per UTC day, with an optional
+`from`/`to` range and `groupBy` of `page` or `device`.
+
+There is no `validate_creative` dry run yet.
 
 ### Workflow tools
 
@@ -935,6 +1448,122 @@ each take only a workflow id:
 - `archive_workflow` / `unarchive_workflow` — soft archive and restore (to draft).
 - `delete_workflow` — the v3 delete returns `204 No Content`; the MCP result contains the `requestId`.
 
+### Response tools
+
+Eight tools, one per documented v3 response operation. The set mirrors the API deliberately: what an
+agent can do through MCP is what an API key can do over HTTP, read off one list rather than two.
+
+Every tool description states the boundary against the feedback-record tools, because
+`list_feedback_records(source_id=<surveyId>)` looks like it answers the same question and does not —
+see **Feedback Records And The Hub** below. The full paragraph goes on `list_responses` and
+`count_responses`, where the wrong pick is both likely and quiet; the others carry a one-line form,
+since a description is context every client pays for on every `tools/list`.
+
+#### list_responses / count_responses / get_response
+
+Read-only and idempotent. `workspaceId` is always required; `surveyId` or `contactId` narrows it, and
+the `finished` and `language` filters require one of those two anchors because without one they are
+unbounded scans. `list_responses` caps `limit` at 50 — below the API's 250, because an agent's binding
+constraint is its context window and a response carries every answer.
+
+```json
+{
+  "finished": true,
+  "limit": 20,
+  "surveyId": "clsv1234567890123456789012",
+  "workspaceId": "clxx1234567890123456789012"
+}
+```
+
+#### validate_response
+
+A dry run of a create or patch: reports `valid`, `invalid_params`, and — when valid — the `effects` a
+write would have, including the language that would be stamped and the quotas that would count. It
+declares `responses:write` although it writes nothing, because it resolves the same references the
+write resolves; gating it at read would make it a cheaper existence probe than the operation it
+describes.
+
+```json
+{ "data": { "data": {}, "finished": true, "surveyId": "clsv…" }, "operation": "create" }
+```
+
+#### create_response / update_response
+
+`create_response` records a real submission: webhooks, integrations, follow-ups, quotas and metering
+all run. `update_response` replaces `data` and `tags` wholesale rather than merging, which is why it is
+annotated `destructiveHint: true` — to add one tag, read the response and send every tag it should end
+up with.
+
+Both take the v3 body as an opaque `data` argument and let the operation parse it, so the tool and the
+route answer the same thing to a malformed body.
+
+#### delete_response / batch_delete_responses
+
+Both **ask before they delete**, over the multi-round-trip `input_required` flow: the first call returns
+an `elicitation/create` request and an opaque `requestState`, and the client retries with the answer.
+
+The pending confirmation is HMAC-sealed by `createRequestStateCodec` and bound to the caller, and the
+handler compares the sealed `resourceId` against the arguments on re-entry. Both come back through the
+client, so without that comparison a client could be asked about response A and retry the confirmation
+against response B. The batch tool binds the exact id list, so a confirmation for two ids does not
+carry over to a third.
+
+`confirm: true` skips the prompt. That is not a convenience bolted on afterwards — it is the path a
+2025-era client and a headless caller use, and without it those clients could not delete at all.
+
+```json
+{ "confirm": true, "responseId": "clrs1234567890123456789012" }
+```
+
+Both are `idempotentHint: true`: a response that is already gone answers the same `403` as one that was
+never this caller's, so repeating the call converges rather than compounding.
+
+### Chart and dashboard tools
+
+Twenty-one tools over the v3 chart and dashboard operations (`modules/mcp/tools/dashboards.ts`), one per
+operation, minus deletion: there is no tool that deletes a chart or a dashboard, so a vague prompt such as
+"clean up old charts" cannot remove anything permanently. There is no AI generation tool either — an agent
+writes the chart query itself.
+
+- **Write against the catalog.** `list_chart_fields` returns every field a chart query may use; the query
+  validator refuses anything else with `invalid_params` naming each problem. `preview_chart` runs an unsaved
+  chart so an agent can check it before `create_chart` saves it.
+- **Free-form numbers need feedback access.** `preview_chart` and `list_chart_field_values` run a caller's own
+  query over respondents' answers, so they declare `dashboards:read` **and** `feedbackRecords:read`.
+  `get_chart_data` declares the same two, with one exception through `registerScopedTool`'s `{ byInput }` form:
+  given a `dashboardId` it reads the chart as that dashboard shows it, and a Dashboard viewer's token (trimmed to
+  `dashboards:read`, flagged `dashboardViewerOnly` at authentication) may do that on `dashboards:read` alone
+  (ADR-0025). Without `dashboardId` it is the chart-only read it always was. Each operation also checks read
+  access to the chart's feedback dataset, the dashboard-bound one through `dashboard_read` for a viewer. They spend from
+  the same 600/min budget as the REST data routes, and share their limit of 20 queries running at once, both
+  charged inside the operation.
+- **Dashboard filter values.** `list_dashboard_filter_values` is `GET /api/v3/dashboards/{dashboardId}/filters/{filterId}/values`:
+  the values a list filter offers, narrowed by the date range, the other filters' picks and `search`, which an
+  agent then passes as `picks` to `get_chart_data`. It is gated like a chart read through its dashboard —
+  `dashboards:read` and `feedbackRecords:read`, or `dashboards:read` alone for a Dashboard viewer — and spends
+  from the default v3 budget on every call and from the chart-query budget per Cube query on a cache miss.
+- **Dashboard filter fields.** `list_dashboard_filter_fields` is `GET /api/v3/dashboards/{dashboardId}/filter-fields`:
+  the embedded-data fields (`FeedbackRecords.ed_*`) of the feedback datasets the dashboard's charts read, which an
+  agent uses as a filter's `field` in `set_dashboard_filters`, `get_chart_data` and `list_dashboard_filter_values`.
+  A Dashboard viewer cannot call `list_chart_fields`, so this is how its agent finds them. It is gated like
+  `list_dashboard_filter_values`, and spends from the default v3 budget.
+- **Shared charts.** `update_chart`'s description says an edit shows on every dashboard holding the chart, and
+  points at `duplicate_chart` + `update_widget` for a per-dashboard change. `duplicate_dashboard` says the copy
+  shares its charts. `remove_chart_from_dashboard` says the chart is kept.
+- **Rearranging.** `update_dashboard_layout` takes `{ expectedUpdatedAt, widgets: [{ widgetId, layout }] }` and is
+  refused unless it lists exactly the current widgets, so it can never remove a widget by omission. A stale
+  `expectedUpdatedAt` answers `409` with the current one in `details`.
+- **Locked filters.** `set_dashboard_filters` takes `{ expectedUpdatedAt, filters }` and replaces the dashboard's
+  locked filters — the `filters` of `PUT /api/v3/dashboards/{dashboardId}` without the rest of the save, through
+  `setV3DashboardFilters`, which keeps the name and every widget. The list is the whole set: a filter is kept by
+  sending it back as `get_dashboard` read it, changed by sending it changed, removed by leaving it out, and an empty
+  list removes them all. A filter sent without `id` gets a new one. The input carries the PUT body's checks (at most
+  10 filters, a catalog dimension or embedded-data field with an operator it allows, values within the picks
+  budget), and the operation the save's: an embedded-data key none of the dashboard's charts reads answers `422`, a
+  stale `expectedUpdatedAt` `409`. Locked filters are ANDed; there are no OR groups.
+
+Every write runs through `runMcpMutation`, so it leaves the same audit event as the REST call.
+
 ### list_feedback_datasets
 
 Lists the active feedback datasets assigned to a workspace. Read-only and idempotent. Use the
@@ -996,7 +1625,7 @@ dropped filter would widen the result set without saying so.
 
 **How they combine.** Every identity filter accepts one value or a list of them. Repeating one filter
 **OR**s its values; different filters are **AND**ed. So `source_type: ["survey", "review"]` with
-`sentiment: ["negative"]` reads as *"(survey OR review) AND negative"*. There is no way to OR across
+`sentiment: ["negative"]` reads as _"(survey OR review) AND negative"_. There is no way to OR across
 different filters.
 
 | Filter                                        | Selects                                                              |
@@ -1015,10 +1644,11 @@ different filters.
 | `emotions`                                    | **any** of the listed emotion labels, never all of them              |
 | `since` / `until`                             | a `collected_at` range (must fall between 1970-01-01 and 2080-12-31) |
 | `created_since` / `created_until`             | a `created_at` range — "what did this import bring in"               |
-| `value_date_min` / `value_date_max`           | a range over the date *answer*, not the collection time              |
+| `updated_since` / `updated_until`             | an `updated_at` range — "what was created or changed since"          |
+| `value_date_min` / `value_date_max`           | a range over the date _answer_, not the collection time              |
 | `value_number_min` / `value_number_max`       | a range over the numeric answer                                      |
 | `sentiment_score_min` / `sentiment_score_max` | a sentiment score range, from -1 to 1                                |
-| `has_sentiment`                               | records that do (`true`) or do not (`false`) carry a sentiment        |
+| `has_sentiment`                               | records that do (`true`) or do not (`false`) carry a sentiment       |
 | `has_emotions`                                | records that do or do not carry emotion labels                       |
 | `has_translation`                             | records that do or do not have a translation                         |
 
@@ -1031,28 +1661,38 @@ identical to omitting the filter, but every string filter on this surface requir
 character, so an empty value is rejected rather than ignored.
 
 <Warning>
-  **Every range filter excludes records whose column is empty.** `value_number_min: 0` is not
-  "everything" — it drops every text answer, because they carry no number. Likewise
-  `sentiment_score_min: -1` means "every *enriched* record", not every record. To find the records
-  enrichment has not reached, use `has_sentiment: false` rather than a score range.
+  **Every range filter excludes records whose column is empty.** `value_number_min: 0` is not "everything" —
+  it drops every text answer, because they carry no number. Likewise `sentiment_score_min: -1` means "every
+  *enriched* record", not every record. To find the records enrichment has not reached, use `has_sentiment:
+  false` rather than a score range.
 </Warning>
 
 <Warning>
-  **A backwards range is rejected, not run as an empty query.** `value_number_min: 5, value_number_max: 1`
-  is a `400` naming both bounds (e.g. `value_number_min` — "must be less than or equal to
-  value_number_max"). This applies to every range pair, including the timestamp ones; it is the Hub's own
-  check relayed as-is, not something validated here, so the message always names the Hub's parameters.
+  **A backwards range is rejected, not run as an empty query.** `value_number_min: 5, value_number_max: 1` is
+  a `400` naming both bounds (e.g. `value_number_min` — "must be less than or equal to value_number_max").
+  This applies to every range pair, including the timestamp ones; it is the Hub's own check relayed as-is, not
+  something validated here, so the message always names the Hub's parameters.
 </Warning>
 
-**Ordering.** `sort` accepts `collected_at` (the default) or `created_at`, and `order` accepts `asc` or
-`desc` (default `desc`). Neither applies to `count_feedback_records`, which rejects them. A cursor marks a
-position *within one specific ordering*, so keep `sort` and `order` identical for the whole traversal —
+**Ordering.** `sort` accepts `collected_at` (the default), `created_at` or `updated_at`, and `order` accepts
+`asc` or `desc` (default `desc`). `updated_at` is ascending-only: pass `order: asc` explicitly, since the Hub answers 400 to `desc` and to an omitted `order`. Neither applies to `count_feedback_records`, which rejects them. A cursor marks a
+position _within one specific ordering_, so keep `sort` and `order` identical for the whole traversal —
 presenting a cursor under a different ordering is rejected rather than silently returning a page that
 looks like a continuation.
 
 `collected_at` and `created_at` diverge whenever historical data is imported: the feedback was collected
 months ago but stored today. Use `created_since` for "what did this import bring in", and `since` for
 "what did people tell us in this period".
+
+`updated_at` is the third timestamp: it is stamped on create, on every correction and on every translation,
+sentiment and emotion result (not on embeddings or topic assignment), so `updated_since` answers "what was created or changed since" — incremental extraction. Pair it
+with `sort: updated_at, order: asc`: each page is one index range, and a record that changes mid-traversal
+normally moves ahead of the cursor (returned again). A write that started before the cursor's position and
+commits after it still lands behind; the run-start watermark picks it up next run. The next run's `updated_since` is when the
+previous run _started_, minus an overlap — not the newest `updated_at` received, which skips a write that was
+still committing when the traversal read past its timestamp. It never returns a
+deleted record, since a delete leaves nothing to match; the full procedure, deletions included, is in the
+v3 API introduction.
 
 The workspace/dataset/pagination parameters (`workspaceId`, `datasetId`, `limit`, `cursor`) stay camelCase:
 they name nothing in the record.
@@ -1410,22 +2050,48 @@ framework-agnostic `@formbricks/workflows` handlers used by the v3 REST routes:
 | `archive_workflow`   | `POST /api/v3/workflows/{workflowId}/archive`   |
 | `unarchive_workflow` | `POST /api/v3/workflows/{workflowId}/unarchive` |
 
+## Relationship to V3 Creatives API
+
+The creative tools call the same operations as the REST routes (`app/api/v3/creatives/lib/operations.ts`):
+
+| MCP Tool | REST Contract |
+| --- | --- |
+| `list_creatives` | `GET /api/v3/creatives` |
+| `get_creative` | `GET /api/v3/creatives/{creativeId}` |
+| `get_creative_stats` | `GET /api/v3/creatives/{creativeId}/stats` |
+| `create_creative` | `POST /api/v3/creatives` |
+| `patch_creative` | `PATCH /api/v3/creatives/{creativeId}` |
+| `delete_creative` | `DELETE /api/v3/creatives/{creativeId}` |
+| `duplicate_creative` | `POST /api/v3/creatives/{creativeId}/duplicate` |
+| `archive_creative` | `POST /api/v3/creatives/{creativeId}/archive` |
+| `restore_creative` | `POST /api/v3/creatives/{creativeId}/restore` |
+
+The creative schemas are generated from the contract (`@formbricks/api-v3-schemas`), so the tools' input
+and output schemas follow it through `pnpm api:v3:sync` rather than by hand.
+
 ## Relationship to V3 Surveys API
 
 The MCP server does not run custom survey database queries. Each tool calls the shared server-only v3
 survey operations used by the REST routes:
 
-| MCP Tool          | REST Contract                       |
-| ----------------- | ----------------------------------- |
-| `list_surveys`    | `GET /api/v3/surveys`               |
-| `get_survey`      | `GET /api/v3/surveys/{surveyId}`    |
-| `create_survey`   | `POST /api/v3/surveys`              |
-| `validate_survey` | `POST /api/v3/surveys/validate`     |
-| `patch_survey`    | `PATCH /api/v3/surveys/{surveyId}`  |
-| `delete_survey`   | `DELETE /api/v3/surveys/{surveyId}` |
+| MCP Tool                     | REST Contract                                       |
+| ---------------------------- | --------------------------------------------------- |
+| `list_surveys`               | `GET /api/v3/surveys`                               |
+| `get_survey`                 | `GET /api/v3/surveys/{surveyId}`                    |
+| `create_survey`              | `POST /api/v3/surveys`                              |
+| `validate_survey`            | `POST /api/v3/surveys/validate`                     |
+| `patch_survey`               | `PATCH /api/v3/surveys/{surveyId}`                  |
+| `edit_survey_blocks`         | `PATCH /api/v3/surveys/{surveyId}/blocks`           |
+| `set_survey_block_order`     | `PUT /api/v3/surveys/{surveyId}/blocks/order`       |
+| `delete_survey`              | `DELETE /api/v3/surveys/{surveyId}`                 |
+| `get_workspace_custom_css`   | `GET /api/v3/workspaces/{workspaceId}/custom-css`   |
+| `patch_workspace_custom_css` | `PATCH /api/v3/workspaces/{workspaceId}/custom-css` |
 
-When the v3 OpenAPI contract changes, update the MCP schemas and this page together. The hand-maintained
-v3 OpenAPI spec lives at `docs/api-v3-reference/openapi.yml`.
+When the v3 OpenAPI contract changes, update the MCP schemas and this page together. The v3 spec is
+hand-authored under `docs/api-v3-reference/src/` and bundled to `docs/api-v3-reference/openapi.yml`. For
+resources whose schemas are generated (Responses today), the tools' output schemas follow the contract through
+`pnpm api:v3:sync`; their input schemas and this page are still updated by hand. See
+[API v3 Schema Generation](/development/technical-handbook/api-v3-schema-generation).
 
 ## Feedback Records And The Hub
 
@@ -1457,7 +2123,10 @@ query, like `create_feedback_record`.
 - OAuth access tokens must be JWTs audience-bound to `/api/mcp`; opaque MCP access token introspection is not
   accepted by the MCP route.
 - API-key authentication remains supported for compatibility and fallback use.
-- The MCP server exposes only the survey, workflow and feedback-record operations listed on this page.
+- The MCP server exposes only the survey, creative, workflow, response, feedback-record, chart and dashboard operations listed on this page.
+- Creative tools require a self-hosted Enterprise license that includes Creatives; elsewhere they answer
+  403 `creatives_not_entitled`. In wind-down (the license lost Creatives) only reads, pause, close and delete
+  are allowed. `POST /api/v3/creatives/pause` has no tool.
 - Survey and workflow tool coverage depends on the current v3 Surveys and Workflows REST endpoint
   coverage; feedback-record tool coverage depends on the Hub feedback-records API.
 - `enable_workflow` makes a workflow live and can trigger email sending; treat it as a high-impact
@@ -1477,8 +2146,28 @@ query, like `create_feedback_record`.
   a query and a tenant. Those need Hub-side support first.
 - The search tools require an embedding model configured on the Hub API **and** the Hub worker; without
   one they return 503. Embedding is asynchronous and covers only records with text.
+- `outputSchema` is declared on the response tools only. The survey, workflow and feedback-record tools
+  still advertise no result shape, so a client has to infer theirs from an example.
+- The response tools cover the v3 operations and nothing more: there is no tool that adds or removes a
+  single tag, because `PATCH` replaces the tag set wholesale and such a tool would be a read-modify-write
+  wrapper with its own race rather than an operation.
 - `create_survey` creates link surveys only. In-app survey creation and distribution settings are not
   part of the current v3 create operation.
+- `edit_survey_blocks` and `set_survey_block_order` operate on whole blocks. There is no element-level
+  operation: elements travel inside the block payload, and going finer would reintroduce the same
+  resend problem one level down.
+- Ordering is validated as a delta on the **patch family only**: a change may not _introduce_ a
+  `#recall:` that points forwards, a logic condition reading a later block, or a `requireAnswer`
+  targeting an earlier one (`misordered_reference`). Violations a survey already contains are left
+  alone, so an existing survey never becomes unpatchable — enforcing the full set would repeat the
+  ENG-3070 failure. `create_survey` is deliberately not covered: tightening it would reject payloads
+  that are valid today, which needs its own versioned rollout.
+- `stored_survey_invalid` (422) means the _stored_ survey cannot be read as a v3 document (legacy
+  questions, no v3 block list, a shape that does not parse); the reported paths are into the survey,
+  not the request — repair it in the editor. A survey that reads fine but already fails validation
+  stays patchable: issues it already had are not refused, only issues a patch newly introduces
+  (ENG-3975). Publishing a draft is the exception — it is refused as `stored_survey_invalid` until
+  the survey passes.
 - `patch_survey` follows the v3 PATCH contract: top-level partial document updates only, no JSON Patch,
   and no nested deep merge. Provided top-level objects and arrays replace their whole subtree and can
   remove omitted nested entries.
@@ -1486,6 +2175,12 @@ query, like `create_feedback_record`.
   versions, or surveys.
 - Query-string credentials are rejected; use headers for API keys.
 - Large request bodies are rejected before the MCP handler using the same body-size policy as v3 APIs.
+- A whole MCP request may contain at most 50,000 object members and array entries combined, including
+  protocol metadata and all calls in a legacy batch. An over-budget request returns HTTP 400 with
+  JSON-RPC code `-32602` before any tool executes. Reduce the arguments or split batches into smaller
+  requests. Existing limits of 2 MiB, 1,000 entries per array, and 256 nesting levels still apply.
+- Legacy JSON-RPC batches are limited to 100 messages by SDK 2.3. Larger batches return HTTP 400 with
+  JSON-RPC code `-32600`; split them into requests of at most 100 messages. Individual calls are unaffected.
 - Tool arguments are strict: undeclared keys are rejected rather than ignored (see [Tool
   Arguments](#tool-arguments)).
 - Resources and prompts are not exposed — the server registers tools only, so there is no MCP resource
@@ -1502,12 +2197,17 @@ query, like `create_feedback_record`.
 - `apps/web/modules/mcp/auth.ts`
 - `apps/web/modules/mcp/server.ts`
 - `apps/web/modules/mcp/tools/surveys.ts`
-- `apps/web/modules/mcp/tools/workspaces.ts`
+- `apps/web/modules/mcp/tools/workspaces.ts` (workspace discovery and the workspace custom CSS tools)
 - `apps/web/modules/mcp/tools/feedback-records.ts`
 - `apps/web/modules/mcp/tools/schemas.ts`
 - `apps/web/modules/mcp/tools/workflows.ts`
 - `apps/web/modules/mcp/tools/workflow-schemas.ts`
+- `apps/web/modules/mcp/tools/creatives.ts`
+- `apps/web/modules/mcp/tools/creative-schemas.ts` and `creative-output-schemas.ts`
+- `apps/web/app/api/v3/creatives/lib/operations.ts`
 - `apps/web/app/api/v3/surveys/lib/operations.ts`
+- `apps/web/app/api/v3/workspaces/lib/custom-css.ts` (workspace custom CSS operations)
+- `apps/web/app/api/v3/surveys/blocks.ts` (pure block op-application and reorder logic)
 - `apps/web/app/api/v3/workflows/lib/context.ts` (adapter to the `@formbricks/workflows` handlers)
 - `apps/web/app/api/v3/feedbackRecords/lib/operations.ts`
 - `apps/web/app/api/v3/feedbackRecords/lib/access.ts` (tenant resolution + per-record ownership guard)

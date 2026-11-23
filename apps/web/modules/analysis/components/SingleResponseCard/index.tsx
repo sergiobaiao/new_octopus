@@ -4,10 +4,12 @@ import { ReactNode, useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TResponse, TResponseWithQuotas } from "@formbricks/types/responses";
+import { getNotShownElementIds } from "@formbricks/types/surveys/not-shown";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { TTag } from "@formbricks/types/tags";
 import { TUser, TUserLocale } from "@formbricks/types/user";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
+import type { TOutcomeActions } from "@/modules/analysis/response-outcome/lib/outcome";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
 import { DecrementQuotasCheckbox } from "@/modules/ui/components/decrement-quotas-checkbox";
 import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
@@ -15,7 +17,8 @@ import { deleteResponseAction, getResponseAction } from "./actions";
 import { ResponseTagsWrapper } from "./components/ResponseTagsWrapper";
 import { SingleResponseCardBody } from "./components/SingleResponseCardBody";
 import { SingleResponseCardHeader } from "./components/SingleResponseCardHeader";
-import { isSubmissionTimeMoreThan5Minutes, isValidValue } from "./util";
+import { getResponseCardRows } from "./lib/card-rows";
+import { isSubmissionTimeMoreThan5Minutes } from "./util";
 
 export interface SingleResponseCardHeaderRenderProps {
   onDeleteClick: () => void;
@@ -33,6 +36,8 @@ interface SingleResponseCardProps {
   setSelectedResponseId?: (responseId: string | null) => void;
   locale: TUserLocale;
   renderHeader?: (props: SingleResponseCardHeaderRenderProps) => ReactNode;
+  /** Set where the card can mark and restore Low quality (the responses page); omitted elsewhere. */
+  outcomeActions?: TOutcomeActions;
 }
 
 export const SingleResponseCard = ({
@@ -46,6 +51,7 @@ export const SingleResponseCard = ({
   setSelectedResponseId,
   locale,
   renderHeader,
+  outcomeActions,
 }: Readonly<SingleResponseCardProps>) => {
   const hasQuotas = (response?.quotas && response.quotas.length > 0) ?? false;
   const [decrementQuotas, setDecrementQuotas] = useState(hasQuotas);
@@ -54,54 +60,17 @@ export const SingleResponseCard = ({
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
-  const skippedQuestions: string[][] = useMemo(() => {
-    // Derive questions from blocks
-    const questions = getElementsFromBlocks(survey.blocks);
-
-    const flushTemp = (temp: string[], result: string[][], shouldReverse = false) => {
-      if (temp.length > 0) {
-        if (shouldReverse) temp.reverse();
-        result.push([...temp]);
-        temp.length = 0;
-      }
-    };
-
-    const processFinishedResponse = () => {
-      const result: string[][] = [];
-      let temp: string[] = [];
-
-      for (const question of questions) {
-        if (isValidValue(response.data[question.id])) {
-          flushTemp(temp, result);
-        } else {
-          temp.push(question.id);
-        }
-      }
-      flushTemp(temp, result);
-      return result;
-    };
-
-    const processUnfinishedResponse = () => {
-      const result: string[][] = [];
-      let temp: string[] = [];
-
-      for (let index = questions.length - 1; index >= 0; index--) {
-        const question = questions[index];
-        const hasNoData = !response.data[question.id];
-        const shouldSkip = hasNoData && (result.length === 0 || !isValidValue(response.data[question.id]));
-
-        if (shouldSkip) {
-          temp.push(question.id);
-        } else {
-          flushTemp(temp, result, true);
-        }
-      }
-      flushTemp(temp, result);
-      return result;
-    };
-
-    return response.finished ? processFinishedResponse() : processUnfinishedResponse();
-  }, [response.finished, response.data, survey.blocks]);
+  // What each question shows: an answer, a skipped or aborted run, or Not shown (ENG-6936).
+  const rows = useMemo(
+    () =>
+      getResponseCardRows({
+        elements: getElementsFromBlocks(survey.blocks),
+        data: response.data,
+        finished: response.finished,
+        notShownElementIds: getNotShownElementIds(response.notShown, survey.blocks),
+      }),
+    [response.finished, response.data, response.notShown, survey.blocks]
+  );
 
   const handleDeleteResponse = async () => {
     setIsDeleting(true);
@@ -153,15 +122,11 @@ export const SingleResponseCard = ({
             isReadOnly={isReadOnly}
             setDeleteDialogOpen={setDeleteDialogOpen}
             locale={locale}
+            outcomeActions={outcomeActions}
           />
         )}
 
-        <SingleResponseCardBody
-          survey={survey}
-          response={response}
-          skippedQuestions={skippedQuestions}
-          locale={locale}
-        />
+        <SingleResponseCardBody survey={survey} response={response} rows={rows} locale={locale} />
 
         <ResponseTagsWrapper
           key={response.id}

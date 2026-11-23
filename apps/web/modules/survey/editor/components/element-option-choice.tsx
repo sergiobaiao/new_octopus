@@ -15,25 +15,40 @@ import { TUserLocale } from "@formbricks/types/user";
 import { cn } from "@/lib/cn";
 import { createI18nString } from "@/lib/i18n/utils";
 import { ElementFormInput } from "@/modules/survey/components/element-form-input";
+import { CopyIdButton } from "@/modules/survey/editor/components/copy-id-button";
+import {
+  HiddenOptionBadge,
+  OptionHideButton,
+  type TSetOptionHidden,
+} from "@/modules/survey/editor/components/option-hide-button";
+import {
+  LOCK_TOOLTIP_DELAY_MS,
+  PublishedLockNotice,
+} from "@/modules/survey/editor/components/published-lock-notice";
+import { TElementLock } from "@/modules/survey/editor/lib/published-lock";
 import { Button } from "@/modules/ui/components/button";
 import { TooltipRenderer } from "@/modules/ui/components/tooltip";
 import { isLabelValidForAllLanguages } from "../lib/validation";
 
 interface ChoiceProps {
-  choice: TSurveyElementChoice;
-  choiceIdx: number;
-  elementIdx: number;
-  updateChoice: (choiceIdx: number, updatedAttributes: Partial<TSurveyElementChoice>) => void;
-  deleteChoice: (choiceIdx: number) => void;
-  addChoice: (choiceIdx: number) => void;
-  isInvalid: boolean;
-  localSurvey: TSurvey;
-  surveyLanguages: TSurveyLanguage[];
-  element: TSurveyMultipleChoiceElement | TSurveyRankingElement;
-  updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
-  surveyLanguageCodes: string[];
-  locale: TUserLocale;
-  isStorageConfigured: boolean;
+  readonly choice: TSurveyElementChoice;
+  readonly choiceIdx: number;
+  readonly elementIdx: number;
+  readonly updateChoice: (choiceIdx: number, updatedAttributes: Partial<TSurveyElementChoice>) => void;
+  readonly deleteChoice: (choiceIdx: number) => void;
+  readonly addChoice: (choiceIdx: number) => void;
+  readonly isInvalid: boolean;
+  readonly localSurvey: TSurvey;
+  readonly surveyLanguages: TSurveyLanguage[];
+  readonly element: TSurveyMultipleChoiceElement | TSurveyRankingElement;
+  readonly updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
+  readonly surveyLanguageCodes: string[];
+  readonly locale: TUserLocale;
+  readonly isStorageConfigured: boolean;
+  /** What the published lock leaves open for this question (ENG-6790). */
+  readonly lock: TElementLock;
+  /** The Hide quick action (ENG-6949); without it, the option has none. */
+  readonly onSetOptionHidden?: TSetOptionHidden;
 }
 
 export const ElementOptionChoice = ({
@@ -51,6 +66,8 @@ export const ElementOptionChoice = ({
   updateElement,
   locale,
   isStorageConfigured,
+  lock,
+  onSetOptionHidden,
 }: ChoiceProps) => {
   const { t } = useTranslation();
   const isSpecialChoice = choice.id === "other" || choice.id === "none";
@@ -81,16 +98,22 @@ export const ElementOptionChoice = ({
     return t("workspace.surveys.edit.option_idx", { choiceIndex: choiceIdx + 1 });
   };
 
+  const isTextLocked = lock.isOptionTextLocked("choices", choice.id, "default");
+  const isDeleteLocked = lock.isOptionLocked("choices", choice.id);
+
+  const isHidden = choice.hidden === true;
+
   const normalChoice = element.choices?.filter((c) => c.id !== "other" && c.id !== "none") || [];
 
   return (
-    <div className="flex w-full gap-2" ref={setNodeRef} style={style}>
+    <div className="flex w-full items-center gap-2" ref={setNodeRef} style={style}>
       {/* drag handle */}
       <div className={cn(isSpecialChoice && "invisible")} {...listeners} {...attributes}>
         <GripVerticalIcon className="size-4 cursor-move text-slate-400" />
       </div>
 
-      <div className="flex w-full gap-x-2">
+      {/* A Hidden option reads as hidden (ENG-6949): muted, with the Flow tab's Hidden badge. */}
+      <div className={cn("flex w-full gap-x-2", isHidden && "opacity-60")}>
         <ElementFormInput
           key={choice.id}
           id={`choice-${choiceIdx}`}
@@ -106,6 +129,7 @@ export const ElementOptionChoice = ({
           className={`${isSpecialChoice ? "border border-dashed" : ""} mt-0`}
           locale={locale}
           isStorageConfigured={isStorageConfigured}
+          disabled={isTextLocked}
           onKeyDown={(e) => {
             if (e.key === "Enter" && choice.id !== "other") {
               e.preventDefault();
@@ -154,13 +178,29 @@ export const ElementOptionChoice = ({
           />
         )}
       </div>
-      <div className="flex gap-2">
+      <div className="flex items-center gap-2">
+        {isHidden && <HiddenOptionBadge />}
+        {isTextLocked && <PublishedLockNotice kind="optionText" />}
+        {/* An option added since launch has no lock; keep its row in line with the locked ones. */}
+        {lock.isActive && !isTextLocked && <span aria-hidden="true" className="size-6 shrink-0" />}
+        <CopyIdButton id={choice.id} label={t("workspace.surveys.edit.copy_option_id")} />
+        {onSetOptionHidden && (
+          <OptionHideButton item={choice} listKey="choices" onSetHidden={onSetOptionHidden} />
+        )}
         {(normalChoice.length > 1 || isSpecialChoice) && (
-          <TooltipRenderer tooltipContent={t("workspace.surveys.edit.delete_choice")}>
+          <TooltipRenderer
+            tooltipContent={
+              isDeleteLocked
+                ? t("workspace.surveys.edit.lock_explanation_option_delete")
+                : t("workspace.surveys.edit.delete_choice")
+            }
+            delayDuration={isDeleteLocked ? LOCK_TOOLTIP_DELAY_MS : undefined}
+            className={isDeleteLocked ? "max-w-xs text-xs" : undefined}>
             <Button
               variant="secondary"
               size="icon"
               aria-label="Delete choice"
+              disabled={isDeleteLocked}
               onClick={(e) => {
                 e.preventDefault();
                 deleteChoice(choiceIdx);

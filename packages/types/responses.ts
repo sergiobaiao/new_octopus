@@ -1,12 +1,14 @@
 import { z } from "zod";
 import { ZId } from "./common";
 import { ZSurveyQuota } from "./quota";
+import { MAX_NOT_SHOWN_ID_LENGTH, ZResponseNotShown, ZResponseNotShownInput } from "./surveys/not-shown";
 import { ZSurvey } from "./surveys/types";
 import { ZTag } from "./tags";
 
-export const ZResponseDataValue = z
-  .union([z.string(), z.number(), z.array(z.string()), z.record(z.string(), z.string())])
-  .optional();
+const buildResponseDataValue = <TArray extends z.ZodType>(array: TArray) =>
+  z.union([z.string(), z.number(), array, z.record(z.string(), z.string())]).optional();
+
+export const ZResponseDataValue = buildResponseDataValue(z.array(z.string()));
 
 export const ZResponseFilterCondition = z.enum([
   "accepted",
@@ -19,6 +21,8 @@ export const ZResponseFilterCondition = z.enum([
   "lessEqual",
   "greaterThan",
   "greaterEqual",
+  "inRange",
+  "notInRange",
   "includesAll",
   "includesOne",
   "uploaded",
@@ -47,6 +51,138 @@ export const ZResponseVariables = z.record(z.string(), z.union([z.string(), z.nu
 
 export type TResponseVariables = z.infer<typeof ZResponseVariables>;
 
+/**
+ * Cardinality caps on a submitted response, per the ENG-1652 input policy. They bound the create and
+ * update inputs, one request at a time: the stored schemas (`ZResponseData`, `ZResponseVariables`,
+ * `ZResponseTtc`) stay unbounded, so rows written before the caps still parse.
+ *
+ * They are generous caps set well above what surveys hold, not limits a survey can reach by design: only
+ * v3 survey writes cap a survey's size (1,000 blocks, 200 hidden fields, 100 variables), and the editor
+ * and v1 survey writes do not. `data` and `ttc` have one key per answered element or hidden field, so
+ * 2,000 keys covers a survey at the v3 limits with one element per block; the largest survey in
+ * production has 31 blocks. A multi-select answer holds one entry per choice and a matrix one per row,
+ * both far under 1,000. `variables` has one key per survey variable. The entry budget counts the whole
+ * `data` map — its keys plus every array item and matrix row — so 2,000 answers can still carry 8,000
+ * selections between them.
+ */
+export const MAX_RESPONSE_DATA_KEYS = 2_000;
+export const MAX_RESPONSE_DATA_VALUES = 1_000;
+export const MAX_RESPONSE_DATA_ENTRIES = 10_000;
+export const MAX_RESPONSE_VARIABLE_KEYS = 500;
+
+export const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** The refusals the response caps share across API versions, so v1/v2 and v3 word them alike. */
+export const RESPONSE_DATA_LIMIT_MESSAGES = {
+  keys: `A response may answer at most ${MAX_RESPONSE_DATA_KEYS} fields`,
+  values: `An answer may hold at most ${MAX_RESPONSE_DATA_VALUES} values`,
+  rows: `A matrix answer may hold at most ${MAX_RESPONSE_DATA_VALUES} rows`,
+  entries: `A response may hold at most ${MAX_RESPONSE_DATA_ENTRIES} values`,
+  text: "An answer's items must be text",
+  shape: "An answer must be text, a number, a list of text, or a map of text",
+} as const;
+
+/** A refusal from a size check: its message, and the path under the checked map when it names one key. */
+export type TSizeCheckFailure = string | { message: string; path: string[] };
+
+/**
+ * Runs `check` on the raw input before `schema` parses it, and stops there when it fails.
+ *
+ * A record has no `.max()`, and a refinement only runs once Zod has parsed every key and array item —
+ * reporting each bad item on its own. Checking the size first rejects an oversized map with one issue,
+ * whatever its size. `z.preprocess` keeps `schema`'s output type and its OpenAPI shape; only the
+ * inferred input type widens to `unknown`. A failure that names a key is reported at that key's path.
+ */
+export const withSizeCheck = <TSchema extends z.ZodType>(
+  schema: TSchema,
+  check: (record: Record<string, unknown>) => TSizeCheckFailure | undefined
+) =>
+  z.preprocess((value, ctx) => {
+    const failure = isPlainRecord(value) ? check(value) : undefined;
+    if (typeof failure === "string") ctx.addIssue({ code: "custom", message: failure });
+    else if (failure) ctx.addIssue({ code: "custom", message: failure.message, path: failure.path });
+    return value;
+  }, schema);
+
+/**
+ * A key cap and a value check for a flat map, both run before Zod reads it. Zod reports every wrong value
+ * on its own; this refuses the map at the first one, with one issue at its key.
+ */
+export const checkFlatMap =
+  (max: number, what: string, isValue: (value: unknown) => boolean, invalid: string) =>
+  (record: Record<string, unknown>): TSizeCheckFailure | undefined => {
+    if (Object.keys(record).length > max) return `A response may carry at most ${max} ${what}`;
+    for (const key in record) {
+      if (!isValue(record[key])) return { message: invalid, path: [key] };
+    }
+    return undefined;
+  };
+
+const isTextOrNumber = (value: unknown) => typeof value === "string" || typeof value === "number";
+
+const NO_ITEMS: readonly unknown[] = [];
+
+/**
+ * What one answer carries: an array's items or a matrix's row values, and nothing for a scalar. An answer
+ * over its cap, or of a shape no element stores, is refused with the message for it.
+ */
+const itemsOfAnswer = (value: unknown): readonly unknown[] | string => {
+  if (Array.isArray(value)) {
+    return value.length > MAX_RESPONSE_DATA_VALUES ? RESPONSE_DATA_LIMIT_MESSAGES.values : value;
+  }
+  if (isPlainRecord(value)) {
+    const rows = Object.values(value);
+    return rows.length > MAX_RESPONSE_DATA_VALUES ? RESPONSE_DATA_LIMIT_MESSAGES.rows : rows;
+  }
+  return value === undefined || isTextOrNumber(value) ? NO_ITEMS : RESPONSE_DATA_LIMIT_MESSAGES.shape;
+};
+
+/**
+ * The caps on a submitted answer map, checked before Zod reads it, shared by every API version that writes
+ * one. Each answer is checked too: it is text, a number, a list of text or a map of text, and one wrong
+ * answer or item refuses the map with one issue at that answer, instead of Zod reporting every item of
+ * the union it fails. Only shape is checked here; Zod still parses what passes, so the check never lets
+ * through anything the schema would refuse.
+ *
+ * `maxEntries` bounds the keys plus every array item and matrix row. The walk stops as soon as it is
+ * spent, so it never reads more than the budget allows.
+ */
+export const checkResponseDataSize = (
+  data: Record<string, unknown>,
+  maxEntries = Number.POSITIVE_INFINITY
+): TSizeCheckFailure | undefined => {
+  // Keys first: on a large map walking the entries costs more than counting them, so it only runs once
+  // the map is under the cap.
+  const keyCount = Object.keys(data).length;
+  if (keyCount > MAX_RESPONSE_DATA_KEYS) return RESPONSE_DATA_LIMIT_MESSAGES.keys;
+  // The budget counts the keys too, so a map with more keys than it allows is refused before any answer.
+  let entries = keyCount;
+  if (entries > maxEntries) return RESPONSE_DATA_LIMIT_MESSAGES.entries;
+  for (const key in data) {
+    const items = itemsOfAnswer(data[key]);
+    if (typeof items === "string") return { message: items, path: [key] };
+    if (items.length === 0) continue;
+    entries += items.length;
+    if (entries > maxEntries) return RESPONSE_DATA_LIMIT_MESSAGES.entries;
+    if (!items.every((item) => typeof item === "string")) {
+      return { message: RESPONSE_DATA_LIMIT_MESSAGES.text, path: [key] };
+    }
+  }
+  return undefined;
+};
+
+/** `ZResponseData` with the caps above, for the create and update inputs. */
+export const ZResponseDataInput = withSizeCheck(
+  z.record(z.string(), buildResponseDataValue(z.array(z.string()).max(MAX_RESPONSE_DATA_VALUES))),
+  (data) => checkResponseDataSize(data, MAX_RESPONSE_DATA_ENTRIES)
+);
+
+export const ZResponseVariablesInput = withSizeCheck(
+  ZResponseVariables,
+  checkFlatMap(MAX_RESPONSE_VARIABLE_KEYS, "variables", isTextOrNumber, "A variable must be text or a number")
+);
+
 export const ZResponseTtc = z.record(z.string(), z.number());
 
 export type TResponseTtc = z.infer<typeof ZResponseTtc>;
@@ -58,12 +194,21 @@ export type TResponseTtc = z.infer<typeof ZResponseTtc>;
 // `_total`. Clamping rather than rejecting means a real submission is never dropped over a
 // noisy timing value — a question is only briefly "active", so anything past a day is
 // meaningless rather than a reason to reject the response. Stored/returned responses keep the
-// unbounded ZResponseTtc so historical data still parses.
+// unbounded ZResponseTtc so historical data still parses. One entry per element, so it shares the
+// response's key cap.
 export const MAX_RESPONSE_TTC = 1000 * 60 * 60 * 24; // 24 hours per element
 
-export const ZResponseTtcInput = z.record(
-  z.string(),
-  z.number().transform((value) => Math.min(Math.max(value, 0), MAX_RESPONSE_TTC))
+export const ZResponseTtcInput = withSizeCheck(
+  z.record(
+    z.string(),
+    z.number().transform((value) => Math.min(Math.max(value, 0), MAX_RESPONSE_TTC))
+  ),
+  checkFlatMap(
+    MAX_RESPONSE_DATA_KEYS,
+    "timing entries",
+    (value) => typeof value === "number",
+    "A timing entry must be a number"
+  )
 );
 
 export type TResponseTtcInput = z.infer<typeof ZResponseTtcInput>;
@@ -115,6 +260,33 @@ const ZResponseFilterCriteriaDataGreaterThan = z.object({
 const MAX_FILTER_VALUES = 1_000;
 const MAX_FILTER_KEYS = 500;
 
+/**
+ * A half-open `[min, max)` window over the stored value — `min` matches, `max` does not.
+ *
+ * It exists because a date-typed field is filtered at a coarser granularity than it is stored: the
+ * response filter's date input emits a day (`2026-09-01`) while the column holds whatever arrived,
+ * which is a day *or* an instant on it (`2026-09-01T10:30:00Z`). "On 2026-09-01" is therefore a
+ * range over the instants of that day rather than an equality, and one condition per key is all the
+ * grammar can carry — so the range is the condition (ENG-3232). `buildDateFieldCondition` is the
+ * only producer; `buildWhereClause` expands it into `gte`/`lt`.
+ *
+ * Both bounds are written in the same ISO spelling as the stored values, which is what lets a single
+ * lexicographic window cover both stored forms: `"2026-09-01" <= "2026-09-01T10:30:00Z" <
+ * "2026-09-02"` holds as text exactly as it does in time.
+ */
+const ZResponseFilterCriteriaDataInRange = z.object({
+  op: z.literal(ZResponseFilterCondition.enum.inRange),
+  min: z.string(),
+  max: z.string(),
+});
+
+/** The complement of {@link ZResponseFilterCriteriaDataInRange}; an absent value matches, as with `notEquals`. */
+const ZResponseFilterCriteriaDataNotInRange = z.object({
+  op: z.literal(ZResponseFilterCondition.enum.notInRange),
+  min: z.string(),
+  max: z.string(),
+});
+
 const ZResponseFilterCriteriaDataIncludesOne = z.object({
   op: z.literal(ZResponseFilterCondition.enum.includesOne),
   value: z.union([z.array(z.string()).max(MAX_FILTER_VALUES), z.array(z.number()).max(MAX_FILTER_VALUES)]),
@@ -125,16 +297,20 @@ const ZResponseFilterCriteriaDataIncludesAll = z.object({
   value: z.array(z.string()).max(MAX_FILTER_VALUES),
 });
 
-// Booleans belong to boolean-typed Embedded Data fields, whose stored values are real jsonb
-// booleans — a string "true" would never match them (ENG-1848).
+// An equality value is compared against the value as it is *stored*, so there is no boolean member:
+// a boolean-typed Embedded Data field stores the strings "true" / "false", never a jsonb boolean.
+// ZResponseDataValue has no boolean member, so `normalizeBoolean` canonicalizes onto those two
+// spellings at ingest and `coerceToEmbeddedDataType` reads them back — and neither `variables`
+// (string | number) nor `meta` can hold one either. A jsonb boolean here could therefore only ever
+// describe a condition that matches no row, which is exactly what it did (ENG-3231).
 const ZResponseFilterCriteriaDataEquals = z.object({
   op: z.literal(ZResponseFilterCondition.enum.equals),
-  value: z.union([z.string(), z.number(), z.boolean()]),
+  value: z.union([z.string(), z.number()]),
 });
 
 const ZResponseFilterCriteriaDataNotEquals = z.object({
   op: z.literal(ZResponseFilterCondition.enum.notEquals),
-  value: z.union([z.string(), z.number(), z.boolean()]),
+  value: z.union([z.string(), z.number()]),
 });
 
 const ZResponseFilterCriteriaDataAccepted = z.object({
@@ -229,7 +405,11 @@ const ZResponseFilterCriteriaIsNotSet = z.object({
  * Condition grammar for the typed Embedded Data + reserved-field filter groups (ENG-1848). One
  * union serves both groups: which subset a field actually offers is decided by its `dataType` at
  * the UI (string → equality + text ops, number → equality + comparisons, date → equality +
- * before/after via lessThan/greaterThan on ISO strings), and `buildWhereClause` only translates.
+ * before/after over ISO strings), and `buildWhereClause` only translates.
+ *
+ * A date-typed field is the exception to "the UI picks the op": its *value* decides too, because a
+ * day-granular value cannot be compared to a stored instant by equality. `buildDateFieldCondition`
+ * rewrites those rows onto the range members below (ENG-3232).
  */
 const ZTypedFieldFilterCondition = z.union([
   ZResponseFilterCriteriaDataEquals,
@@ -244,6 +424,8 @@ const ZTypedFieldFilterCondition = z.union([
   ZResponseFilterCriteriaDataLessEqual,
   ZResponseFilterCriteriaDataGreaterEqual,
   ZResponseFilterCriteriaDataGreaterThan,
+  ZResponseFilterCriteriaDataInRange,
+  ZResponseFilterCriteriaDataNotInRange,
   ZResponseFilterCriteriaIsSet,
   ZResponseFilterCriteriaIsNotSet,
 ]);
@@ -260,8 +442,113 @@ const ZQuotasFilterCriteriaScreenedOutNotInQuota = z.object({
   op: z.literal("screenedOutNotInQuota"),
 });
 
+/**
+ * A reviewer's verdict on a response (ENG-6780). Mirrors the `ResponseOutcome` database enum; a response
+ * with no verdict carries `null`, which is not a value of this enum. Marking never deletes: every count,
+ * list, webhook and integration still includes the response.
+ */
+export const ZResponseOutcome = z.enum(["lowQuality"]);
+export type TResponseOutcome = z.infer<typeof ZResponseOutcome>;
+
+/**
+ * The statuses the Responses quick filter offers. Complete and Partial follow `finished`, Low quality
+ * follows `outcome`: a Low quality response is also Complete or Partial.
+ */
+export const ZResponseStatusFilter = z.enum(["complete", "partial", "lowQuality"]);
+export type TResponseStatusFilter = z.infer<typeof ZResponseStatusFilter>;
+
+/** A block, element, option, row or column id a shown / not shown filter names. */
+const ZResponseFilterShownId = z.string().min(1).max(MAX_NOT_SHOWN_ID_LENGTH);
+
+/**
+ * Shown / not shown (ENG-6951): whether a response's not-shown record (ADR 0029) says the respondent
+ * was shown a block, an element, or an element's option, matrix row or matrix column.
+ *
+ * - `notShown`: the record lists the target, or the element or block holding it.
+ * - `shown`: the respondent reached it and it was not hidden. The record lists neither the target nor
+ *   what holds it, and the element (for a block: one of its elements) has an answer or a time entry,
+ *   which the survey writes for every element on a page the respondent submitted.
+ *
+ * A response with no record (`notShown` null: collected before 6.2 or by an older cached survey) is
+ * unknown and matches neither.
+ */
+const ZResponseFilterShownOp = z.enum(["shown", "notShown"]);
+
+export const ZResponseFilterCriteriaShown = z.discriminatedUnion("target", [
+  z.object({ target: z.literal("block"), blockId: ZResponseFilterShownId, op: ZResponseFilterShownOp }),
+  z.object({ target: z.literal("element"), elementId: ZResponseFilterShownId, op: ZResponseFilterShownOp }),
+  z.object({
+    target: z.literal("option"),
+    elementId: ZResponseFilterShownId,
+    itemId: ZResponseFilterShownId,
+    op: ZResponseFilterShownOp,
+  }),
+  z.object({
+    target: z.literal("row"),
+    elementId: ZResponseFilterShownId,
+    itemId: ZResponseFilterShownId,
+    op: ZResponseFilterShownOp,
+  }),
+  z.object({
+    target: z.literal("column"),
+    elementId: ZResponseFilterShownId,
+    itemId: ZResponseFilterShownId,
+    op: ZResponseFilterShownOp,
+  }),
+]);
+
+export type TResponseFilterCriteriaShown = z.infer<typeof ZResponseFilterCriteriaShown>;
+
+/** One condition on a `data` key: a question, or an ingested field under its storage key. */
+const ZResponseFilterCriteriaDataCondition = z.union([
+  ZResponseFilterCriteriaDataLessThan,
+  ZResponseFilterCriteriaDataLessEqual,
+  ZResponseFilterCriteriaDataGreaterEqual,
+  ZResponseFilterCriteriaDataGreaterThan,
+  // An ingested date field filters through `data` under its storage key, so the day window a
+  // date-only filter value means has to be expressible here too (ENG-3232).
+  ZResponseFilterCriteriaDataInRange,
+  ZResponseFilterCriteriaDataNotInRange,
+  ZResponseFilterCriteriaDataIncludesOne,
+  ZResponseFilterCriteriaDataIncludesAll,
+  ZResponseFilterCriteriaDataEquals,
+  ZResponseFilterCriteriaDataNotEquals,
+  ZResponseFilterCriteriaDataAccepted,
+  ZResponseFilterCriteriaDataClicked,
+  ZResponseFilterCriteriaDataSubmitted,
+  ZResponseFilterCriteriaDataSkipped,
+  ZResponseFilterCriteriaDataUploaded,
+  ZResponseFilterCriteriaDataNotUploaded,
+  ZResponseFilterCriteriaDataBooked,
+  ZResponseFilterCriteriaMatrix,
+  ZResponseFilterCriteriaIsEmpty,
+  ZResponseFilterCriteriaIsNotEmpty,
+  ZResponseFilterCriteriaIsAnyOf,
+  ZResponseFilterCriteriaFilledOut,
+  // Text ops for string-typed ingested Embedded Data fields, which filter through `data`
+  // under their storage key (ENG-1848).
+  ZResponseFilterCriteriaContains,
+  ZResponseFilterCriteriaDoesNotContain,
+  ZResponseFilterCriteriaStartsWith,
+  ZResponseFilterCriteriaDoesNotStartWith,
+  ZResponseFilterCriteriaEndsWith,
+  ZResponseFilterCriteriaDoesNotEndWith,
+]);
+
 const ZResponseFilterCriteriaFields = z.object({
   finished: z.boolean().optional(),
+  /** Only responses carrying this outcome. Absent means no constraint, not "without an outcome". */
+  outcome: ZResponseOutcome.optional(),
+  /**
+   * Only responses without an outcome: the export's "leave Low quality out". Ignored when `outcome` selects
+   * one. Set by the export route, never by the Responses filter.
+   */
+  excludeLowQuality: z.boolean().optional(),
+  /**
+   * "Any of these statuses": the Responses quick filter ticks several and means either. One status is
+   * `finished` or `outcome`; like every field here, this is ANDed with the rest.
+   */
+  statuses: z.array(ZResponseStatusFilter).max(ZResponseStatusFilter.options.length).optional(),
   responseIds: z.array(ZId).optional(),
   createdAt: z
     .object({
@@ -280,40 +567,15 @@ const ZResponseFilterCriteriaFields = z.object({
     )
     .optional(),
 
-  data: z
-    .record(
-      z.string(),
-      z.union([
-        ZResponseFilterCriteriaDataLessThan,
-        ZResponseFilterCriteriaDataLessEqual,
-        ZResponseFilterCriteriaDataGreaterEqual,
-        ZResponseFilterCriteriaDataGreaterThan,
-        ZResponseFilterCriteriaDataIncludesOne,
-        ZResponseFilterCriteriaDataIncludesAll,
-        ZResponseFilterCriteriaDataEquals,
-        ZResponseFilterCriteriaDataNotEquals,
-        ZResponseFilterCriteriaDataAccepted,
-        ZResponseFilterCriteriaDataClicked,
-        ZResponseFilterCriteriaDataSubmitted,
-        ZResponseFilterCriteriaDataSkipped,
-        ZResponseFilterCriteriaDataUploaded,
-        ZResponseFilterCriteriaDataNotUploaded,
-        ZResponseFilterCriteriaDataBooked,
-        ZResponseFilterCriteriaMatrix,
-        ZResponseFilterCriteriaIsEmpty,
-        ZResponseFilterCriteriaIsNotEmpty,
-        ZResponseFilterCriteriaIsAnyOf,
-        ZResponseFilterCriteriaFilledOut,
-        // Text ops for string-typed ingested Embedded Data fields, which filter through `data`
-        // under their storage key (ENG-1848).
-        ZResponseFilterCriteriaContains,
-        ZResponseFilterCriteriaDoesNotContain,
-        ZResponseFilterCriteriaStartsWith,
-        ZResponseFilterCriteriaDoesNotStartWith,
-        ZResponseFilterCriteriaEndsWith,
-        ZResponseFilterCriteriaDoesNotEndWith,
-      ])
-    )
+  data: z.record(z.string(), ZResponseFilterCriteriaDataCondition).optional(),
+
+  /**
+   * Further conditions on keys `data` already holds, all ANDed with it: a range on one question is
+   * two rules ("> 1" and "< 5"), and `data` keeps one condition per key.
+   */
+  dataAnd: z
+    .array(z.object({ key: z.string(), condition: ZResponseFilterCriteriaDataCondition }))
+    .max(MAX_FILTER_KEYS)
     .optional(),
 
   /**
@@ -332,16 +594,22 @@ const ZResponseFilterCriteriaFields = z.object({
       // same clause-expansion risk as the data filters above.
       applied: z.array(z.string()).max(MAX_FILTER_VALUES).optional(),
       notApplied: z.array(z.string()).max(MAX_FILTER_VALUES).optional(),
+      // "Tagged with any of": the Responses quick filter ticks several tags and means either.
+      appliedAny: z.array(z.string()).max(MAX_FILTER_VALUES).optional(),
     })
     .optional(),
 
   others: z
     .record(
       z.string(),
-      z.object({
-        op: z.enum(["equals", "notEquals"]),
-        value: z.union([z.string(), z.number()]),
-      })
+      z.union([
+        z.object({
+          op: z.enum(["equals", "notEquals"]),
+          value: z.union([z.string(), z.number()]),
+        }),
+        // "Language is any of": the Responses quick filter ticks several languages at once.
+        z.object({ op: z.literal("in"), value: z.array(z.string()).min(1).max(MAX_FILTER_VALUES) }),
+      ])
     )
     .optional(),
 
@@ -371,6 +639,9 @@ const ZResponseFilterCriteriaFields = z.object({
       ])
     )
     .optional(),
+
+  /** Shown / not shown conditions on the not-shown record (ENG-6951), all ANDed. */
+  shown: z.array(ZResponseFilterCriteriaShown).max(MAX_FILTER_KEYS).optional(),
 });
 
 /**
@@ -442,6 +713,18 @@ export const ZAutoCapturedResponseMeta = z.object({
    * rather than something imperfect.
    */
   locale: z.string().optional(),
+  /*
+   * The visit so far, from the web SDK's visit store (ENG-3926): app surveys on websites only, so
+   * link surveys and mobile apps never carry them. A visit is one browser tab.
+   */
+  visitPagesViewed: z.number().optional(),
+  visitUniquePagesViewed: z.number().optional(),
+  /** Seconds spent on the site's own pages in this visit; time on other sites is left out. */
+  visitTimeOnSite: z.number().optional(),
+  /** `document.referrer` of the visit's first page. */
+  visitEntryReferrer: z.string().optional(),
+  /** The pages taken in order, as paths joined by `VISIT_URLS_SEPARATOR` from `./visit` (last 50, first kept). */
+  visitUrls: z.string().optional(),
 });
 
 export type TAutoCapturedResponseMeta = z.infer<typeof ZAutoCapturedResponseMeta>;
@@ -459,6 +742,15 @@ export const ZResponseMeta = ZAutoCapturedResponseMeta.extend({
   country: z.string().optional(),
   action: z.string().optional(),
   ipAddress: z.string().optional(),
+  /**
+   * The creative that opened the survey. A client asks with the id; the ingest routes
+   * keep it only after checking the creative is in the workspace and opens this survey, and stamp the
+   * name themselves — a client-sent name never reaches the database. The name is the one the creative
+   * had when the response was created, so a later rename leaves stored responses as they were.
+   */
+  // Anything but text is dropped rather than refusing the response (the routes check the id anyway).
+  openedByCreativeId: z.string().optional().catch(undefined),
+  openedByCreativeName: z.string().optional(),
 });
 
 export type TResponseMeta = z.infer<typeof ZResponseMeta>;
@@ -497,6 +789,9 @@ export const ZResponse = z.object({
   meta: ZResponseMeta,
   singleUseId: z.string().nullable(),
   language: z.string().nullable(),
+  // `nullish` so a snapshot built before the column existed (a queued job, a fixture) still parses;
+  // every select reads the column, so a live response always carries it, `null` when unset.
+  outcome: ZResponseOutcome.nullish(),
 });
 
 export type TResponse = z.infer<typeof ZResponse>;
@@ -516,8 +811,8 @@ export const ZResponseInput = z.object({
   finished: z.boolean(),
   endingId: z.string().nullish(),
   language: z.string().optional(),
-  data: ZResponseData,
-  variables: ZResponseVariables.optional(),
+  data: ZResponseDataInput,
+  variables: ZResponseVariablesInput.optional(),
   ttc: ZResponseTtcInput.optional(),
   // The same shape as the stored `ZResponseMeta`, and now literally it: this used to be a hand-copied
   // duplicate, which is how a field added to one could pass review and still fail to parse on the way
@@ -528,17 +823,54 @@ export const ZResponseInput = z.object({
 
 export type TResponseInput = z.infer<typeof ZResponseInput>;
 
+/**
+ * Mark as low quality from the survey (ENG-6933, ADR 0022/0024): a rule's action asks the server to set the
+ * response's outcome to Low quality, with the create or update that follows it. The flag is one way: only
+ * `true` is accepted, it never clears an outcome and sets no other value. The server sets the outcome and
+ * queues the Hub reconcile, exactly as a reviewer marking the response does.
+ *
+ * Only the client response routes take it, so it lives on the client inputs below and not on
+ * `ZResponseInput` / `ZResponseUpdateInput`, which the management APIs share and document.
+ */
+export const ZResponseMarkLowQuality = z.literal(true);
+
+/**
+ * The survey's create input on the public client routes (`POST /api/v1|v2/client/{workspaceId}/responses`):
+ * `ZResponseInput` plus the Mark as low quality flag (ENG-6933) and the not-shown record (ENG-6936). Kept off
+ * `ZResponseInput` itself, which the v1 and v2 management APIs also parse, so their contracts stay as they are.
+ */
+export const ZClientResponseInput = ZResponseInput.extend({
+  markLowQuality: ZResponseMarkLowQuality.optional(),
+  notShown: ZResponseNotShownInput.optional(),
+});
+
+export type TClientResponseInput = z.infer<typeof ZClientResponseInput>;
+
 export const ZResponseUpdateInput = z.object({
   finished: z.boolean().optional(),
   endingId: z.string().nullish(),
-  data: ZResponseData.optional(),
-  variables: ZResponseVariables.optional(),
+  data: ZResponseDataInput.optional(),
+  variables: ZResponseVariablesInput.optional(),
   ttc: ZResponseTtcInput.optional(),
   language: z.string().optional(),
   pinAuthToken: z.string().nullish(),
 });
 
 export type TResponseUpdateInput = z.infer<typeof ZResponseUpdateInput>;
+
+/**
+ * The survey's update input on the public client route
+ * (`PUT /api/v1|v2/client/{workspaceId}/responses/{responseId}`): `ZResponseUpdateInput` plus the Mark as
+ * low quality flag (ENG-6933) and the not-shown record (ENG-6936). The survey sends the whole current
+ * not-shown record with every update; the server replaces the stored one with it and removes the answers
+ * it lists. Kept off `ZResponseUpdateInput`, which the management APIs also parse.
+ */
+export const ZClientResponseUpdateInput = ZResponseUpdateInput.extend({
+  markLowQuality: ZResponseMarkLowQuality.optional(),
+  notShown: ZResponseNotShownInput.optional(),
+});
+
+export type TClientResponseUpdateInput = z.infer<typeof ZClientResponseUpdateInput>;
 
 export const ZResponseWithSurvey = ZResponse.extend({
   survey: ZSurvey,
@@ -565,6 +897,8 @@ export const ZResponseUpdate = z.object({
     url: z.string().optional(),
     source: z.string().optional(),
     action: z.string().optional(),
+    // The id only: the ingest routes check it and stamp the name (ENG-4001).
+    openedByCreativeId: z.string().optional(),
   }).optional(),
   // `ZResponseData`, not the narrower `ZResponseHiddenFieldValue`: `ResponseQueue` merges this map
   // over `data` on every submit, so `data`'s value shape is literally its type. The renderer now
@@ -573,6 +907,11 @@ export const ZResponseUpdate = z.object({
   hiddenFields: ZResponseData.optional(),
   displayId: z.string().nullish(),
   endingId: z.string().nullish(),
+  // A rule marked the response Low quality on this submit (ENG-6933). Sent with this write and kept by
+  // the accumulated response, so a create built from it carries the flag too.
+  markLowQuality: ZResponseMarkLowQuality.optional(),
+  /** The whole current not-shown record (ENG-6936), sent with every create and update. */
+  notShown: ZResponseNotShownInput.optional(),
 });
 
 export type TResponseUpdate = z.infer<typeof ZResponseUpdate>;
@@ -599,12 +938,20 @@ export const ZResponseTableData = z.object({
    */
   reservedValues: z.record(z.string(), z.string()),
   quotas: z.array(z.string()).optional(),
+  outcome: ZResponseOutcome.nullish(),
 });
 
 export type TResponseTableData = z.infer<typeof ZResponseTableData>;
 
 export const ZResponseWithQuotas = ZResponse.extend({
   quotas: z.array(ZSurveyQuota.pick({ id: true, name: true })).optional(),
+  /**
+   * What the respondent was not shown (ENG-6936, ADR 0029); `null` means unknown. Read only for the
+   * app's own results (the responses page and the response card): it is not on `ZResponse`, and the
+   * shared response selection leaves it out, so webhooks, integrations and the v1/v2 payloads stay
+   * exactly as before.
+   */
+  notShown: ZResponseNotShown.nullish(),
 });
 
 export type TResponseWithQuotas = z.infer<typeof ZResponseWithQuotas>;

@@ -5,9 +5,11 @@ import {
   fileUploadElement,
   responseWithFiles,
   scanTimestamp,
+  signatureElement,
   storageUrl,
   surveyId,
   surveyWithFileUpload,
+  surveyWithSignature,
   surveyWithoutFileUpload,
   workspaceId,
 } from "./__mocks__/survey-reset.mock";
@@ -19,7 +21,12 @@ import { PrismaErrorType } from "@formbricks/database/types/error";
 import { logger } from "@formbricks/logger";
 import { DatabaseError } from "@formbricks/types/errors";
 import { TSurvey } from "@formbricks/types/surveys/types";
+import { requestEmailAuditErasureRequired } from "@/modules/email/lib/email-audit-maintenance";
 import { deleteResponsesAndDisplaysForSurvey, getQuotasSummary } from "./survey";
+
+vi.mock("@/modules/email/lib/email-audit-maintenance", () => ({
+  requestEmailAuditErasureRequired: vi.fn().mockResolvedValue(undefined),
+}));
 
 /**
  * The fixtures declare only the three fields the service reads, so the hand-off to `getSurvey` (typed
@@ -41,10 +48,12 @@ const mockResponsePages = (...pages: ScannedResponse[][]) => {
 };
 
 beforeEach(() => {
-  // Default: a survey with no file-upload element, so the response scan is skipped.
+  vi.mocked(requestEmailAuditErasureRequired).mockResolvedValue(undefined);
+  // Default: a survey with no file-upload element and no responses to scan.
   mockSurvey(surveyWithoutFileUpload);
+  mockResponsePages();
   deleteResponseFileUrls.mockReset();
-  deleteResponseFileUrls.mockResolvedValue(undefined);
+  deleteResponseFileUrls.mockResolvedValue({ failed: [] });
 });
 
 describe("Tests for deleteResponsesAndDisplaysForSurvey service", () => {
@@ -60,6 +69,31 @@ describe("Tests for deleteResponsesAndDisplaysForSurvey service", () => {
         deletedResponsesCount: 5,
         deletedDisplaysCount: 3,
       });
+    });
+
+    test("marks every response copy before the reset deletes its source rows", async () => {
+      vi.mocked(prisma.$transaction).mockImplementation(async (callback) => callback(prisma as never));
+      vi.mocked(prisma.response.deleteMany).mockResolvedValue({ count: 5 });
+      vi.mocked(prisma.display.deleteMany).mockResolvedValue({ count: 3 });
+
+      await deleteResponsesAndDisplaysForSurvey(surveyId);
+
+      expect(requestEmailAuditErasureRequired).toHaveBeenCalledWith(
+        { responsesOfSurveyId: surveyId },
+        prisma
+      );
+      expect(vi.mocked(requestEmailAuditErasureRequired).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(prisma.response.deleteMany).mock.invocationCallOrder[0]
+      );
+    });
+
+    test("runs the reset on its own execution budget rather than the client default (ENG-3285)", async () => {
+      vi.mocked(prisma.$transaction).mockResolvedValue([{ count: 0 }, { count: 0 }]);
+
+      await deleteResponsesAndDisplaysForSurvey(surveyId);
+
+      // The whole survey is deleted in one batch; a short budget rolls back a reset about to commit.
+      expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), { timeout: 120_000 });
     });
 
     test("Handles case with no responses or displays to delete", async () => {
@@ -113,6 +147,7 @@ describe("Tests for deleteResponsesAndDisplaysForSurvey service", () => {
       }) as never);
       deleteResponseFileUrls.mockImplementation(async () => {
         callOrder.push("storage");
+        return { failed: [] };
       });
 
       await deleteResponsesAndDisplaysForSurvey(surveyId);
@@ -178,13 +213,32 @@ describe("Tests for deleteResponsesAndDisplaysForSurvey service", () => {
       expect(deleteResponseFileUrls.mock.calls.map(([urls]) => urls.length)).toEqual([100, 100, 50]);
     });
 
-    test("Skips the response scan when the survey has no file-upload element", async () => {
-      vi.mocked(prisma.$transaction).mockResolvedValue([{ count: 3 }, { count: 1 }]);
+    // The bug case: the survey's only upload element was deleted, so no current element id matches the
+    // answers it left. Their keys are filed under this survey, which is what makes them its files to
+    // delete. A flat key under the removed id names no survey, so it stays element-matched and is left.
+    test("Deletes this survey's uploads even when no current element is a file upload", async () => {
+      const removedElementId = "removed-upload-element";
+      const ownFile = storageUrl(`surveys/${surveyId}/elements/${removedElementId}/own.png`);
+
+      mockResponsePages([
+        {
+          id: "response-1",
+          createdAt: scanTimestamp(0),
+          data: {
+            [removedElementId]: [
+              ownFile,
+              storageUrl("flat.png"),
+              storageUrl(`surveys/clq5n7p1q0000m7z0h5p6g3r9/elements/${removedElementId}/other.png`),
+            ],
+          },
+        },
+      ]);
+      vi.mocked(prisma.$transaction).mockResolvedValue([{ count: 1 }, { count: 0 }]);
 
       await deleteResponsesAndDisplaysForSurvey(surveyId);
 
-      expect(prisma.response.findMany).not.toHaveBeenCalled();
-      expect(deleteResponseFileUrls).not.toHaveBeenCalled();
+      expect(deleteResponseFileUrls).toHaveBeenCalledTimes(1);
+      expect(deleteResponseFileUrls).toHaveBeenCalledWith([ownFile], workspaceId);
     });
 
     test("Skips storage cleanup when the survey no longer exists", async () => {
@@ -213,6 +267,86 @@ describe("Tests for deleteResponsesAndDisplaysForSurvey service", () => {
       await deleteResponsesAndDisplaysForSurvey(surveyId);
 
       expect(deleteResponseFileUrls).not.toHaveBeenCalled();
+    });
+
+    test("Deletes a Signature answer held as a single URL string", async () => {
+      const ownSignature = storageUrl(`surveys/${surveyId}/elements/${signatureElement.id}/signature.png`);
+      mockSurvey(surveyWithSignature);
+      mockResponsePages([
+        { id: "response-1", createdAt: scanTimestamp(0), data: { [signatureElement.id]: ownSignature } },
+        { id: "response-2", createdAt: scanTimestamp(1), data: { [signatureElement.id]: "" } },
+      ]);
+      vi.mocked(prisma.$transaction).mockResolvedValue([{ count: 2 }, { count: 0 }]);
+
+      await deleteResponsesAndDisplaysForSurvey(surveyId);
+
+      expect(deleteResponseFileUrls).toHaveBeenCalledTimes(1);
+      expect(deleteResponseFileUrls).toHaveBeenCalledWith([ownSignature], workspaceId);
+    });
+
+    test("Never deletes a Signature URL filed under another survey or element, but still deletes an array of own signatures", async () => {
+      const otherSurveyId = "clq5n7p1q0000m7z0h5p6g3r9";
+      const ownSignature = storageUrl(`surveys/${surveyId}/elements/${signatureElement.id}/signature.png`);
+      mockSurvey(surveyWithSignature);
+      mockResponsePages([
+        {
+          id: "response-1",
+          createdAt: scanTimestamp(0),
+          data: {
+            [signatureElement.id]: storageUrl(
+              `surveys/${otherSurveyId}/elements/${signatureElement.id}/other.png`
+            ),
+          },
+        },
+        {
+          id: "response-2",
+          createdAt: scanTimestamp(1),
+          data: { [signatureElement.id]: storageUrl(`surveys/${surveyId}/elements/other-element/x.png`) },
+        },
+        {
+          id: "response-3",
+          createdAt: scanTimestamp(2),
+          data: { [signatureElement.id]: [ownSignature] as unknown as string },
+        },
+        // A pasted copy of an own signature URL under another id names another element, so it is refused.
+        { id: "response-4", createdAt: scanTimestamp(3), data: { "free-text": ownSignature } },
+      ]);
+      vi.mocked(prisma.$transaction).mockResolvedValue([{ count: 4 }, { count: 0 }]);
+
+      await deleteResponsesAndDisplaysForSurvey(surveyId);
+
+      expect(deleteResponseFileUrls).toHaveBeenCalledTimes(1);
+      expect(deleteResponseFileUrls).toHaveBeenCalledWith([ownSignature], workspaceId);
+    });
+
+    test("Never deletes a file stored under another survey's folder", async () => {
+      const otherSurveyId = "clq5n7p1q0000m7z0h5p6g3r9";
+      const ownFile = storageUrl(`surveys/${surveyId}/elements/${fileUploadElement.id}/own.png`);
+      const flatFile = storageUrl("flat.png");
+
+      mockSurvey(surveyWithFileUpload);
+      mockResponsePages([
+        {
+          id: "response-1",
+          createdAt: scanTimestamp(0),
+          data: {
+            [fileUploadElement.id]: [
+              ownFile,
+              flatFile,
+              storageUrl(`surveys/${otherSurveyId}/elements/${fileUploadElement.id}/other.png`),
+              // Both decode to `surveys/{otherSurveyId}/…`, which is the key the delete path builds.
+              storageUrl(`%73urveys/${otherSurveyId}/elements/${fileUploadElement.id}/encoded.png`),
+              storageUrl(`surveys%2F${otherSurveyId}%2Felements%2F${fileUploadElement.id}%2Fslash.png`),
+            ],
+          },
+        },
+      ]);
+      vi.mocked(prisma.$transaction).mockResolvedValue([{ count: 1 }, { count: 0 }]);
+
+      await deleteResponsesAndDisplaysForSurvey(surveyId);
+
+      expect(deleteResponseFileUrls).toHaveBeenCalledTimes(1);
+      expect(deleteResponseFileUrls).toHaveBeenCalledWith([ownFile, flatFile], workspaceId);
     });
   });
 

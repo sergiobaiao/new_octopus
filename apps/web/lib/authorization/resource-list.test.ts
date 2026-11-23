@@ -2,10 +2,16 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import { getAuthzedClient } from "@/lib/authzed/client";
 import { AUTHZED_ERROR_CODES, AuthzedError } from "@/lib/authzed/errors";
 import { assertAuthzedProjectionFreshness } from "@/lib/authzed/outbox-freshness";
+import { isSurveyVisibilityReady } from "@/lib/authzed/scope-readiness";
 import { getAuthorizationSurface, recordAuthorizationCheckIssued } from "./context";
 import { recordAuthorizationDecision } from "./metrics";
-import { lookupAuthorizedOrganizationIds, lookupAuthorizedWorkspaceIds } from "./resource-list";
+import {
+  filterReadableSurveyIds,
+  lookupAuthorizedOrganizationIds,
+  lookupAuthorizedWorkspaceIds,
+} from "./resource-list";
 
+vi.mock("@/lib/authzed/scope-readiness", () => ({ isSurveyVisibilityReady: vi.fn() }));
 vi.mock("@/lib/authzed/client", () => ({ getAuthzedClient: vi.fn() }));
 vi.mock("@/lib/authzed/outbox-freshness", () => ({ assertAuthzedProjectionFreshness: vi.fn() }));
 vi.mock("./context", () => ({
@@ -108,5 +114,65 @@ describe("authoritative resource lists", () => {
     expect(recordAuthorizationDecision).toHaveBeenCalledWith(
       expect.objectContaining({ outcome: "deny", surface: "mcp" })
     );
+  });
+});
+
+describe("survey list graph confirmation", () => {
+  test("keeps the SQL-authorized page before the survey baseline exists", async () => {
+    vi.mocked(isSurveyVisibilityReady).mockResolvedValue(false);
+    await expect(filterReadableSurveyIds({ type: "user", id: "u1" }, ["old-survey"])).resolves.toEqual(
+      new Set(["old-survey"])
+    );
+    expect(getAuthzedClient).not.toHaveBeenCalled();
+  });
+  test("uses visibility-aware permissions once projection is ready", async () => {
+    vi.mocked(isSurveyVisibilityReady).mockResolvedValue(true);
+    vi.mocked(assertAuthzedProjectionFreshness).mockResolvedValue(undefined);
+    const checkBulkPermissions = vi.fn().mockResolvedValue(new Set(["shared"]));
+    vi.mocked(getAuthzedClient).mockReturnValue({ checkBulkPermissions } as never);
+    await expect(
+      filterReadableSurveyIds({ type: "apiKey", id: "k1" }, ["shared", "private"])
+    ).resolves.toEqual(new Set(["shared"]));
+    expect(checkBulkPermissions).toHaveBeenCalledWith(expect.objectContaining({ permission: "read_v2" }));
+  });
+  test("fails closed when readiness cannot be determined", async () => {
+    vi.mocked(isSurveyVisibilityReady).mockRejectedValue(new Error("database unavailable"));
+    await expect(filterReadableSurveyIds({ type: "user", id: "u1" }, ["private"])).rejects.toThrow(
+      "database unavailable"
+    );
+    expect(getAuthzedClient).not.toHaveBeenCalled();
+  });
+});
+
+describe("on the previous release's AuthZed schema", () => {
+  const failedPrecondition = (details: string) =>
+    new AuthzedError({
+      attempts: 1,
+      cause: Object.assign(new Error(`9 FAILED_PRECONDITION: ${details}`), { code: 9, details }),
+      code: AUTHZED_ERROR_CODES.FAILED_PRECONDITION,
+      grpcStatus: 9,
+      operation: "lookup_resources",
+      retryable: false,
+    });
+
+  test("lists no workspace for dashboard_read, which that schema does not define", async () => {
+    lookupResources.mockRejectedValueOnce(
+      failedPrecondition("relation/permission `dashboard_read` not found under definition `workspace`")
+    );
+
+    await expect(
+      lookupAuthorizedWorkspaceIds({ type: "user", id: "viewer-missing-schema" }, "dashboard_read")
+    ).resolves.toEqual([]);
+    expect(recordAuthorizationDecision).toHaveBeenCalledWith(expect.objectContaining({ outcome: "deny" }));
+  });
+
+  test("still fails on a missing permission the release did not add", async () => {
+    lookupResources.mockRejectedValueOnce(
+      failedPrecondition("relation/permission `write` not found under definition `workspace`")
+    );
+
+    await expect(
+      lookupAuthorizedWorkspaceIds({ type: "user", id: "viewer-missing-write" }, "write")
+    ).rejects.toBeDefined();
   });
 });

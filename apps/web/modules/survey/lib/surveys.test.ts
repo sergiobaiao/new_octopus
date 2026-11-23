@@ -1,9 +1,22 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { getSurvey } from "@/lib/survey/service";
 import { validateInputs } from "@/lib/utils/validate";
+import { drainDeletionCleanups } from "@/modules/deletion-cleanup/lib/drain";
+import { enqueueSurveyDeletionCleanups } from "@/modules/deletion-cleanup/lib/enqueue";
+import {
+  SurveyLinkedCreativesError,
+  findLinkedCreatives,
+  unlinkSurveyCreatives,
+} from "@/modules/ee/creatives/lib/linked-creatives";
+import { requestEmailAuditErasureRequired } from "@/modules/email/lib/email-audit-maintenance";
+import { getSurveyPurgeEligibleWhere } from "@/modules/survey/archive/lib/purge-eligibility";
+import { restartSurveyRetention } from "@/modules/survey/archive/lib/retention-restart";
 import { archiveSurvey, deleteSurvey, restoreSurvey } from "./surveys";
 
 vi.mock("@/lib/utils/validate", () => ({
@@ -13,10 +26,36 @@ vi.mock("@/lib/utils/validate", () => ({
 vi.mock("@formbricks/database", () => ({
   prisma: {
     $transaction: vi.fn(),
+    response: {
+      findMany: vi.fn(),
+    },
     survey: {
+      findFirst: vi.fn(),
       update: vi.fn(),
     },
   },
+}));
+
+vi.mock("@/lib/survey/service", () => ({
+  getSurvey: vi.fn(),
+}));
+
+vi.mock("@/modules/deletion-cleanup/lib/enqueue", () => ({
+  enqueueSurveyDeletionCleanups: vi.fn(),
+}));
+
+vi.mock("@/modules/deletion-cleanup/lib/drain", () => ({
+  drainDeletionCleanups: vi.fn(),
+}));
+
+vi.mock("@/modules/survey/archive/lib/retention-restart", () => ({
+  restartSurveyRetention: vi.fn(),
+}));
+
+vi.mock("@/modules/ee/creatives/lib/linked-creatives", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/modules/ee/creatives/lib/linked-creatives")>()),
+  findLinkedCreatives: vi.fn(),
+  unlinkSurveyCreatives: vi.fn(),
 }));
 
 vi.mock("@formbricks/logger", () => ({
@@ -24,6 +63,9 @@ vi.mock("@formbricks/logger", () => ({
     error: vi.fn(),
     warn: vi.fn(),
   },
+}));
+vi.mock("@/modules/email/lib/email-audit-maintenance", () => ({
+  requestEmailAuditErasureRequired: vi.fn().mockResolvedValue(undefined),
 }));
 
 const surveyId = "clq5n7p1q0000m7z0h5p6g3r2";
@@ -49,69 +91,164 @@ const mockDeletedSurveyLink = {
 };
 
 describe("deleteSurvey", () => {
+  const fileUploadElementId = "clq5n7p1q0000m7z0h5p6g3r7";
+  const organizationId = "clq5n7p1q0000m7z0h5p6g3ra";
+  const cutoff = new Date("2026-07-01T00:00:00.000Z");
+
+  // getSurvey is typed TSurvey, but the scan reads only these fields, so the fixtures stop there.
+  const surveyWithFileUpload = {
+    workspaceId,
+    questions: [],
+    blocks: [
+      {
+        id: "clq5n7p1q0000m7z0h5p6g3r8",
+        name: "Block 1",
+        elements: [
+          {
+            id: fileUploadElementId,
+            type: TSurveyElementTypeEnum.FileUpload,
+            headline: { default: "Upload a file" },
+            required: false,
+            allowMultipleFiles: true,
+          },
+        ],
+      },
+    ],
+  } as unknown as TSurvey;
+
+  // A current upload, keyed under this survey's folder, and a pre-#8044 upload with a flat key.
+  const fileUrl = (name: string) =>
+    `/storage/${workspaceId}/private/surveys/${surveyId}/elements/${fileUploadElementId}/${name}`;
+  const flatFileUrl = (name: string) => `/storage/${workspaceId}/private/${name}`;
+  const otherSurveyFileUrl = (name: string) =>
+    `/storage/${workspaceId}/private/surveys/clq5n7p1q0000m7z0h5p6g3r9/elements/${fileUploadElementId}/${name}`;
+
+  /** A transaction whose lock finds the survey (or not) and whose eligibility re-check says `eligible`. */
+  const mockTransaction = ({
+    deleted = mockDeletedSurveyLink as object,
+    locked = true,
+    eligible = true,
+  }: { deleted?: object; locked?: boolean; eligible?: boolean } = {}) => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue(locked ? [{ workspaceId, organizationId }] : []),
+      survey: {
+        findFirst: vi.fn().mockResolvedValue(eligible ? { id: surveyId } : null),
+        delete: vi.fn().mockResolvedValue(deleted),
+      },
+      segment: { delete: vi.fn() },
+    };
+    vi.mocked(prisma.$transaction).mockImplementation(async (callback) => callback(tx as never));
+    return tx;
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    vi.clearAllMocks();
-  });
-
-  test("should delete a link survey without a segment", async () => {
-    const deleteMock = vi.fn().mockResolvedValue(mockDeletedSurveyLink);
-    const segmentDeleteMock = vi.fn();
-
-    vi.mocked(prisma.$transaction).mockImplementation(async (callback) =>
-      callback({
-        survey: { delete: deleteMock },
-        segment: { delete: segmentDeleteMock },
-      } as never)
-    );
-
-    const deletedSurvey = await deleteSurvey(surveyId);
-
-    expect(validateInputs).toHaveBeenCalledWith([surveyId, expect.any(Object)]);
-    expect(deleteMock).toHaveBeenCalledWith({
-      where: { id: surveyId },
-      include: {
-        segment: true,
-        triggers: { include: { actionClass: true } },
+    vi.mocked(requestEmailAuditErasureRequired).mockResolvedValue(undefined);
+    vi.mocked(getSurvey).mockResolvedValue(surveyWithFileUpload);
+    vi.mocked(prisma.survey.findFirst).mockResolvedValue({ id: surveyId } as never);
+    vi.mocked(prisma.response.findMany).mockResolvedValue([
+      {
+        id: "response-1",
+        createdAt: new Date("2026-06-01T00:00:00.000Z"),
+        data: {
+          [fileUploadElementId]: [fileUrl("a.png"), flatFileUrl("b.pdf"), otherSurveyFileUrl("c.png")],
+          other: "not a file",
+        },
       },
-    });
-    expect(segmentDeleteMock).not.toHaveBeenCalled();
-    expect(deletedSurvey).toEqual(mockDeletedSurveyLink);
+    ] as never);
+    vi.mocked(enqueueSurveyDeletionCleanups).mockResolvedValue({ drainNowIds: ["cleanup-1"] });
+    vi.mocked(drainDeletionCleanups).mockResolvedValue({ done: 1, again: 0, failed: 0 });
+    vi.mocked(findLinkedCreatives).mockResolvedValue([]);
+    vi.mocked(unlinkSurveyCreatives).mockResolvedValue([]);
   });
 
-  test("should delete a private segment for app surveys", async () => {
-    const deleteMock = vi.fn().mockResolvedValue(mockDeletedSurveyAppPrivateSegment);
-    const segmentDeleteMock = vi.fn().mockResolvedValue({ id: segmentId });
+  test("locks the survey, queues its cleanup, deletes it, then drains the storage cleanup", async () => {
+    const callOrder: string[] = [];
+    const tx = mockTransaction();
+    tx.$queryRaw.mockImplementation(async () => {
+      callOrder.push("lock");
+      return [{ workspaceId, organizationId }];
+    });
+    tx.survey.delete.mockImplementation(async () => {
+      callOrder.push("delete");
+      return mockDeletedSurveyLink;
+    });
+    vi.mocked(prisma.response.findMany).mockImplementation((async () => {
+      callOrder.push("scan");
+      return [];
+    }) as never);
+    vi.mocked(enqueueSurveyDeletionCleanups).mockImplementation(async () => {
+      callOrder.push("enqueue");
+      return { drainNowIds: ["cleanup-1"] };
+    });
+    vi.mocked(drainDeletionCleanups).mockImplementation(async () => {
+      callOrder.push("drain");
+      return { done: 1, again: 0, failed: 0 };
+    });
 
-    vi.mocked(prisma.$transaction).mockImplementation(async (callback) =>
-      callback({
-        survey: { delete: deleteMock },
-        segment: { delete: segmentDeleteMock },
-      } as never)
+    const deleted = await deleteSurvey(surveyId);
+
+    // The URLs live only in response.data, which the cascade takes with it, so the scan comes first,
+    // outside the transaction; the cleanup is queued in the delete's transaction and drained after it.
+    expect(callOrder).toEqual(["scan", "lock", "enqueue", "delete", "drain"]);
+    expect(enqueueSurveyDeletionCleanups).toHaveBeenCalledWith(tx, {
+      organizationId,
+      workspaceId,
+      surveyId,
+      fileUrls: [],
+    });
+    expect(drainDeletionCleanups).toHaveBeenCalledWith({ ids: ["cleanup-1"] });
+    expect(deleted).toEqual(mockDeletedSurveyLink);
+  });
+
+  test("queues only the flat keys one by one, leaving survey-filed keys to the folder delete", async () => {
+    const tx = mockTransaction();
+
+    await deleteSurvey(surveyId);
+
+    // This survey's own uploads go with its folder; the other survey's upload is never ours to delete.
+    expect(enqueueSurveyDeletionCleanups).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({ fileUrls: [flatFileUrl("b.pdf")] })
     );
-
-    const deletedSurvey = await deleteSurvey(surveyId);
-
-    expect(segmentDeleteMock).toHaveBeenCalledWith({ where: { id: segmentId } });
-    expect(deletedSurvey).toEqual(mockDeletedSurveyAppPrivateSegment);
   });
 
-  test("should map Prisma P2025 during survey deletion to ResourceNotFoundError", async () => {
-    const prismaError = new Prisma.PrismaClientKnownRequestError("Record not found", {
-      code: "P2025",
-      clientVersion: "4.0.0",
-    });
-    vi.mocked(prisma.$transaction).mockRejectedValue(prismaError);
+  test("deletes a private segment for app surveys", async () => {
+    const tx = mockTransaction({ deleted: mockDeletedSurveyAppPrivateSegment });
+
+    await expect(deleteSurvey(surveyId)).resolves.toEqual(mockDeletedSurveyAppPrivateSegment);
+    expect(tx.segment.delete).toHaveBeenCalledWith({ where: { id: segmentId } });
+  });
+
+  test("reports the survey as deleted when the drain after commit fails", async () => {
+    mockTransaction();
+    vi.mocked(drainDeletionCleanups).mockRejectedValue(new Error("db blip"));
+
+    // The row is already committed as deleted and its cleanup is queued for the drain job, so a failure
+    // here must not turn into an error the caller would retry against a survey that no longer exists.
+    await expect(deleteSurvey(surveyId)).resolves.toEqual(mockDeletedSurveyLink);
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  test("maps a survey that no longer exists to ResourceNotFoundError and queues nothing", async () => {
+    const tx = mockTransaction({ locked: false });
+
+    await expect(deleteSurvey(surveyId)).rejects.toThrow(ResourceNotFoundError);
+    expect(enqueueSurveyDeletionCleanups).not.toHaveBeenCalled();
+    expect(tx.survey.delete).not.toHaveBeenCalled();
+    expect(drainDeletionCleanups).not.toHaveBeenCalled();
+  });
+
+  test("maps Prisma P2025 to ResourceNotFoundError", async () => {
+    vi.mocked(prisma.$transaction).mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError("Record not found", { code: "P2025", clientVersion: "4.0.0" })
+    );
 
     await expect(deleteSurvey(surveyId)).rejects.toThrow(ResourceNotFoundError);
     expect(logger.warn).toHaveBeenCalledWith({ surveyId }, "Survey not found during delete");
-    expect(logger.error).not.toHaveBeenCalled();
   });
 
-  test("should handle non-P2025 PrismaClientKnownRequestError during survey deletion", async () => {
+  test("maps other Prisma errors to DatabaseError and drains nothing", async () => {
     const prismaError = new Prisma.PrismaClientKnownRequestError("Constraint failed", {
       code: "P2003",
       clientVersion: "4.0.0",
@@ -120,68 +257,141 @@ describe("deleteSurvey", () => {
 
     await expect(deleteSurvey(surveyId)).rejects.toThrow(DatabaseError);
     expect(logger.error).toHaveBeenCalledWith({ error: prismaError, surveyId }, "Error deleting survey");
+    expect(drainDeletionCleanups).not.toHaveBeenCalled();
   });
 
-  test("should handle generic errors during deletion", async () => {
+  test("rethrows a generic error", async () => {
     const genericError = new Error("Something went wrong");
     vi.mocked(prisma.$transaction).mockRejectedValue(genericError);
 
     await expect(deleteSurvey(surveyId)).rejects.toThrow(genericError);
-    expect(logger.error).not.toHaveBeenCalled();
   });
 
-  test("should throw validation error for invalid surveyId", async () => {
-    const invalidSurveyId = "invalid-id";
+  test("throws the validation error for an invalid surveyId", async () => {
     const validationError = new Error("Validation failed");
-    vi.mocked(validateInputs).mockImplementation(() => {
+    vi.mocked(validateInputs).mockImplementationOnce(() => {
       throw validationError;
     });
 
-    await expect(deleteSurvey(invalidSurveyId)).rejects.toThrow(validationError);
+    await expect(deleteSurvey("invalid-id")).rejects.toThrow(validationError);
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
-  test("skips the guarded delete when the survey was restored before the purge deletes it", async () => {
-    const cutoff = new Date("2026-07-01T00:00:00.000Z");
-    const queryRawMock = vi.fn().mockResolvedValue([]);
-    // archivedAt cleared -> restored between batch selection and delete.
-    const findUniqueMock = vi.fn().mockResolvedValue({ archivedAt: null });
-    const deleteMock = vi.fn();
+  describe("creatives that open the survey", () => {
+    const linked = [
+      { id: "clcr1234567890123456789012", name: "Feedback tab" },
+      { id: "clcr1234567890123456789013", name: "Promo banner" },
+    ];
 
-    vi.mocked(prisma.$transaction).mockImplementation(async (callback) =>
-      callback({
-        $queryRaw: queryRawMock,
-        survey: { findUnique: findUniqueMock, delete: deleteMock },
-        segment: { delete: vi.fn() },
-      } as never)
-    );
+    test("refuses while linked creatives open it, naming them, and queues and deletes nothing", async () => {
+      const tx = mockTransaction();
+      vi.mocked(findLinkedCreatives).mockResolvedValue(linked);
 
-    await expect(deleteSurvey(surveyId, { requireArchivedBefore: cutoff })).rejects.toThrow(
-      ResourceNotFoundError
-    );
-    expect(queryRawMock).toHaveBeenCalled();
-    expect(deleteMock).not.toHaveBeenCalled();
+      const refusal = await deleteSurvey(surveyId).catch((error: unknown) => error);
+
+      expect(refusal).toBeInstanceOf(SurveyLinkedCreativesError);
+      expect(refusal).toMatchObject({ statusCode: 409, blockedChange: "delete", creatives: linked });
+      // Checked under the row lock a link also takes, so a creative linked meanwhile can't slip past.
+      expect(findLinkedCreatives).toHaveBeenCalledWith(tx, { surveyId, workspaceId });
+      expect(unlinkSurveyCreatives).not.toHaveBeenCalled();
+      expect(enqueueSurveyDeletionCleanups).not.toHaveBeenCalled();
+      expect(tx.survey.delete).not.toHaveBeenCalled();
+    });
+
+    test("unlinks its archived creatives before the delete and hands them over once it commits", async () => {
+      const callOrder: string[] = [];
+      const tx = mockTransaction();
+      vi.mocked(unlinkSurveyCreatives).mockImplementation(async () => {
+        callOrder.push("unlink");
+        return [linked[0]];
+      });
+      tx.survey.delete.mockImplementation(async () => {
+        callOrder.push("delete");
+        return mockDeletedSurveyLink;
+      });
+      const onCreativesUnlinked = vi.fn(async () => {
+        callOrder.push("unlinked");
+      });
+
+      await deleteSurvey(surveyId, { onCreativesUnlinked });
+
+      expect(unlinkSurveyCreatives).toHaveBeenCalledWith(tx, {
+        surveyId,
+        workspaceId,
+        include: "archived",
+      });
+      expect(onCreativesUnlinked).toHaveBeenCalledWith([linked[0]], { organizationId });
+      expect(callOrder).toEqual(["unlink", "delete", "unlinked"]);
+    });
+
+    test("tells nobody when it unlinked nothing, and a failing report doesn't undo the delete", async () => {
+      mockTransaction();
+      const onCreativesUnlinked = vi.fn();
+
+      await deleteSurvey(surveyId, { onCreativesUnlinked });
+      expect(onCreativesUnlinked).not.toHaveBeenCalled();
+
+      vi.mocked(unlinkSurveyCreatives).mockResolvedValue([linked[0]]);
+      onCreativesUnlinked.mockRejectedValue(new Error("audit down"));
+      await expect(deleteSurvey(surveyId, { onCreativesUnlinked })).resolves.toEqual(mockDeletedSurveyLink);
+      expect(logger.error).toHaveBeenCalled();
+    });
+
+    test("the archive purge unlinks every creative instead of refusing", async () => {
+      const tx = mockTransaction();
+      vi.mocked(findLinkedCreatives).mockResolvedValue(linked);
+      vi.mocked(unlinkSurveyCreatives).mockResolvedValue(linked);
+      const onCreativesUnlinked = vi.fn();
+
+      await deleteSurvey(surveyId, { purgeCutoff: cutoff, onCreativesUnlinked });
+
+      expect(unlinkSurveyCreatives).toHaveBeenCalledWith(tx, { surveyId, workspaceId, include: "all" });
+      expect(tx.survey.delete).toHaveBeenCalled();
+      expect(onCreativesUnlinked).toHaveBeenCalledWith(linked, { organizationId });
+    });
   });
 
-  test("performs the guarded delete when the survey is still archived before the cutoff", async () => {
-    const cutoff = new Date("2026-07-01T00:00:00.000Z");
-    const queryRawMock = vi.fn().mockResolvedValue([]);
-    const findUniqueMock = vi.fn().mockResolvedValue({ archivedAt: new Date("2026-05-01T00:00:00.000Z") });
-    const deleteMock = vi.fn().mockResolvedValue(mockDeletedSurveyLink);
+  describe("the archive purge's guard", () => {
+    test("skips a survey no longer eligible before scanning its files", async () => {
+      vi.mocked(prisma.survey.findFirst).mockResolvedValue(null);
 
-    vi.mocked(prisma.$transaction).mockImplementation(async (callback) =>
-      callback({
-        $queryRaw: queryRawMock,
-        survey: { findUnique: findUniqueMock, delete: deleteMock },
-        segment: { delete: vi.fn() },
-      } as never)
-    );
+      await expect(deleteSurvey(surveyId, { purgeCutoff: cutoff })).rejects.toThrow(ResourceNotFoundError);
+      expect(prisma.survey.findFirst).toHaveBeenCalledWith({
+        where: { id: surveyId, ...getSurveyPurgeEligibleWhere(cutoff) },
+        select: { id: true },
+      });
+      expect(prisma.response.findMany).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
 
-    const result = await deleteSurvey(surveyId, { requireArchivedBefore: cutoff });
+    test("re-checks under the lock, and a survey restored or held in between is neither deleted nor queued", async () => {
+      const tx = mockTransaction({ eligible: false });
 
-    expect(queryRawMock).toHaveBeenCalled();
-    expect(deleteMock).toHaveBeenCalled();
-    expect(result).toEqual(mockDeletedSurveyLink);
+      await expect(deleteSurvey(surveyId, { purgeCutoff: cutoff })).rejects.toThrow(ResourceNotFoundError);
+      expect(tx.survey.findFirst).toHaveBeenCalledWith({
+        where: { id: surveyId, ...getSurveyPurgeEligibleWhere(cutoff) },
+        select: { id: true },
+      });
+      expect(enqueueSurveyDeletionCleanups).not.toHaveBeenCalled();
+      expect(tx.survey.delete).not.toHaveBeenCalled();
+      expect(drainDeletionCleanups).not.toHaveBeenCalled();
+    });
+
+    test("deletes a survey still eligible under the lock", async () => {
+      const tx = mockTransaction();
+
+      await expect(deleteSurvey(surveyId, { purgeCutoff: cutoff })).resolves.toEqual(mockDeletedSurveyLink);
+      expect(tx.survey.delete).toHaveBeenCalled();
+    });
+
+    test("checks no eligibility for a manual delete", async () => {
+      const tx = mockTransaction();
+
+      await deleteSurvey(surveyId);
+
+      expect(prisma.survey.findFirst).not.toHaveBeenCalled();
+      expect(tx.survey.findFirst).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -265,24 +475,59 @@ describe("archiveSurvey", () => {
 });
 
 describe("restoreSurvey", () => {
+  const organizationId = "clq5n7p1q0000m7z0h5p6g3r9";
+  const restored = { id: surveyId, status: "paused", archivedAt: null };
+  const restoreTx = (
+    locked: { status?: string; archivedAt: Date | null; organizationId: string } | undefined
+  ) => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue(locked ? [locked] : []),
+      survey: { update: vi.fn().mockResolvedValue(restored) },
+    };
+    vi.mocked(prisma.$transaction).mockImplementation(async (callback) => callback(tx as never));
+    return tx;
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  test("should restore a survey by clearing archivedAt", async () => {
-    vi.mocked(prisma.survey.update).mockResolvedValue({
-      id: surveyId,
-      status: "paused",
-      archivedAt: null,
-    } as never);
+  test("clears archivedAt and restarts the survey's retention, with the survey locked", async () => {
+    const tx = restoreTx({ archivedAt: new Date("2030-01-01T00:00:00.000Z"), organizationId });
+    vi.mocked(restartSurveyRetention).mockResolvedValue({ exemptionId: "clexm" });
 
-    await restoreSurvey(surveyId);
+    await expect(restoreSurvey(surveyId, { restoredById: "user-1" })).resolves.toEqual({
+      ...restored,
+      retentionExemptionId: "clexm",
+    });
 
-    expect(prisma.survey.update).toHaveBeenCalledWith({
+    expect(String(tx.$queryRaw.mock.calls[0][0].join("?"))).toContain("FOR UPDATE");
+    expect(tx.survey.update).toHaveBeenCalledWith({
       where: { id: surveyId },
       data: { archivedAt: null },
       select: { id: true, status: true, archivedAt: true },
     });
+    expect(restartSurveyRetention).toHaveBeenCalledWith(tx, {
+      surveyId,
+      organizationId,
+      restoredById: "user-1",
+    });
+  });
+
+  test("restoring a survey that isn't archived writes nothing and leaves retention alone", async () => {
+    const tx = restoreTx({ status: "paused", archivedAt: null, organizationId });
+
+    await expect(restoreSurvey(surveyId)).resolves.toEqual({ ...restored, retentionExemptionId: null });
+    // An update would bump updated_at, which the surveys policy's "no changes" reads.
+    expect(tx.survey.update).not.toHaveBeenCalled();
+    expect(restartSurveyRetention).not.toHaveBeenCalled();
+  });
+
+  test("a survey that doesn't exist is not found", async () => {
+    const tx = restoreTx(undefined);
+
+    await expect(restoreSurvey(surveyId)).rejects.toThrow(ResourceNotFoundError);
+    expect(tx.survey.update).not.toHaveBeenCalled();
   });
 
   test("should map Prisma P2025 during restore to ResourceNotFoundError", async () => {
@@ -290,7 +535,7 @@ describe("restoreSurvey", () => {
       code: "P2025",
       clientVersion: "4.0.0",
     });
-    vi.mocked(prisma.survey.update).mockRejectedValue(prismaError);
+    vi.mocked(prisma.$transaction).mockRejectedValue(prismaError);
 
     await expect(restoreSurvey(surveyId)).rejects.toThrow(ResourceNotFoundError);
   });
@@ -300,7 +545,7 @@ describe("restoreSurvey", () => {
       code: "P2003",
       clientVersion: "4.0.0",
     });
-    vi.mocked(prisma.survey.update).mockRejectedValue(prismaError);
+    vi.mocked(prisma.$transaction).mockRejectedValue(prismaError);
 
     await expect(restoreSurvey(surveyId)).rejects.toThrow(DatabaseError);
     expect(logger.error).toHaveBeenCalledWith({ error: prismaError, surveyId }, "Error restoring survey");

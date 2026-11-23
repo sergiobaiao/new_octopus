@@ -9,7 +9,7 @@ import { TOrganization } from "@formbricks/types/organizations";
 import { TAllowedFileExtension } from "@formbricks/types/storage";
 import { SettingsCard } from "@/app/(app)/workspaces/[workspaceId]/settings/components/SettingsCard";
 import { isExternalImageSrc } from "@/lib/image-hosts";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import {
   removeOrganizationFaviconUrlAction,
   updateOrganizationFaviconUrlAction,
@@ -31,11 +31,11 @@ const allowedFileExtensions: TAllowedFileExtension[] = ["png", "jpeg", "jpg", "i
 const MAX_FAVICON_SIZE_MB = 0.1; // 100KB
 
 interface FaviconCustomizationSettingsProps {
-  organization: TOrganization;
-  hasWhiteLabelPermission: boolean;
-  workspaceId: string;
-  isReadOnly: boolean;
-  isStorageConfigured: boolean;
+  readonly organization: TOrganization;
+  readonly hasWhiteLabelPermission: boolean;
+  readonly workspaceId: string;
+  readonly isReadOnly: boolean;
+  readonly isStorageConfigured: boolean;
 }
 
 export const FaviconCustomizationSettings = ({

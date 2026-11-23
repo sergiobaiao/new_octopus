@@ -6,9 +6,14 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
 import { useTranslation } from "react-i18next";
 import { logger } from "@formbricks/logger";
+import type { TOrganizationRole } from "@formbricks/types/memberships";
 import { getWorkspacesForSwitcherAction } from "@/app/(app)/workspaces/[workspaceId]/actions";
-import { SwitcherDropdownBody } from "@/modules/settings/components/switcher-dropdown-body";
+import {
+  SWITCHER_DROPDOWN_CONTENT_CLASS_NAME,
+  SwitcherDropdownBody,
+} from "@/modules/settings/components/switcher-dropdown-body";
 import { useSwitcherData } from "@/modules/settings/hooks/use-switcher-data";
+import { getWorkspaceHomePath } from "@/modules/settings/lib/organization-switch";
 import { BreadcrumbItem } from "@/modules/ui/components/breadcrumb";
 import {
   DropdownMenu,
@@ -23,16 +28,18 @@ import { WorkspaceLimitModal } from "@/modules/workspaces/components/workspace-l
 import { useWorkspace } from "../context/workspace-context";
 
 interface WorkspaceBreadcrumbProps {
-  currentWorkspaceId: string;
-  currentWorkspaceName?: string; // Optional: pass directly if context not available
-  isOwnerOrManager: boolean;
-  organizationWorkspacesLimit: number;
-  isFormbricksCloud: boolean;
-  isLicenseActive: boolean;
-  currentOrganizationId: string;
-  isAccessControlAllowed: boolean;
-  isEnvironmentBreadcrumbVisible: boolean;
-  isMembershipPending: boolean;
+  readonly currentWorkspaceId: string;
+  readonly currentWorkspaceName?: string; // Optional: pass directly if context not available
+  readonly isOwnerOrManager: boolean;
+  readonly organizationWorkspacesLimit: number;
+  readonly isFormbricksCloud: boolean;
+  readonly isLicenseActive: boolean;
+  readonly isNoLicense: boolean;
+  readonly currentOrganizationId: string;
+  readonly isAccessControlAllowed: boolean;
+  readonly isEnvironmentBreadcrumbVisible: boolean;
+  readonly isMembershipPending: boolean;
+  readonly membershipRole?: TOrganizationRole;
 }
 
 export const WorkspaceBreadcrumb = ({
@@ -42,10 +49,12 @@ export const WorkspaceBreadcrumb = ({
   organizationWorkspacesLimit,
   isFormbricksCloud,
   isLicenseActive,
+  isNoLicense,
   currentOrganizationId,
   isAccessControlAllowed,
   isEnvironmentBreadcrumbVisible,
   isMembershipPending,
+  membershipRole,
 }: WorkspaceBreadcrumbProps) => {
   const { t } = useTranslation();
   const [isWorkspaceDropdownOpen, setIsWorkspaceDropdownOpen] = useState(false);
@@ -54,6 +63,11 @@ export const WorkspaceBreadcrumb = ({
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
 
+  // Get current workspace name from context OR prop
+  // Context is preferred, but prop is fallback for pages without EnvironmentContextWrapper
+  const { workspace: currentWorkspace } = useWorkspace();
+  const workspaceName = currentWorkspace?.name || currentWorkspaceName || "";
+
   const workspaceSwitcher = useSwitcherData(
     () => getWorkspacesForSwitcherAction({ organizationId: currentOrganizationId }),
     t("common.failed_to_load_workspaces"),
@@ -61,14 +75,10 @@ export const WorkspaceBreadcrumb = ({
       const error = new Error(message);
       logger.error(error, "Failed to load workspaces");
       Sentry.captureException(error);
-    }
+    },
+    workspaceName
   );
   const { load: loadWorkspaces } = workspaceSwitcher;
-
-  // Get current workspace name from context OR prop
-  // Context is preferred, but prop is fallback for pages without EnvironmentContextWrapper
-  const { workspace: currentWorkspace } = useWorkspace();
-  const workspaceName = currentWorkspace?.name || currentWorkspaceName || "";
 
   // Lazy-load workspaces when dropdown opens (the hook guards against duplicate/looping loads).
   useEffect(() => {
@@ -85,10 +95,7 @@ export const WorkspaceBreadcrumb = ({
   }
 
   const handleWorkspaceChange = (workspaceId: string) => {
-    const targetPath =
-      workspaceId === currentWorkspaceId
-        ? `/workspaces/${currentWorkspaceId}/surveys`
-        : `/workspaces/${workspaceId}/`;
+    const targetPath = getWorkspaceHomePath(membershipRole, workspaceId);
     startTransition(() => {
       setIsWorkspaceDropdownOpen(false);
       router.push(targetPath);
@@ -149,7 +156,7 @@ export const WorkspaceBreadcrumb = ({
           </div>
         </DropdownMenuTrigger>
 
-        <DropdownMenuContent align="start" className="mt-2">
+        <DropdownMenuContent align="start" className={`mt-2 ${SWITCHER_DROPDOWN_CONTENT_CLASS_NAME}`}>
           <SwitcherDropdownBody
             type="workspace"
             isLoading={workspaceSwitcher.isLoading}
@@ -193,6 +200,7 @@ export const WorkspaceBreadcrumb = ({
           setOpen={setOpenLimitModal}
           buttons={getLimitModalButtons()}
           workspaceLimit={organizationWorkspacesLimit}
+          showLiteLicenseTip={!isFormbricksCloud && isNoLicense}
         />
       )}
       {openCreateWorkspaceModal && (

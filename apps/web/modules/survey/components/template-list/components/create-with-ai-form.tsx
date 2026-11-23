@@ -1,12 +1,16 @@
 "use client";
 
-import { ArrowLeftIcon, PencilIcon } from "lucide-react";
+import { ArrowLeftIcon, UploadIcon } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { getLanguageLabel } from "@formbricks/i18n-utils/utils";
 import type { TUserLocale } from "@formbricks/types/user";
+import { V3_SURVEY_GENERATE_ALLOWED_LANGUAGES } from "@/app/api/v3/surveys/generate/schemas";
 import type { TAIUnavailableReason } from "@/lib/ai/service";
 import { AIUnavailableAlert } from "@/modules/ai/components/ai-unavailable-alert";
-import { AiDraftPreview } from "@/modules/survey/components/template-list/components/ai-draft-preview";
+import { landFocusOnDraft } from "@/modules/survey/components/template-list/components/ai-draft-preview";
+import { DraftReviewPanel } from "@/modules/survey/components/template-list/components/draft-review-panel";
+import { SourceChip } from "@/modules/survey/components/template-list/components/source-chip";
 import { useCreateSurveyWithAI } from "@/modules/survey/components/template-list/hooks/use-create-survey-with-ai";
 import {
   AI_SURVEY_PROMPT_MAX_LENGTH,
@@ -15,7 +19,17 @@ import {
 import { AiIcon, AiStatusLine } from "@/modules/ui/components/ai";
 import { Alert, AlertDescription, AlertTitle } from "@/modules/ui/components/alert";
 import { Button } from "@/modules/ui/components/button";
-import { TooltipRenderer } from "@/modules/ui/components/tooltip";
+import { Label } from "@/modules/ui/components/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/modules/ui/components/select";
+
+// Radix Select cannot hold an empty value, so "match my prompt" needs a sentinel of its own.
+const MATCH_PROMPT_LANGUAGE = "match-prompt";
 
 type CreateWithAIFormProps = {
   workspaceId: string;
@@ -38,6 +52,11 @@ type CreateWithAIFormProps = {
   onUnsavedWorkChange?: (hasUnsavedWork: boolean) => void;
   /** Reports whether a generation is in flight, so the host can word its confirmation. */
   onGeneratingChange?: (isGenerating: boolean) => void;
+  /**
+   * Opens the import instead, offered on the footer's left while the prompt is written.
+   * Left out when the host has no import to offer (no AI: the import would take Formbricks files only).
+   */
+  onImportInstead?: () => void;
 };
 
 export const CreateWithAIForm = ({
@@ -53,12 +72,15 @@ export const CreateWithAIForm = ({
   isHostNavigating = false,
   onUnsavedWorkChange,
   onGeneratingChange,
+  onImportInstead,
 }: Readonly<CreateWithAIFormProps>) => {
   const { t } = useTranslation();
 
   const {
     prompt,
     setPrompt,
+    surveyLanguage,
+    setSurveyLanguage,
     submittedPrompt,
     status,
     draft,
@@ -104,11 +126,20 @@ export const CreateWithAIForm = ({
   // that scrolls, and a user pressing Space to read further would otherwise navigate by accident.
   useEffect(() => {
     if (status === "review") {
-      draftRef.current?.focus();
+      landFocusOnDraft(draftRef.current);
     }
   }, [status]);
 
   const helperPrompts = useMemo(() => getHelperPrompts(t), [t]);
+
+  const surveyLanguageOptions = useMemo(
+    () =>
+      V3_SURVEY_GENERATE_ALLOWED_LANGUAGES.map((code) => ({
+        code,
+        label: getLanguageLabel(code, language) ?? code,
+      })).sort((left, right) => left.label.localeCompare(right.label, language)),
+    [language]
+  );
 
   const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -166,6 +197,18 @@ export const CreateWithAIForm = ({
 
     return (
       <>
+        {onImportInstead && (
+          // The other way in, on the footer's left, away from the dialog's own actions.
+          <Button
+            type="button"
+            variant="ghost"
+            className="text-slate-600 sm:mr-auto"
+            title={t("workspace.surveys.ai_create.import_file_hint")}
+            onClick={onImportInstead}>
+            <UploadIcon aria-hidden="true" />
+            {t("workspace.surveys.ai_create.import_file")}
+          </Button>
+        )}
         {showCancel && onCancel && (
           <Button type="button" variant="secondary" onClick={onCancel}>
             {t("common.cancel")}
@@ -196,37 +239,19 @@ export const CreateWithAIForm = ({
 
   const editPromptLabel = t("workspace.surveys.ai_create.edit_prompt");
 
-  /**
-   * The prompt, settled. It is the same content the textarea held, so it borrows that component's
-   * shape — same radius and text size — with a lighter border and a filled ground to say it is no
-   * longer the thing you are editing. The pencil lives inside that frame: pinned to the dialog edge
-   * instead, it read as an unrelated control floating in whitespace.
-   */
+  /*
+    The prompt this draft came from, not the one being typed. Edit prompt keeps the draft, so the live
+    text would label an old draft with words that had no part in producing it.
+  */
   const promptChip = (
-    <div className="flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 py-1 pr-1 pl-3">
-      <p id="ai-prompt-echo" className="min-w-0 flex-1 truncate text-sm text-slate-700">
-        <span className="sr-only">{t("workspace.surveys.ai_create.your_prompt")}: </span>
-        {/*
-          The prompt this draft came from, not the one being typed. Edit prompt keeps the draft, so
-          the live text would label an old draft with words that had no part in producing it.
-        */}
-        {submittedPrompt}
-      </p>
-      <TooltipRenderer tooltipContent={editPromptLabel}>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="size-7 shrink-0 text-slate-500 hover:text-slate-800"
-          disabled={isCreatingSurvey}
-          // Icon-only, so it needs its own name; describedby points at the prompt it acts on.
-          aria-label={editPromptLabel}
-          aria-describedby="ai-prompt-echo"
-          onClick={handleEditPrompt}>
-          <PencilIcon aria-hidden="true" />
-        </Button>
-      </TooltipRenderer>
-    </div>
+    <SourceChip
+      id="ai-prompt-echo"
+      label={submittedPrompt}
+      srLabel={t("workspace.surveys.ai_create.your_prompt")}
+      editLabel={editPromptLabel}
+      disabled={isCreatingSurvey}
+      onEdit={handleEditPrompt}
+    />
   );
 
   return (
@@ -239,18 +264,15 @@ export const CreateWithAIForm = ({
       )}
 
       {isGenerating || isReviewing ? (
-        <>
-          <div className="shrink-0">{promptChip}</div>
-          <div className="flex min-h-0 flex-1 flex-col">
-            <AiDraftPreview
-              draft={draft}
-              isGenerating={isGenerating}
-              className="flex-1"
-              scrollContainerRef={draftRef}
-            />
-          </div>
-          <AiStatusLine isActive={isGenerating} messages={generatingMessages} activeIndex={statusIndex} />
-        </>
+        <DraftReviewPanel
+          draft={draft}
+          isGenerating={isGenerating}
+          source={promptChip}
+          scrollContainerRef={draftRef}
+          status={
+            <AiStatusLine isActive={isGenerating} messages={generatingMessages} activeIndex={statusIndex} />
+          }
+        />
       ) : (
         <>
           <div className="space-y-2">
@@ -276,29 +298,50 @@ export const CreateWithAIForm = ({
             </div>
           </div>
 
-          <div className="space-y-2">
-            <p className="text-sm font-medium text-slate-700">
+          {/* Light chips straight under the prompt: examples to fill it with, not actions of the dialog. */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="mr-0.5 text-xs text-slate-500">
               {t("workspace.surveys.ai_create.try_prompt")}
-            </p>
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-              {helperPrompts.map((helperPrompt) => (
-                <Button
-                  key={helperPrompt.label}
-                  type="button"
-                  variant="secondary"
-                  size="sm"
-                  className="group w-full min-w-0 justify-start text-left"
-                  title={helperPrompt.prompt}
-                  aria-label={`${helperPrompt.label}. ${helperPrompt.prompt}`}
-                  onClick={() => {
-                    setPrompt(helperPrompt.prompt);
-                    clearError();
-                  }}>
-                  <helperPrompt.Icon className="size-3.5 shrink-0 text-slate-500 transition-colors group-hover:text-primary" />
-                  <span className="min-w-0 truncate">{helperPrompt.label}</span>
-                </Button>
-              ))}
-            </div>
+            </span>
+            {helperPrompts.map((helperPrompt) => (
+              <button
+                key={helperPrompt.label}
+                type="button"
+                className="group inline-flex max-w-full items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-700 transition-colors hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:outline-none"
+                title={helperPrompt.prompt}
+                aria-label={`${helperPrompt.label}. ${helperPrompt.prompt}`}
+                onClick={() => {
+                  setPrompt(helperPrompt.prompt);
+                  clearError();
+                }}>
+                <helperPrompt.Icon
+                  className="size-3.5 shrink-0 text-slate-400 transition-colors group-hover:text-slate-600"
+                  aria-hidden="true"
+                />
+                <span className="min-w-0 truncate">{helperPrompt.label}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="flex flex-col gap-y-2">
+            <Label htmlFor="ai-survey-language">{t("workspace.surveys.ai_create.survey_language")}</Label>
+            <Select
+              value={surveyLanguage ?? MATCH_PROMPT_LANGUAGE}
+              onValueChange={(value) => setSurveyLanguage(value === MATCH_PROMPT_LANGUAGE ? null : value)}>
+              <SelectTrigger id="ai-survey-language" className="w-full bg-white sm:w-64">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={MATCH_PROMPT_LANGUAGE}>
+                  {t("workspace.surveys.ai_create.survey_language_match_prompt")}
+                </SelectItem>
+                {surveyLanguageOptions.map(({ code, label }) => (
+                  <SelectItem key={code} value={code}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         </>
       )}

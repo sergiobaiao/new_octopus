@@ -1,15 +1,15 @@
-import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import { logger } from "@formbricks/logger";
 import { Prisma, PrismaClient } from "../prisma";
 import { createPrismaPgAdapter } from "../prisma-adapter";
+import { assertPrismaCliTlsSupported, runPrismaCli } from "../prisma-cli-tls";
+import { type MigrationRunPhase, shouldRunMigration } from "./migration-phases";
+import { ensureOnlineIndexes } from "./online-indexes";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const execFileAsync = promisify(execFile);
 
 export interface DataMigrationContext {
   prisma: PrismaClient;
@@ -37,6 +37,10 @@ const getMigrationDatabaseUrl = (): string | undefined => {
 };
 
 const migrationDatabaseUrl = getMigrationDatabaseUrl();
+const requireMigrationDatabaseUrl = (): string => {
+  if (!migrationDatabaseUrl) throw new Error("DATABASE_URL or MIGRATE_DATABASE_URL is required");
+  return migrationDatabaseUrl;
+};
 const prisma = new PrismaClient({ adapter: createPrismaPgAdapter(migrationDatabaseUrl).adapter });
 const TRANSACTION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
 
@@ -189,8 +193,15 @@ const runMigrations = async (migrations: MigrationScript[]): Promise<void> => {
   // each schema migration into packages/database/.prisma-migrations on demand for
   // `prisma migrate deploy`, then wipe between runs so stale or experimental
   // migrations from a previous local invocation can't influence this one.
-  await fs.rm(PRISMA_MIGRATIONS_DIR, { recursive: true, force: true });
+  // Empty it in place: under a read-only root filesystem the directory is a volume mount point, which
+  // cannot itself be removed.
   await fs.mkdir(PRISMA_MIGRATIONS_DIR, { recursive: true });
+  const staleEntries = await fs.readdir(PRISMA_MIGRATIONS_DIR);
+  await Promise.all(
+    staleEntries.map((entry) =>
+      fs.rm(path.join(PRISMA_MIGRATIONS_DIR, entry), { recursive: true, force: true })
+    )
+  );
 
   const appliedSchemaMigrations = await loadAppliedSchemaMigrations();
 
@@ -403,11 +414,12 @@ const runSchemaMigrationBatch = async (
     // We pin DATABASE_URL on the child env to the same URL the in-process
     // PrismaClient resolved above. prisma.config.ts always reads
     // env("DATABASE_URL"), so this is how MIGRATE_DATABASE_URL reaches the
-    // subprocess without leaking into the parent's env.
+    // subprocess without leaking into the parent's env. The URL's libpq TLS
+    // settings are translated first: the CLI ignores verify-ca/verify-full.
     const prismaBin = await resolvePrismaBin();
-    await execFileAsync(prismaBin, ["migrate", "deploy", "--config", PRISMA_CONFIG_PATH], {
+    await runPrismaCli(prismaBin, ["migrate", "deploy", "--config", PRISMA_CONFIG_PATH], {
       cwd: REPO_ROOT_DIR,
-      env: { ...process.env, DATABASE_URL: migrationDatabaseUrl },
+      databaseUrl: requireMigrationDatabaseUrl(),
     });
     logger.info(`Successfully applied schema migration batch (${batch.length.toString()})`);
   } catch (err) {
@@ -517,15 +529,18 @@ const loadMigrations = async (): Promise<MigrationScript[]> => {
   return migrations;
 };
 
-export async function applyMigrations(): Promise<void> {
+export async function applyMigrations(phase: MigrationRunPhase = "maintenance"): Promise<void> {
   try {
+    assertPrismaCliTlsSupported(requireMigrationDatabaseUrl());
     const allMigrations = await loadMigrations();
     logger.info(
       `Loaded ${allMigrations.length.toString()} migrations from ${MIGRATIONS_DIR} (source: ${
         isBuilt ? "dist" : "src"
       })`
     );
-    await runMigrations(allMigrations);
+    await runMigrations(allMigrations.filter((migration) => shouldRunMigration(migration.name, phase)));
+    if (!migrationDatabaseUrl) throw new Error("A migration database URL is required");
+    await ensureOnlineIndexes(migrationDatabaseUrl);
   } finally {
     await prisma.$disconnect();
   }

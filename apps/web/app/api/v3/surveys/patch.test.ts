@@ -1,18 +1,30 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
-import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
+import type { TCustomCssInput } from "@formbricks/types/custom-css";
+import { DatabaseError, ResourceNotFoundError, TooManyRequestsError } from "@formbricks/types/errors";
 import type { TSurvey } from "@formbricks/types/surveys/types";
+import {
+  type TV3SurveyWriteReport,
+  V3CustomCssInvalidError,
+  V3CustomCssPlanRequiredError,
+} from "@/app/api/v3/lib/custom-css";
 import { getActionClasses } from "@/lib/actionClass/service";
+import { cache } from "@/lib/cache";
 import { scheduleFeedbackSourceReconciliation } from "@/lib/feedback-source/mapping-reconciliation";
 import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
+import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
+import { getCustomCssPlanAllowed } from "@/modules/custom-css/lib/access";
+import { processCustomCss } from "@/modules/custom-css/processor";
+import { getIsQuotasEnabled } from "@/modules/ee/license-check/lib/utils";
 import { getExternalUrlsPermission } from "@/modules/survey/lib/permission";
 import {
   isSurveySchedulingDue,
   normalizeSurveyScheduling,
   reconcileDueSurveySchedules,
 } from "@/modules/survey/scheduling/lib/survey-scheduling";
-import { executeV3SurveyPatch, patchV3Survey } from "./patch";
+import { V3SurveyArchivedError, V3SurveyStaleError, executeV3SurveyPatch, patchV3Survey } from "./patch";
 import { V3SurveyReferenceValidationError } from "./reference-validation";
 import { ZV3CreateSurveyBody } from "./schemas";
 import {
@@ -24,6 +36,23 @@ import { V3SurveyWritePermissionError } from "./write-permissions";
 
 vi.mock("server-only", () => ({}));
 
+// ENG-3641: the processor contract and the plan gate; the save rules between them run for real.
+vi.mock("@/modules/custom-css/processor", () => ({
+  CUSTOM_CSS_PROCESSOR_VERSION: 3,
+  processCustomCss: vi.fn(),
+  normalizeCustomCssInput: (input: { light: string | null; dark: string | null } | null | undefined) => {
+    const light = input?.light?.trim() ? input.light : null;
+    const dark = input?.dark?.trim() ? input.dark : null;
+    return light === null && dark === null ? null : { light, dark };
+  },
+}));
+vi.mock("@/modules/custom-css/lib/access", () => ({
+  CUSTOM_CSS_PLAN_REQUIRED_MESSAGE: "Adding or editing custom CSS requires the Scale plan.",
+  getCustomCssPlanAllowed: vi.fn(),
+}));
+vi.mock("@/lib/cache", () => ({ cache: { del: vi.fn() } }));
+vi.mock("@/modules/core/rate-limit/helpers", () => ({ applyRateLimit: vi.fn() }));
+
 vi.mock("@formbricks/database", () => {
   const prisma = {
     language: {
@@ -31,10 +60,16 @@ vi.mock("@formbricks/database", () => {
     },
     survey: {
       findUnique: vi.fn(),
+      findFirst: vi.fn(),
       update: vi.fn(),
+      findUniqueOrThrow: vi.fn(),
     },
     segment: {
       update: vi.fn(),
+    },
+    // ENG-3994: the publish rule asks whether a creative opens the survey. None does unless a test says so.
+    creative: {
+      findFirst: vi.fn(async () => null),
     },
     // ENG-1837: the patch reconciles the EmbeddedData rows in the same transaction as the survey
     // write, so the models the reconcile touches have to exist on the client.
@@ -45,19 +80,27 @@ vi.mock("@formbricks/database", () => {
       updateMany: vi.fn(),
     },
     embeddedData: {
+      findMany: vi.fn(),
       create: vi.fn(),
       deleteMany: vi.fn(),
       updateMany: vi.fn(),
     },
+    // ENG-6934: a save that holds a matrix re-syncs its quotas' matrix conditions in the transaction.
+    surveyQuota: {
+      findMany: vi.fn(async () => []),
+      update: vi.fn(),
+    },
     // Interactive transaction: run the callback with the mocked client as the tx client.
+    $executeRaw: vi.fn(),
     $transaction: vi.fn((callback: (tx: typeof prisma) => Promise<unknown>) => callback(prisma)),
   };
   return { prisma };
 });
 
 vi.mock("@/lib/survey/service", () => ({
-  selectSurvey: {
+  selectSurveyWithCustomCss: {
     id: true,
+    customCss: true,
   },
 }));
 
@@ -81,6 +124,10 @@ vi.mock("./targeting", () => ({
 
 vi.mock("@/lib/organization/service", () => ({
   getOrganizationByWorkspaceId: vi.fn(),
+}));
+
+vi.mock("@/modules/ee/license-check/lib/utils", () => ({
+  getIsQuotasEnabled: vi.fn(),
 }));
 
 vi.mock("@/modules/survey/lib/permission", () => ({
@@ -206,6 +253,22 @@ type TLanguageUpsertReturn = ReturnType<typeof prisma.language.upsert>;
 type TSurveyUpdateArgs = Parameters<typeof prisma.survey.update>[0];
 type TSurveyUpdateReturn = ReturnType<typeof prisma.survey.update>;
 
+/**
+ * What the post-reconcile re-read returns: the stored survey with the last update's data applied. The
+ * update itself selects only the id — the re-read is what the route serializes.
+ */
+const readBackUpdatedSurvey = (data: TSurveyUpdateArgs["data"] | undefined) => ({
+  ...currentSurvey,
+  name: data?.name ?? currentSurvey.name,
+  status: data?.status ?? currentSurvey.status,
+  metadata: data?.metadata ?? currentSurvey.metadata,
+  welcomeCard: data?.welcomeCard ?? currentSurvey.welcomeCard,
+  blocks: data?.blocks ?? currentSurvey.blocks,
+  endings: data?.endings ?? currentSurvey.endings,
+  closeOn: data?.closeOn ?? currentSurvey.closeOn,
+  publishOn: data?.publishOn ?? currentSurvey.publishOn,
+});
+
 describe("patchV3Survey", () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -229,23 +292,13 @@ describe("patchV3Survey", () => {
         }) as TLanguageUpsertReturn;
       }
     );
-    vi.mocked(prisma.survey.update).mockImplementation((args: TSurveyUpdateArgs): TSurveyUpdateReturn => {
-      const data = args.data;
-
-      return Promise.resolve({
-        ...currentSurvey,
-        name: data.name ?? currentSurvey.name,
-        status: data.status ?? currentSurvey.status,
-        metadata: data.metadata ?? currentSurvey.metadata,
-        welcomeCard: data.welcomeCard ?? currentSurvey.welcomeCard,
-        blocks: data.blocks ?? currentSurvey.blocks,
-        endings: data.endings ?? currentSurvey.endings,
-        hiddenFields: data.hiddenFields ?? currentSurvey.hiddenFields,
-        variables: data.variables ?? currentSurvey.variables,
-        closeOn: data.closeOn ?? currentSurvey.closeOn,
-        publishOn: data.publishOn ?? currentSurvey.publishOn,
-      }) as unknown as TSurveyUpdateReturn;
-    });
+    vi.mocked(prisma.survey.update).mockImplementation(
+      (): TSurveyUpdateReturn => Promise.resolve({ id: currentSurvey.id }) as unknown as TSurveyUpdateReturn
+    );
+    vi.mocked(prisma.survey.findUniqueOrThrow).mockImplementation((() =>
+      Promise.resolve(
+        readBackUpdatedSurvey(vi.mocked(prisma.survey.update).mock.calls.at(0)?.[0].data)
+      )) as unknown as typeof prisma.survey.findUniqueOrThrow);
     vi.mocked(prisma.$transaction).mockImplementation(async (callback) => callback(prisma));
     // ENG-1837: the patch reconciles the EmbeddedData rows in the same transaction as the survey
     // write, so the models that reconcile touches have to answer. Left as the real reconcile rather
@@ -280,6 +333,7 @@ describe("patchV3Survey", () => {
       whitelabel: undefined,
     });
     vi.mocked(getExternalUrlsPermission).mockResolvedValue(true);
+    vi.mocked(getIsQuotasEnabled).mockResolvedValue(true);
     vi.mocked(getActionClasses).mockResolvedValue([]);
     vi.mocked(resolveV3ContactsEntitlement).mockResolvedValue({
       resolvedOrganizationId: "org_1",
@@ -292,19 +346,60 @@ describe("patchV3Survey", () => {
     await patchV3Survey(
       currentSurvey,
       { name: "Start from scratch (MCP QA test renamed)" },
-      "req_qa",
-      "org_1"
+      { requestId: "req_qa", organizationId: "org_1" }
     );
 
     expect(prisma.survey.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: currentSurvey.id },
+        where: { id: currentSurvey.id, archivedAt: null },
         data: expect.objectContaining({
           name: "Start from scratch (MCP QA test renamed)",
           metadata: currentSurvey.metadata,
-          hiddenFields: currentSurvey.hiddenFields,
         }),
       })
+    );
+  });
+
+  test("writes a patched language setting and keeps the omitted one as stored", async () => {
+    await patchV3Survey(
+      { ...currentSurvey, showLanguageSwitch: true, autoSelectLanguage: null },
+      { autoSelectLanguage: true },
+      { requestId: "req_1", organizationId: "org_1" }
+    );
+
+    expect(prisma.survey.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ showLanguageSwitch: true, autoSelectLanguage: true }),
+      })
+    );
+  });
+
+  test("clears a stored language setting when the patch sets it to null", async () => {
+    await patchV3Survey(
+      { ...currentSurvey, autoSelectLanguage: true },
+      { autoSelectLanguage: null },
+      { requestId: "req_1", organizationId: "org_1" }
+    );
+
+    expect(prisma.survey.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ autoSelectLanguage: null }) })
+    );
+  });
+
+  test("writes compatible legacy columns and returns the survey read back after the reconcile", async () => {
+    await patchV3Survey(
+      currentSurvey,
+      { hiddenFields: { enabled: true, fieldIds: ["utm_source"] } },
+      { requestId: "req_qa", organizationId: "org_1" }
+    );
+
+    expect(prisma.survey.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ hiddenFields: { enabled: true, fieldIds: ["utm_source"] } }),
+      })
+    );
+    expect(vi.mocked(prisma.survey.findUniqueOrThrow).mock.invocationCallOrder[0]).toBeGreaterThan(
+      vi.mocked(prisma.surveyEmbeddedData.create).mock.invocationCallOrder[0]
     );
   });
 
@@ -314,13 +409,52 @@ describe("patchV3Survey", () => {
    * recall, the logic engine, export columns and the response filters keep reading the pre-patch set.
    * v3 patch is the one write path that did not do this.
    */
+  // ENG-6783: PATCH, the block routes and the MCP tools all end in patchV3Survey, so one test here
+  // proves the lock stops the write for all of them (the cases live in prepare.test.ts).
+  describe("published lock (ENG-6783)", () => {
+    const publishedWithCode = {
+      ...currentSurvey,
+      status: "inProgress",
+      blocks: currentSurvey.blocks.map((block) => ({
+        ...block,
+        elements: block.elements.map((element) => ({ ...element, code: "feedback" })),
+      })),
+    } as unknown as TSurvey;
+
+    test("refuses to change a question code and does not write", async () => {
+      const input = {
+        blocks: [
+          {
+            id: publishedWithCode.blocks[0].id,
+            name: "Main Block",
+            elements: [
+              {
+                id: "satisfaction",
+                type: "openText",
+                headline: { "en-US": "What should we improve?" },
+                required: true,
+                code: "renamed",
+              },
+            ],
+          },
+        ],
+      };
+
+      await expect(
+        patchV3Survey(publishedWithCode, input, { requestId: "req_lock_1", organizationId: "org_1" })
+      ).rejects.toMatchObject({
+        invalidParams: [expect.objectContaining({ code: "immutable_question_code" })],
+      });
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+  });
+
   describe("Embedded Data reconcile", () => {
     test("writes a row and a link for a variable the patch adds", async () => {
       await patchV3Survey(
         currentSurvey,
         { variables: [{ id: "clvar123456789012345678901", name: "score", type: "number", value: 7 }] },
-        "req_qa",
-        "org_1"
+        { requestId: "req_qa", organizationId: "org_1" }
       );
 
       expect(prisma.embeddedData.create).toHaveBeenCalledWith(
@@ -350,8 +484,7 @@ describe("patchV3Survey", () => {
       await patchV3Survey(
         currentSurvey,
         { hiddenFields: { enabled: true, fieldIds: ["utm_source"] } },
-        "req_qa",
-        "org_1"
+        { requestId: "req_qa", organizationId: "org_1" }
       );
 
       expect(prisma.embeddedData.create).toHaveBeenCalledWith(
@@ -377,10 +510,13 @@ describe("patchV3Survey", () => {
           embeddedData: {
             id: "ed_existing",
             surveyId: currentSurvey.id,
+            // Local, so no library key and no lock — the two columns ENG-3228 added to this select.
+            key: null,
             name: "utm_source",
             source: "ingested",
             dataType: "string",
             defaultValue: null,
+            locked: false,
           },
         },
       ] as never);
@@ -388,8 +524,7 @@ describe("patchV3Survey", () => {
       await patchV3Survey(
         { ...currentSurvey, hiddenFields: { enabled: true, fieldIds: ["utm_source"] } } as never,
         { name: "Renamed" },
-        "req_qa",
-        "org_1"
+        { requestId: "req_qa", organizationId: "org_1" }
       );
 
       expect(prisma.surveyEmbeddedData.deleteMany).not.toHaveBeenCalled();
@@ -401,7 +536,11 @@ describe("patchV3Survey", () => {
   // without its own call a survey edited over the v3 API would leave its feedback-source mappings
   // stale — and the API is exactly the surface an automation changes questions from.
   test("reconciles feedback-source mappings against the persisted blocks", async () => {
-    await patchV3Survey(currentSurvey, { name: "renamed via v3" }, "req_qa", "org_1");
+    await patchV3Survey(
+      currentSurvey,
+      { name: "renamed via v3" },
+      { requestId: "req_qa", organizationId: "org_1" }
+    );
 
     // Pinned to the stored blocks rather than `expect.any(Array)`: this patch carries no `blocks` at
     // all, so reconciling against the request payload would pass `undefined` — which `expect.any(Array)`
@@ -411,9 +550,53 @@ describe("patchV3Survey", () => {
     expect(scheduleFeedbackSourceReconciliation).toHaveBeenCalledWith(
       currentSurvey.id,
       currentSurvey.workspaceId,
-      currentSurvey.blocks
+      // ENG-6782: the stored blocks now arrive coded, which is what the write carried.
+      vi.mocked(prisma.survey.update).mock.calls.at(0)?.[0].data.blocks
     );
     expect(currentSurvey.blocks.length).toBeGreaterThan(0);
+  });
+
+  // ENG-6845: inside a caller's transaction nothing is committed when the patch returns, so the
+  // feedback-source reconciliation would diff mappings against blocks that may yet roll back.
+  test("under a caller's transaction, writes through it and reconciles feedback sources only after it commits", async () => {
+    const afterCommitEffects: Array<() => Promise<unknown>> = [];
+
+    await executeV3SurveyPatch({
+      currentSurvey,
+      document: {
+        name: "Renamed in the caller's transaction",
+        status: currentSurvey.status,
+        metadata: currentSurvey.metadata,
+        defaultLanguage: "en-US",
+        languages: [{ code: "en-US", enabled: true }],
+        showLanguageSwitch: null,
+        autoSelectLanguage: null,
+        welcomeCard: currentSurvey.welcomeCard,
+        blocks: currentSurvey.blocks,
+        endings: currentSurvey.endings,
+        startLogic: [],
+        hiddenFields: currentSurvey.hiddenFields,
+        variables: currentSurvey.variables,
+      },
+      languageRequests: [{ code: "en-US", default: true, enabled: true }],
+      requestId: "req_outer_tx",
+      transaction: {
+        tx: prisma as unknown as Prisma.TransactionClient,
+        afterCommit: (effect) => afterCommitEffects.push(effect),
+      },
+    });
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.survey.update).toHaveBeenCalledTimes(1);
+    expect(scheduleFeedbackSourceReconciliation).not.toHaveBeenCalled();
+
+    expect(afterCommitEffects).toHaveLength(1);
+    await afterCommitEffects[0]();
+    expect(scheduleFeedbackSourceReconciliation).toHaveBeenCalledWith(
+      currentSurvey.id,
+      currentSurvey.workspaceId,
+      expect.arrayContaining([expect.objectContaining({ id: currentSurvey.blocks[0].id })])
+    );
   });
 
   test("patches metadata and hidden fields through v3 persistence", async () => {
@@ -425,8 +608,7 @@ describe("patchV3Survey", () => {
         },
         hiddenFields: { enabled: true, fieldIds: ["utm_source"] },
       },
-      "req_qa",
-      "org_1"
+      { requestId: "req_qa", organizationId: "org_1" }
     );
 
     expect(prisma.survey.update).toHaveBeenCalledWith(
@@ -435,9 +617,12 @@ describe("patchV3Survey", () => {
           metadata: {
             title: { default: "MCP QA title" },
           },
-          hiddenFields: { enabled: true, fieldIds: ["utm_source"] },
         }),
       })
+    );
+    // The hidden field has no column any more; it lands as a row.
+    expect(prisma.surveyEmbeddedData.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ storageKey: "utm_source" }) })
     );
   });
 
@@ -465,8 +650,7 @@ describe("patchV3Survey", () => {
           },
         ],
       },
-      "req_1",
-      "org_1"
+      { requestId: "req_1", organizationId: "org_1" }
     );
 
     expect(prisma.language.upsert).toHaveBeenCalledWith(
@@ -477,7 +661,7 @@ describe("patchV3Survey", () => {
     );
     expect(prisma.survey.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: currentSurvey.id },
+        where: { id: currentSurvey.id, archivedAt: null },
         data: expect.objectContaining({
           name: "Updated Feedback",
           metadata: {
@@ -540,11 +724,14 @@ describe("patchV3Survey", () => {
         metadata: currentSurvey.metadata,
         defaultLanguage: "en-US",
         languages: [{ code: "en-US", enabled: true }],
+        showLanguageSwitch: null,
+        autoSelectLanguage: null,
         welcomeCard: currentSurvey.welcomeCard,
         blocks: currentSurvey.blocks,
         endings: currentSurvey.endings,
         hiddenFields: currentSurvey.hiddenFields,
         variables: currentSurvey.variables,
+        startLogic: [],
       },
       languageRequests: [{ code: "en-US", default: true, enabled: true }],
       requestId: "req_1",
@@ -559,6 +746,98 @@ describe("patchV3Survey", () => {
         }),
       })
     );
+  });
+
+  test("carries stored codes over a replaced block by id and codes what is new (ENG-6782)", async () => {
+    const storedElement = {
+      id: "q-single",
+      type: "multipleChoiceSingle",
+      code: "age",
+      headline: { default: "Age?" },
+      required: true,
+      choices: [
+        { id: "c1", code: "1", label: { default: "Young" } },
+        { id: "c2", code: "2", label: { default: "Old" } },
+      ],
+    };
+    const replacedElement = {
+      ...storedElement,
+      code: undefined,
+      choices: [
+        { id: "c1", label: { default: "Young" } },
+        { id: "c2", label: { default: "Old" } },
+        { id: "c3", label: { default: "Ancient" } },
+      ],
+    };
+    const newElement = { id: "q-new", type: "openText", headline: { default: "Why?" }, required: false };
+
+    await executeV3SurveyPatch({
+      currentSurvey: {
+        ...currentSurvey,
+        blocks: [{ id: "block-1", name: "Block 1", elements: [storedElement] }],
+      } as unknown as TSurvey,
+      document: {
+        name: currentSurvey.name,
+        status: currentSurvey.status,
+        metadata: currentSurvey.metadata,
+        defaultLanguage: "en-US",
+        languages: [{ code: "en-US", enabled: true }],
+        showLanguageSwitch: null,
+        autoSelectLanguage: null,
+        welcomeCard: currentSurvey.welcomeCard,
+        blocks: [{ id: "block-1", name: "Block 1", elements: [replacedElement, newElement] }],
+        endings: currentSurvey.endings,
+        hiddenFields: currentSurvey.hiddenFields,
+        variables: currentSurvey.variables,
+        startLogic: [],
+      } as unknown as Parameters<typeof executeV3SurveyPatch>[0]["document"],
+      languageRequests: [{ code: "en-US", default: true, enabled: true }],
+      requestId: "req_1",
+    });
+
+    const written = vi.mocked(prisma.survey.update).mock.calls.at(0)?.[0].data.blocks as {
+      elements: { id: string; code?: string; choices?: { code?: string }[] }[];
+    }[];
+    const [single, added] = written[0].elements;
+    expect(single.code).toBe("age");
+    expect(single.choices?.map((choice) => choice.code)).toEqual(["1", "2", "3"]);
+    expect(added.code).toBe("q1");
+  });
+
+  test("writes the rules before the first question, and none as a database null (ENG-6932)", async () => {
+    const rule = {
+      id: "clrule12345678901234567890",
+      conditions: { id: "clgrp123456789012345678901", connector: "and" as const, conditions: [] },
+      actions: [{ id: "clact123456789012345678901", objective: "jumpToBlock" as const, target: "block-1" }],
+    };
+    const documentWith = (startLogic: (typeof rule)[]) =>
+      ({
+        name: currentSurvey.name,
+        status: currentSurvey.status,
+        metadata: currentSurvey.metadata,
+        defaultLanguage: "en-US",
+        languages: [{ code: "en-US", enabled: true }],
+        showLanguageSwitch: null,
+        autoSelectLanguage: null,
+        welcomeCard: currentSurvey.welcomeCard,
+        blocks: currentSurvey.blocks,
+        endings: currentSurvey.endings,
+        hiddenFields: currentSurvey.hiddenFields,
+        variables: currentSurvey.variables,
+        startLogic,
+      }) as unknown as Parameters<typeof executeV3SurveyPatch>[0]["document"];
+
+    for (const startLogic of [[rule], []]) {
+      await executeV3SurveyPatch({
+        currentSurvey: currentSurvey as TSurvey,
+        document: documentWith(startLogic),
+        languageRequests: [{ code: "en-US", default: true, enabled: true }],
+        requestId: "req_1",
+      });
+    }
+
+    const writes = vi.mocked(prisma.survey.update).mock.calls.map((call) => call[0].data.startLogic);
+    expect(writes).toEqual([[rule], Prisma.DbNull]);
   });
 
   test("rejects setting a non-draft status on an app survey with no triggers", async () => {
@@ -576,12 +855,47 @@ describe("patchV3Survey", () => {
           endings: currentSurvey.endings,
           hiddenFields: currentSurvey.hiddenFields,
           variables: currentSurvey.variables,
+          startLogic: [],
         } as unknown as Parameters<typeof executeV3SurveyPatch>[0]["document"],
         languageRequests: [{ code: "en-US", default: true, enabled: true }],
         requestId: "req_1",
       })
     ).rejects.toBeInstanceOf(V3SurveyReferenceValidationError);
     expect(prisma.survey.update).not.toHaveBeenCalled();
+  });
+
+  test("publishes an app survey with no triggers while a creative opens it (ENG-3994)", async () => {
+    vi.mocked(prisma.creative.findFirst).mockResolvedValueOnce({ id: "creative-1" } as never);
+    vi.mocked(prisma.survey.update).mockResolvedValue({
+      ...currentSurvey,
+      type: "app",
+      triggers: [],
+    } as never);
+
+    await executeV3SurveyPatch({
+      currentSurvey: { ...currentSurvey, type: "app", triggers: [] } as TSurvey,
+      document: {
+        name: currentSurvey.name,
+        status: "inProgress",
+        metadata: currentSurvey.metadata,
+        defaultLanguage: "en-US",
+        languages: [{ code: "en-US", enabled: true }],
+        welcomeCard: currentSurvey.welcomeCard,
+        blocks: currentSurvey.blocks,
+        endings: currentSurvey.endings,
+        hiddenFields: currentSurvey.hiddenFields,
+        variables: currentSurvey.variables,
+        startLogic: [],
+      } as unknown as Parameters<typeof executeV3SurveyPatch>[0]["document"],
+      languageRequests: [{ code: "en-US", default: true, enabled: true }],
+      requestId: "req_1",
+    });
+
+    expect(prisma.creative.findFirst).toHaveBeenCalledWith({
+      where: { surveyId: currentSurvey.id, workspaceId: currentSurvey.workspaceId, archivedAt: null },
+      select: { id: true },
+    });
+    expect(prisma.survey.update).toHaveBeenCalled();
   });
 
   /**
@@ -602,6 +916,7 @@ describe("patchV3Survey", () => {
         endings: currentSurvey.endings,
         hiddenFields: currentSurvey.hiddenFields,
         variables: currentSurvey.variables,
+        startLogic: [],
         ...overrides,
       }) as unknown as Parameters<typeof executeV3SurveyPatch>[0]["document"];
 
@@ -662,13 +977,9 @@ describe("patchV3Survey", () => {
         requestId: "req_1",
       });
 
-      // Nothing is renamed or dropped: the field is written back exactly as it was.
-      expect(prisma.survey.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            hiddenFields: { enabled: true, fieldIds: ["country"] },
-          }),
-        })
+      // Nothing is renamed or dropped: the field is written back exactly as it was, as a row.
+      expect(prisma.surveyEmbeddedData.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ storageKey: "country" }) })
       );
     });
 
@@ -708,7 +1019,11 @@ describe("patchV3Survey", () => {
       surveyUpdated: false,
     });
 
-    const result = await patchV3Survey(currentSurvey, { name: "Updated Feedback" }, "req_1", "org_1");
+    const result = await patchV3Survey(
+      currentSurvey,
+      { name: "Updated Feedback" },
+      { requestId: "req_1", organizationId: "org_1" }
+    );
 
     expect(reconcileDueSurveySchedules).toHaveBeenCalledWith({
       logContext: {
@@ -735,11 +1050,15 @@ describe("patchV3Survey", () => {
       status: "inProgress",
     } as unknown as Awaited<ReturnType<typeof prisma.survey.findUnique>>);
 
-    const result = await patchV3Survey(currentSurvey, { name: "Updated Feedback" }, "req_1", "org_1");
+    const result = await patchV3Survey(
+      currentSurvey,
+      { name: "Updated Feedback" },
+      { requestId: "req_1", organizationId: "org_1" }
+    );
 
     expect(prisma.survey.findUnique).toHaveBeenCalledWith({
       where: { id: currentSurvey.id },
-      select: { id: true },
+      select: { id: true, customCss: true },
     });
     expect(result.name).toBe("Published Feedback");
     expect(result.status).toBe("inProgress");
@@ -755,20 +1074,29 @@ describe("patchV3Survey", () => {
     vi.mocked(prisma.survey.findUnique).mockResolvedValueOnce(null);
 
     await expect(
-      patchV3Survey(currentSurvey, { name: "Updated Feedback" }, "req_1", "org_1")
+      patchV3Survey(
+        currentSurvey,
+        { name: "Updated Feedback" },
+        { requestId: "req_1", organizationId: "org_1" }
+      )
     ).rejects.toThrow(ResourceNotFoundError);
   });
 
   test("maps Prisma persistence errors to database errors", async () => {
+    // Any code but P2025, which the compare-and-set now resolves by re-reading the row.
     vi.mocked(prisma.survey.update).mockRejectedValueOnce(
       new Prisma.PrismaClientKnownRequestError("Survey update failed", {
-        code: "P2025",
+        code: "P2002",
         clientVersion: "test",
       })
     );
 
     await expect(
-      patchV3Survey(currentSurvey, { name: "Updated Feedback" }, "req_1", "org_1")
+      patchV3Survey(
+        currentSurvey,
+        { name: "Updated Feedback" },
+        { requestId: "req_1", organizationId: "org_1" }
+      )
     ).rejects.toThrow(DatabaseError);
   });
 
@@ -776,9 +1104,13 @@ describe("patchV3Survey", () => {
     const unknownError = new Error("unexpected persistence failure");
     vi.mocked(prisma.survey.update).mockRejectedValueOnce(unknownError);
 
-    await expect(patchV3Survey(currentSurvey, { name: "Updated Feedback" }, "req_1", "org_1")).rejects.toBe(
-      unknownError
-    );
+    await expect(
+      patchV3Survey(
+        currentSurvey,
+        { name: "Updated Feedback" },
+        { requestId: "req_1", organizationId: "org_1" }
+      )
+    ).rejects.toBe(unknownError);
   });
 
   test("rejects invalid media URLs before updating the survey", async () => {
@@ -802,12 +1134,102 @@ describe("patchV3Survey", () => {
             },
           ],
         },
-        "req_media",
-        "org_1"
+        { requestId: "req_media", organizationId: "org_1" }
       )
     ).rejects.toThrow(V3SurveyReferenceValidationError);
 
     expect(prisma.survey.update).not.toHaveBeenCalled();
+  });
+
+  describe("typed Embedded Data (ENG-6930)", () => {
+    const planTierRow = {
+      id: "clplantier00000000000000001",
+      key: "plan_tier",
+      name: "Plan tier",
+      source: "ingested",
+      dataType: "string",
+      defaultValue: null,
+      locked: true,
+    };
+
+    beforeEach(() => {
+      vi.mocked(prisma.embeddedData.findMany).mockResolvedValue([planTierRow] as never);
+    });
+
+    test("writes embeddedFields as rows: a library field linked by key, a local one created", async () => {
+      await patchV3Survey(currentSurvey, {
+        embeddedFields: [
+          { key: "plan_tier" },
+          { name: "region", source: "ingested", dataType: "string", defaultValue: "emea", locked: true },
+        ],
+      });
+
+      // The library field is linked, never copied: its row is the workspace's.
+      expect(prisma.surveyEmbeddedData.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ storageKey: "plan_tier", embeddedDataId: planTierRow.id }),
+        })
+      );
+      expect(prisma.embeddedData.create).toHaveBeenCalledTimes(1);
+      expect(prisma.embeddedData.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ key: null, name: "region", defaultValue: "emea", locked: true }),
+        })
+      );
+      // The legacy columns written beside the rows are derived from them.
+      expect(prisma.survey.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { variables: [], hiddenFields: { enabled: true, fieldIds: ["plan_tier", "region"] } },
+        })
+      );
+    });
+
+    test("refuses a library key the workspace does not have, at its path, and writes nothing", async () => {
+      await expect(
+        patchV3Survey(currentSurvey, { embeddedFields: [{ key: "churn_risk" }] })
+      ).rejects.toMatchObject({
+        name: "V3SurveyEmbeddedFieldsError",
+        invalidParams: [expect.objectContaining({ name: "embeddedFields.0.key" })],
+      });
+
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+
+    test("refuses a key the caller sent beside a library key, at its path, and writes nothing", async () => {
+      await expect(
+        patchV3Survey(currentSurvey, { embeddedFields: [{ key: "plan_tier", foo: 1 }] })
+      ).rejects.toMatchObject({
+        invalidParams: [expect.objectContaining({ name: "embeddedFields.0.foo" })],
+      });
+
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+
+    test("refuses both formats when they disagree, and writes nothing", async () => {
+      await expect(
+        patchV3Survey(currentSurvey, {
+          embeddedFields: [{ key: "plan_tier" }],
+          hiddenFields: { enabled: true, fieldIds: ["plan"] },
+        })
+      ).rejects.toMatchObject({
+        name: "V3SurveyEmbeddedFieldsError",
+        invalidParams: [
+          expect.objectContaining({ name: "hiddenFields.fieldIds.0" }),
+          expect.objectContaining({ name: "embeddedFields.0" }),
+        ],
+      });
+
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+
+    test("keeps the legacy-only write exactly as before: no library lookup, no typed rows", async () => {
+      await patchV3Survey(currentSurvey, { hiddenFields: { enabled: true, fieldIds: ["utm_source"] } });
+
+      expect(prisma.embeddedData.findMany).not.toHaveBeenCalled();
+      expect(prisma.embeddedData.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ name: "utm_source", locked: false }) })
+      );
+    });
   });
 
   test("rejects invalid patch documents before updating", async () => {
@@ -843,7 +1265,11 @@ describe("patchV3Survey", () => {
       endings: externalUrlBody.endings,
     } as TSurvey;
 
-    await patchV3Survey(currentSurveyWithExternalUrls, { name: "Renamed Feedback" }, "req_2", "org_1");
+    await patchV3Survey(
+      currentSurveyWithExternalUrls,
+      { name: "Renamed Feedback" },
+      { requestId: "req_2", organizationId: "org_1" }
+    );
 
     expect(getExternalUrlsPermission).not.toHaveBeenCalled();
     expect(prisma.survey.update).toHaveBeenCalledWith(
@@ -866,8 +1292,7 @@ describe("patchV3Survey", () => {
         {
           blocks: [createExternalCtaBlock()],
         },
-        "req_2",
-        "org_1"
+        { requestId: "req_2", organizationId: "org_1" }
       )
     ).rejects.toThrow(V3SurveyWritePermissionError);
 
@@ -889,8 +1314,7 @@ describe("patchV3Survey", () => {
             },
           ],
         },
-        "req_2",
-        "org_1"
+        { requestId: "req_2", organizationId: "org_1" }
       )
     ).rejects.toThrow(V3SurveyWritePermissionError);
 
@@ -906,7 +1330,7 @@ describe("patchV3Survey", () => {
         {
           blocks: [createExternalCtaBlock()],
         },
-        "req_2"
+        { requestId: "req_2" }
       )
     ).rejects.toThrow(`Unable to verify external URL permissions for workspaceId: ${workspaceId}`);
 
@@ -957,11 +1381,11 @@ describe("patchV3Survey", () => {
           distribution: {
             displayOption: "displayMultiple",
             recontactDays: 14,
+            keepEndingCardOpen: true,
             triggers: [{ actionClassId: actionClass.id }],
           },
         },
-        "req_app_patch_1",
-        "org_1"
+        { requestId: "req_app_patch_1", organizationId: "org_1" }
       );
 
       expect(prisma.survey.update).toHaveBeenCalledWith(
@@ -969,6 +1393,7 @@ describe("patchV3Survey", () => {
           data: expect.objectContaining({
             displayOption: "displayMultiple",
             recontactDays: 14,
+            keepEndingCardOpen: true,
             triggers: { create: [{ actionClassId: actionClass.id }] },
           }),
         })
@@ -976,7 +1401,11 @@ describe("patchV3Survey", () => {
     });
 
     test("preserves omitted app fields under replacement merge", async () => {
-      await patchV3Survey(appCurrentSurvey, { name: "Renamed" }, "req_app_patch_2", "org_1");
+      await patchV3Survey(
+        appCurrentSurvey,
+        { name: "Renamed" },
+        { requestId: "req_app_patch_2", organizationId: "org_1" }
+      );
 
       expect(prisma.survey.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -989,12 +1418,147 @@ describe("patchV3Survey", () => {
       );
     });
 
+    describe("show conditions", () => {
+      const finished = {
+        id: "cnd1",
+        leftOperand: { type: "visit", value: "timeOnSite" },
+        operator: "isGreaterThanOrEqual",
+        rightOperand: { type: "static", value: 30 },
+      };
+      const unfinished = {
+        id: "cnd2",
+        leftOperand: { type: "page", value: "currentUrl" },
+        operator: "pathIsAnyOf",
+      };
+      const surveyWithDraftRow = {
+        ...appCurrentSurvey,
+        showConditions: { id: "grp1", connector: "and", conditions: [finished, unfinished] },
+      } as unknown as TSurvey;
+
+      test("a patch that leaves them alone keeps a draft's unfinished row", async () => {
+        // The patch reads the survey without that row; writing its copy back would delete the row.
+        await patchV3Survey(
+          surveyWithDraftRow,
+          { name: "Renamed" },
+          { requestId: "req_app_patch_sc1", organizationId: "org_1" }
+        );
+
+        const { data } = vi.mocked(prisma.survey.update).mock.calls[0][0];
+        expect(data.name).toBe("Renamed");
+        expect(data).not.toHaveProperty("showConditions");
+      });
+
+      test("a patch that changes them writes them, and null clears them", async () => {
+        vi.mocked(getActionClasses).mockResolvedValue([]);
+        const onPricing = {
+          id: "grp2",
+          connector: "and",
+          conditions: [
+            {
+              id: "cnd3",
+              leftOperand: { type: "page", value: "currentUrl" },
+              operator: "pathIsAnyOf",
+              rightOperand: { type: "static", value: ["/pricing"] },
+            },
+          ],
+        };
+
+        await patchV3Survey(
+          surveyWithDraftRow,
+          { distribution: { triggers: [], showConditions: onPricing } },
+          { requestId: "req_app_patch_sc2", organizationId: "org_1" }
+        );
+        await patchV3Survey(
+          surveyWithDraftRow,
+          { distribution: { triggers: [], showConditions: null } },
+          { requestId: "req_app_patch_sc3", organizationId: "org_1" }
+        );
+
+        const writes = vi.mocked(prisma.survey.update).mock.calls.map(([args]) => args.data.showConditions);
+        expect(writes).toEqual([onPricing, Prisma.DbNull]);
+      });
+
+      test("an explicit null clears a draft that holds only an unfinished row", async () => {
+        vi.mocked(getActionClasses).mockResolvedValue([]);
+        const onlyUnfinished = {
+          ...appCurrentSurvey,
+          showConditions: { id: "grp1", connector: "and", conditions: [unfinished] },
+        } as unknown as TSurvey;
+
+        await patchV3Survey(
+          onlyUnfinished,
+          { distribution: { triggers: [], showConditions: null } },
+          { requestId: "req_app_patch_sc4", organizationId: "org_1" }
+        );
+
+        expect(vi.mocked(prisma.survey.update).mock.calls[0][0].data.showConditions).toBe(Prisma.DbNull);
+      });
+
+      test("taking a draft live with an unfinished row is refused, not published wider", async () => {
+        // Dropping the row would turn "AND[time ≥ 30, unfinished]" into just "time ≥ 30".
+        vi.mocked(getActionClasses).mockResolvedValue([actionClass]);
+        const draftWithTrigger = { ...surveyWithDraftRow, triggers: [{ actionClass }] } as unknown as TSurvey;
+
+        const error = await patchV3Survey(
+          draftWithTrigger,
+          { status: "inProgress" },
+          { requestId: "req_app_patch_sc5", organizationId: "org_1" }
+        ).catch((e: unknown) => e);
+
+        expect(error).toBeInstanceOf(V3SurveyReferenceValidationError);
+        expect((error as V3SurveyReferenceValidationError).invalidParams[0].name).toBe(
+          "distribution.showConditions"
+        );
+        expect(prisma.survey.update).not.toHaveBeenCalled();
+      });
+
+      test("taking a draft live with only finished rows writes them", async () => {
+        vi.mocked(getActionClasses).mockResolvedValue([actionClass]);
+        const finishedDraft = {
+          ...appCurrentSurvey,
+          triggers: [{ actionClass }],
+          showConditions: { id: "grp1", connector: "and", conditions: [finished] },
+        } as unknown as TSurvey;
+
+        await patchV3Survey(
+          finishedDraft,
+          { status: "inProgress" },
+          { requestId: "req_app_patch_sc6", organizationId: "org_1" }
+        );
+
+        expect(vi.mocked(prisma.survey.update).mock.calls[0][0].data.showConditions).toEqual({
+          id: "grp1",
+          connector: "and",
+          conditions: [finished],
+        });
+      });
+
+      test("sending distribution with the publish replaces the unfinished row instead", async () => {
+        vi.mocked(getActionClasses).mockResolvedValue([actionClass]);
+        const draftWithTrigger = { ...surveyWithDraftRow, triggers: [{ actionClass }] } as unknown as TSurvey;
+
+        await patchV3Survey(
+          draftWithTrigger,
+          {
+            status: "inProgress",
+            distribution: { triggers: [{ actionClassId: actionClass.id }], showConditions: null },
+          },
+          { requestId: "req_app_patch_sc7", organizationId: "org_1" }
+        );
+
+        expect(vi.mocked(prisma.survey.update).mock.calls[0][0].data.showConditions).toBe(Prisma.DbNull);
+      });
+    });
+
     test("updates segment filters when targeting changes and contacts are enabled", async () => {
       vi.mocked(areV3SurveyTargetingFiltersEqual).mockReturnValue(false);
       // Run the interactive transaction with a DISTINCT tx client so the assertions prove both writes
       // go through it (not the global prisma) — i.e. that the update really is transactional.
       const tx = {
-        survey: { update: vi.fn(vi.mocked(prisma.survey.update).getMockImplementation()) },
+        survey: {
+          update: vi.fn(vi.mocked(prisma.survey.update).getMockImplementation()),
+          findUniqueOrThrow: vi.fn(vi.mocked(prisma.survey.findUniqueOrThrow).getMockImplementation()),
+        },
         segment: { update: vi.fn() },
         // ENG-1837: the EmbeddedData reconcile is part of the same transaction, so it has to be
         // reachable on the tx client — and the assertions below prove it used that client.
@@ -1017,8 +1581,7 @@ describe("patchV3Survey", () => {
       await patchV3Survey(
         appCurrentSurvey,
         { targeting: { filters: attributeFilters } },
-        "req_app_patch_3",
-        "org_1"
+        { requestId: "req_app_patch_3", organizationId: "org_1" }
       );
 
       expect(resolveV3ContactsEntitlement).toHaveBeenCalledWith(workspaceId, "org_1");
@@ -1045,8 +1608,7 @@ describe("patchV3Survey", () => {
         patchV3Survey(
           segmentlessSurvey,
           { targeting: { filters: attributeFilters } },
-          "req_app_no_segment",
-          "org_1"
+          { requestId: "req_app_no_segment", organizationId: "org_1" }
         )
       ).rejects.toThrow(V3SurveyReferenceValidationError);
 
@@ -1065,8 +1627,7 @@ describe("patchV3Survey", () => {
         patchV3Survey(
           appCurrentSurvey,
           { targeting: { filters: attributeFilters } },
-          "req_app_patch_4",
-          "org_1"
+          { requestId: "req_app_patch_4", organizationId: "org_1" }
         )
       ).rejects.toThrow(V3SurveyWritePermissionError);
 
@@ -1081,12 +1642,524 @@ describe("patchV3Survey", () => {
         patchV3Survey(
           appCurrentSurvey,
           { distribution: { triggers: [{ actionClassId: actionClass.id }] } },
-          "req_app_patch_5",
-          "org_1"
+          { requestId: "req_app_patch_5", organizationId: "org_1" }
         )
       ).rejects.toThrow(V3SurveyReferenceValidationError);
 
       expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("custom CSS (ENG-3641)", () => {
+    const storedCss = {
+      light: { source: "a{}", compiled: "@layer fb-survey{a}" },
+      dark: { source: "b{}", compiled: "@layer fb-survey-dark{b}" },
+      processorVersion: 3,
+    };
+    const surveyWithCss = { ...currentSurvey, customCss: storedCss } as unknown as TSurvey;
+    const lastUpdateData = () => vi.mocked(prisma.survey.update).mock.calls.at(0)?.[0].data ?? {};
+
+    beforeEach(() => {
+      vi.mocked(cache.del).mockResolvedValue({ ok: true, data: undefined });
+      vi.mocked(getCustomCssPlanAllowed).mockResolvedValue(true);
+      vi.mocked(processCustomCss).mockImplementation((({ input }: { input: TCustomCssInput }) => ({
+        ok: true,
+        compiled: {
+          light: input.light ? `C(${input.light})` : null,
+          dark: input.dark ? `CD(${input.dark})` : null,
+        },
+        warnings: [],
+        processorVersion: 3,
+      })) as never);
+    });
+
+    test("an unrelated patch on a downgraded organization keeps the CSS without a plan check or a write", async () => {
+      vi.mocked(getCustomCssPlanAllowed).mockResolvedValue(false);
+      const report: TV3SurveyWriteReport = {};
+
+      await patchV3Survey(
+        surveyWithCss,
+        { name: "Renamed" },
+        { requestId: "req", organizationId: "org_1", report }
+      );
+
+      expect(getCustomCssPlanAllowed).not.toHaveBeenCalled();
+      expect(processCustomCss).not.toHaveBeenCalled();
+      expect(lastUpdateData()).not.toHaveProperty("customCss");
+      expect(cache.del).not.toHaveBeenCalled();
+      expect(report.customCssWarnings).toBeUndefined();
+    });
+
+    test("echoing the GET source back is unchanged, whitespace-only fields included", async () => {
+      vi.mocked(getCustomCssPlanAllowed).mockResolvedValue(false);
+
+      await patchV3Survey(
+        surveyWithCss,
+        { name: "Renamed", customCss: { light: "a{}", dark: "b{}" } },
+        { requestId: "req", organizationId: "org_1" }
+      );
+
+      expect(getCustomCssPlanAllowed).not.toHaveBeenCalled();
+      expect(lastUpdateData()).not.toHaveProperty("customCss");
+    });
+
+    test("an addition without the plan is refused and nothing is written", async () => {
+      vi.mocked(getCustomCssPlanAllowed).mockResolvedValue(false);
+
+      await expect(
+        patchV3Survey(
+          currentSurvey,
+          { customCss: { light: "a{}", dark: null } },
+          { requestId: "req", organizationId: "org_1" }
+        )
+      ).rejects.toBeInstanceOf(V3CustomCssPlanRequiredError);
+      expect(processCustomCss).not.toHaveBeenCalled();
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+
+    test("an edit is processed, stored with its trusted output, reported and invalidates the workspace state", async () => {
+      const report: TV3SurveyWriteReport = {};
+
+      await patchV3Survey(
+        surveyWithCss,
+        { customCss: { light: "a{color:red}", dark: "b{}" } },
+        { requestId: "req", organizationId: "org_1", report }
+      );
+
+      expect(processCustomCss).toHaveBeenCalledWith({
+        scope: "survey",
+        input: { light: "a{color:red}", dark: "b{}" },
+      });
+      expect(lastUpdateData()).toMatchObject({
+        customCss: {
+          light: { source: "a{color:red}", compiled: "C(a{color:red})" },
+          dark: { source: "b{}", compiled: "CD(b{})" },
+          processorVersion: 3,
+        },
+      });
+      expect(report.customCssWarnings).toEqual([]);
+      expect(cache.del).toHaveBeenCalledWith([`fb:env:${workspaceId}:state`]);
+    });
+
+    test("clearing is allowed without the plan", async () => {
+      vi.mocked(getCustomCssPlanAllowed).mockResolvedValue(false);
+
+      await patchV3Survey(surveyWithCss, { customCss: null }, { requestId: "req", organizationId: "org_1" });
+
+      expect(lastUpdateData().customCss).toBe(Prisma.DbNull);
+      expect(processCustomCss).not.toHaveBeenCalled();
+    });
+
+    test("removing one field is a removal too, keeping the other's output", async () => {
+      vi.mocked(getCustomCssPlanAllowed).mockResolvedValue(false);
+
+      await patchV3Survey(
+        surveyWithCss,
+        { customCss: { light: null, dark: "b{}" } },
+        { requestId: "req", organizationId: "org_1" }
+      );
+
+      expect(lastUpdateData().customCss).toEqual({ light: null, dark: storedCss.dark, processorVersion: 3 });
+    });
+
+    test("malformed CSS is rejected and the stored CSS is untouched", async () => {
+      vi.mocked(processCustomCss).mockReturnValue({
+        ok: false,
+        errors: [
+          {
+            code: "syntax_error",
+            scope: "survey",
+            appearance: "light",
+            line: 1,
+            column: 3,
+            reason: "Unexpected",
+          },
+        ],
+      });
+
+      await expect(
+        patchV3Survey(
+          surveyWithCss,
+          { customCss: { light: "a{", dark: null } },
+          { requestId: "req", organizationId: "org_1" }
+        )
+      ).rejects.toBeInstanceOf(V3CustomCssInvalidError);
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+
+    test("an edit spends one unit of the caller's custom CSS budget; a spent budget writes nothing", async () => {
+      const edit = { customCss: { light: "a{color:red}", dark: "b{}" } };
+      const patch = () =>
+        patchV3Survey(surveyWithCss, edit, {
+          requestId: "req",
+          organizationId: "org_1",
+          report: {},
+          customCssPrincipal: "user_1",
+        });
+
+      await patch();
+      expect(applyRateLimit).toHaveBeenCalledTimes(1);
+      expect(applyRateLimit).toHaveBeenCalledWith(rateLimitConfigs.api.v3CustomCss, "user_1");
+
+      vi.mocked(prisma.survey.update).mockClear();
+      vi.mocked(processCustomCss).mockClear();
+      vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("Slow down", 30));
+      await expect(patch()).rejects.toBeInstanceOf(TooManyRequestsError);
+      expect(processCustomCss).not.toHaveBeenCalled();
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+
+    test("unchanged CSS and removals spend nothing from the custom CSS budget", async () => {
+      const patch = (input: unknown) =>
+        patchV3Survey(surveyWithCss, input, {
+          requestId: "req",
+          organizationId: "org_1",
+          report: {},
+          customCssPrincipal: "user_1",
+        });
+
+      await patch({ name: "Renamed" });
+      await patch({ customCss: { light: "a{}", dark: "b{}" } });
+      await patch({ customCss: { light: null, dark: "b{}" } });
+      await patch({ customCss: null });
+
+      expect(applyRateLimit).not.toHaveBeenCalled();
+    });
+
+    test("caller-supplied compiled output is rejected by the strict patch schema", async () => {
+      await expect(
+        patchV3Survey(
+          surveyWithCss,
+          { customCss: { light: "a{}", dark: null, compiled: "#fbjs{position:fixed}" } },
+          { requestId: "req", organizationId: "org_1" }
+        )
+      ).rejects.toBeInstanceOf(V3SurveyReferenceValidationError);
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // ENG-6934: PATCH, the block routes and the MCP tools all end in patchV3Survey, so the matrix ids
+  // written here are written for all of them.
+  describe("matrix conditions by id (ENG-6934)", () => {
+    const grid = (rows: string[], columns: string[]) => ({
+      id: "grid",
+      type: "matrix" as const,
+      headline: { "en-US": "Rate each service" },
+      required: false,
+      shuffleOption: "none" as const,
+      rows: rows.map((id) => ({ id, label: { "en-US": id } })),
+      columns: columns.map((id) => ({ id, label: { "en-US": id } })),
+    });
+    const blocksWith = (
+      matrix: ReturnType<typeof grid>,
+      meta: Record<string, string>,
+      rightOperand: Record<string, unknown>
+    ) => [
+      {
+        id: "clbk1234567890123456789012",
+        name: "Ratings",
+        elements: [matrix],
+        logic: [
+          {
+            id: "clrule34567890123456789012",
+            conditions: {
+              id: "clgrp234567890123456789012",
+              connector: "and",
+              conditions: [
+                {
+                  id: "clcond4567890123456789012",
+                  leftOperand: { type: "element", value: "grid", meta },
+                  operator: "equals",
+                  rightOperand: { type: "static", ...rightOperand },
+                },
+              ],
+            },
+            actions: [{ id: "clact234567890123456789012", objective: "requireAnswer", target: "why" }],
+          },
+        ],
+      },
+      {
+        id: "clbk2234567890123456789012",
+        name: "Follow-up",
+        elements: [{ id: "why", type: "openText", headline: { "en-US": "Why?" }, required: false }],
+      },
+    ];
+    const writtenCondition = () => {
+      const data = vi.mocked(prisma.survey.update).mock.calls.at(0)?.[0].data as {
+        blocks: { logic?: { conditions: { conditions: unknown[] } }[] }[];
+      };
+      return data.blocks[0].logic?.[0].conditions.conditions[0];
+    };
+
+    test("writes the ids next to positions a caller sent alone", async () => {
+      const blocks = blocksWith(grid(["netflix", "disney"], ["poor", "good"]), { row: "1" }, { value: "0" });
+
+      await patchV3Survey(currentSurvey, { blocks }, { requestId: "req_matrix_1", organizationId: "org_1" });
+
+      expect(writtenCondition()).toMatchObject({
+        leftOperand: { meta: { row: "1", rowId: "disney" } },
+        rightOperand: { value: "0", columnId: "poor" },
+      });
+    });
+
+    test("accepts the id form and rewrites stale positions from the ids", async () => {
+      const blocks = blocksWith(
+        grid(["disney", "netflix"], ["good", "poor"]),
+        { row: "0", rowId: "netflix" },
+        { value: "1", columnId: "good" }
+      );
+
+      await patchV3Survey(currentSurvey, { blocks }, { requestId: "req_matrix_2", organizationId: "org_1" });
+
+      expect(writtenCondition()).toMatchObject({
+        leftOperand: { meta: { row: "1", rowId: "netflix" } },
+        rightOperand: { value: "0", columnId: "good" },
+      });
+    });
+
+    test("re-syncs the survey's quotas after a row reorder, in the same transaction", async () => {
+      const quotaCondition = (row: string) => ({
+        id: "qc1",
+        leftOperand: { type: "element", value: "grid", meta: { row, rowId: "netflix" } },
+        operator: "equals",
+        rightOperand: { type: "static", value: "0", columnId: "good" },
+      });
+      vi.mocked(prisma.surveyQuota.findMany).mockResolvedValueOnce([
+        { id: "quota_1", logic: { connector: "and", conditions: [quotaCondition("0")] } },
+      ] as never);
+      const blocks = blocksWith(
+        grid(["disney", "netflix"], ["good", "poor"]),
+        { row: "1", rowId: "netflix" },
+        { value: "0", columnId: "good" }
+      );
+
+      await patchV3Survey(
+        currentSurvey,
+        { blocks },
+        { requestId: "req_matrix_quota", organizationId: "org_1" }
+      );
+
+      expect(prisma.surveyQuota.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "quota_1" },
+          data: { logic: { connector: "and", conditions: [quotaCondition("1")] } },
+        })
+      );
+    });
+
+    test("leaves the quotas alone where quotas are not licensed", async () => {
+      vi.mocked(getIsQuotasEnabled).mockResolvedValue(false);
+      const blocks = blocksWith(
+        grid(["disney", "netflix"], ["good", "poor"]),
+        { row: "1", rowId: "netflix" },
+        { value: "0", columnId: "good" }
+      );
+
+      await patchV3Survey(
+        currentSurvey,
+        { blocks },
+        { requestId: "req_matrix_unlicensed", organizationId: "org_1" }
+      );
+
+      expect(getIsQuotasEnabled).toHaveBeenCalledWith("org_1");
+      expect(prisma.surveyQuota.findMany).not.toHaveBeenCalled();
+      expect(prisma.surveyQuota.update).not.toHaveBeenCalled();
+    });
+
+    test("refuses a column id the matrix doesn't have, with its path, and does not write", async () => {
+      const blocks = blocksWith(
+        grid(["netflix", "disney"], ["poor", "good"]),
+        { row: "0", rowId: "netflix" },
+        { value: "1", columnId: "great" }
+      );
+
+      await expect(
+        patchV3Survey(currentSurvey, { blocks }, { requestId: "req_matrix_3", organizationId: "org_1" })
+      ).rejects.toMatchObject({
+        invalidParams: [
+          expect.objectContaining({
+            name: "blocks.0.logic.0.conditions.conditions.0.rightOperand.columnId",
+          }),
+        ],
+      });
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("optimistic concurrency (ENG-3069)", () => {
+    const expectedUpdatedAt = new Date("2026-04-21T10:00:00.000Z");
+    const movedOnAt = new Date("2026-04-21T11:30:00.000Z");
+
+    const rejectWithP2025 = (): void => {
+      vi.mocked(prisma.survey.update).mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError("no rows", { code: "P2025", clientVersion: "7" })
+      );
+    };
+
+    test("passes the expected updatedAt into the update's where clause", async () => {
+      await patchV3Survey(
+        currentSurvey,
+        { name: "CAS" },
+        { requestId: "req_cas_1", organizationId: "org_1", precondition: { expectedUpdatedAt } }
+      );
+
+      expect(prisma.survey.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: currentSurvey.id, archivedAt: null, updatedAt: expectedUpdatedAt },
+        })
+      );
+    });
+
+    test("omits updatedAt from the where clause when no precondition is supplied", async () => {
+      await patchV3Survey(
+        currentSurvey,
+        { name: "no CAS" },
+        { requestId: "req_cas_2", organizationId: "org_1" }
+      );
+
+      expect(prisma.survey.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: currentSurvey.id, archivedAt: null } })
+      );
+    });
+
+    test("rejects a stale precondition before attempting the write", async () => {
+      const stale = new Date("2026-04-20T09:00:00.000Z");
+
+      await expect(
+        patchV3Survey(
+          currentSurvey,
+          { name: "stale" },
+          { requestId: "req_cas_3", organizationId: "org_1", precondition: { expectedUpdatedAt: stale } }
+        )
+      ).rejects.toMatchObject({
+        name: "V3SurveyStaleError",
+        detectedAt: "read",
+        expectedUpdatedAt: stale,
+        currentUpdatedAt: currentSurvey.updatedAt,
+      });
+
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+
+    test("takes the precondition from a round-tripped body updatedAt when none is passed explicitly", async () => {
+      // The PATCH route's whole promise: GET output is a valid PATCH body, and the echoed `updatedAt`
+      // is the compare-and-set. That contract is one `??` in patchV3Survey; every other test here
+      // feeds the precondition through the explicit argument, so without this one deleting the
+      // fallback would leave the suite green and every round-tripping client silently unguarded.
+      await patchV3Survey(
+        currentSurvey,
+        { name: "CAS from body", updatedAt: "2026-04-21T10:00:00.000Z" },
+        { requestId: "req_cas_body_1", organizationId: "org_1" }
+      );
+
+      expect(prisma.survey.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: currentSurvey.id, archivedAt: null, updatedAt: expectedUpdatedAt },
+        })
+      );
+    });
+
+    test("rejects a stale round-tripped body updatedAt before attempting the write", async () => {
+      const stale = new Date("2026-04-20T09:00:00.000Z");
+
+      await expect(
+        patchV3Survey(
+          currentSurvey,
+          { name: "stale from body", updatedAt: stale.toISOString() },
+          { requestId: "req_cas_body_2", organizationId: "org_1" }
+        )
+      ).rejects.toMatchObject({
+        name: "V3SurveyStaleError",
+        detectedAt: "read",
+        expectedUpdatedAt: stale,
+        currentUpdatedAt: currentSurvey.updatedAt,
+      });
+
+      expect(prisma.survey.update).not.toHaveBeenCalled();
+    });
+
+    test("an explicit precondition wins over the body's updatedAt", async () => {
+      // The block endpoints pass it explicitly; a body echo must not be able to weaken it.
+      const stale = new Date("2026-04-20T09:00:00.000Z");
+
+      await expect(
+        patchV3Survey(
+          currentSurvey,
+          { name: "x", updatedAt: "2026-04-21T10:00:00.000Z" },
+          { requestId: "req_cas_body_3", organizationId: "org_1", precondition: { expectedUpdatedAt: stale } }
+        )
+      ).rejects.toMatchObject({ name: "V3SurveyStaleError", expectedUpdatedAt: stale });
+    });
+
+    test("turns a P2025 under a precondition into a stale error carrying the live updatedAt", async () => {
+      // The row moved on between the authorized read and the compare-and-set — the race the early
+      // check cannot see.
+      rejectWithP2025();
+      vi.mocked(prisma.survey.findFirst).mockResolvedValue({ updatedAt: movedOnAt } as never);
+
+      await expect(
+        patchV3Survey(
+          currentSurvey,
+          { name: "raced" },
+          { requestId: "req_cas_4", organizationId: "org_1", precondition: { expectedUpdatedAt } }
+        )
+      ).rejects.toMatchObject({
+        name: "V3SurveyStaleError",
+        detectedAt: "write",
+        currentUpdatedAt: movedOnAt,
+      });
+
+      expect(prisma.survey.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: currentSurvey.id, workspaceId: currentSurvey.workspaceId },
+        })
+      );
+    });
+
+    test("turns a P2025 into not-found when the survey is actually gone", async () => {
+      rejectWithP2025();
+      vi.mocked(prisma.survey.findFirst).mockResolvedValue(null as never);
+
+      await expect(
+        patchV3Survey(
+          currentSurvey,
+          { name: "deleted" },
+          { requestId: "req_cas_5", organizationId: "org_1", precondition: { expectedUpdatedAt } }
+        )
+      ).rejects.toBeInstanceOf(ResourceNotFoundError);
+    });
+
+    test("turns a P2025 on a survey archived mid-request into the archived error, precondition or not", async () => {
+      // The UPDATE's `where` carries `archivedAt: null`, so an archive that lands after the authorized
+      // read misses the row instead of being written straight back to inProgress.
+      rejectWithP2025();
+      vi.mocked(prisma.survey.findFirst).mockResolvedValue({
+        updatedAt: currentSurvey.updatedAt,
+        archivedAt: new Date("2026-04-21T10:30:00.000Z"),
+      } as never);
+
+      await expect(
+        patchV3Survey(currentSurvey, { name: "x" }, { requestId: "req_cas_6", organizationId: "org_1" })
+      ).rejects.toBeInstanceOf(V3SurveyArchivedError);
+    });
+
+    test("keeps a P2025 on a live, unarchived, unconditional row a database error", async () => {
+      rejectWithP2025();
+      vi.mocked(prisma.survey.findFirst).mockResolvedValue({
+        updatedAt: currentSurvey.updatedAt,
+        archivedAt: null,
+      } as never);
+
+      await expect(
+        patchV3Survey(currentSurvey, { name: "x" }, { requestId: "req_cas_7", organizationId: "org_1" })
+      ).rejects.toBeInstanceOf(DatabaseError);
+    });
+
+    test("V3SurveyStaleError carries both timestamps for the 409 body", () => {
+      const err = new V3SurveyStaleError(expectedUpdatedAt, movedOnAt, "write");
+      expect(err.name).toBe("V3SurveyStaleError");
+      expect(err.expectedUpdatedAt).toBe(expectedUpdatedAt);
+      expect(err.currentUpdatedAt).toBe(movedOnAt);
     });
   });
 });

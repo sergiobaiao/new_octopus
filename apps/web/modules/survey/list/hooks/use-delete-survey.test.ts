@@ -10,7 +10,7 @@ import { TSurveyListPage } from "@/modules/survey/list/lib/v3-surveys-client";
 import { useDeleteSurvey } from "./use-delete-survey";
 
 function createWrapper(queryClient: QueryClient) {
-  const Wrapper = ({ children }: { children: ReactNode }) =>
+  const Wrapper = ({ children }: { readonly children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
 
   Wrapper.displayName = "UseDeleteSurveyTestWrapper";
@@ -37,6 +37,9 @@ function createQueryData(): { pages: TSurveyListPage[]; pageParams: (string | nu
             completedResponseCount: 0,
             creator: { name: "Alice" },
             singleUse: null,
+            visibility: "workspace",
+            owner: { name: "Test User" },
+            access: { via: "workspace", canManageVisibility: false },
           },
         ],
         meta: {
@@ -83,6 +86,7 @@ describe("useDeleteSurvey", () => {
         name: "",
         status: [],
         type: [],
+        visibility: [],
         sortBy: "relevance",
       },
     });
@@ -141,6 +145,7 @@ describe("useDeleteSurvey", () => {
         name: "",
         status: [],
         type: [],
+        visibility: [],
         sortBy: "relevance",
       },
     });

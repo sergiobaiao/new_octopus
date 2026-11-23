@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { pruneOptionLabels, resolveOptionGrouping } from "./option-grouping";
+import {
+  pruneChartLabels,
+  pruneOptionLabels,
+  resolveDatasetValueLabels,
+  resolveOptionGrouping,
+} from "./option-grouping";
 
 const mocks = vi.hoisted(() => ({
   getFeedbackSourcesWithMappings: vi.fn(),
@@ -39,7 +44,7 @@ const givenWorkspace = (
   entries: { mapping: Record<string, unknown>; survey: ReturnType<typeof surveyWith> }[]
 ) => {
   mocks.getFeedbackSourcesWithMappings.mockResolvedValue([
-    { formbricksMappings: entries.map((e) => e.mapping) },
+    { feedbackDirectoryId: "dir-1", formbricksMappings: entries.map((e) => e.mapping) },
   ]);
   mocks.getSurvey.mockImplementation(
     async (surveyId: string) => entries.find((e) => e.survey.id === surveyId)?.survey
@@ -76,7 +81,7 @@ describe("resolveOptionGrouping", () => {
       filters: [],
     };
 
-    const result = await resolveOptionGrouping(query as never, "workspace-1");
+    const result = await resolveOptionGrouping(query as never, "workspace-1", "dir-1");
 
     expect(result.optionLabels).toBeUndefined();
     expect(result.rewrittenQuery).toBe(query);
@@ -99,7 +104,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldIdFilter("el-single")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toEqual({ "c-in": "India", "c-nl": "Netherlands" });
@@ -123,7 +129,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldIdFilter("el-multi__c-cricket")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toEqual({ "c-cricket": "Cricket", "c-hockey": "Hockey" });
@@ -148,7 +155,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldLabelFilter("Nationality")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toEqual({ "c-in": "India", "c-pk": "Pakistan" });
@@ -170,7 +178,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldIdFilter("el-single")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toEqual({ "c-in": "India", other: "Other" });
@@ -192,7 +201,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldIdFilter("el-single")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toEqual({ "c-in": "India", other: "Somewhere else" });
@@ -225,7 +235,7 @@ describe("resolveOptionGrouping", () => {
       },
     ]);
 
-    const result = await resolveOptionGrouping(groupByValueId() as never, "workspace-1");
+    const result = await resolveOptionGrouping(groupByValueId() as never, "workspace-1", "dir-1");
 
     expect(result.optionLabels?.other).toBe("Other");
     // The ids that *can* be attributed are still labelled from their own survey.
@@ -255,7 +265,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldIdFilter("el-a")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels?.other).toBe("Somewhere else");
@@ -281,7 +292,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldIdFilter("el-matrix__r-1")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toEqual({ "col-good": "Good", "col-bad": "Bad" });
@@ -304,7 +316,7 @@ describe("resolveOptionGrouping", () => {
       },
     ]);
 
-    const result = await resolveOptionGrouping(groupByValueId() as never, "workspace-1");
+    const result = await resolveOptionGrouping(groupByValueId() as never, "workspace-1", "dir-1");
 
     expect(result.optionLabels).toEqual({ "c-in": "India", "c-cricket": "Cricket" });
   });
@@ -323,7 +335,8 @@ describe("resolveOptionGrouping", () => {
         dimensions: ["FeedbackRecords.valueText"],
         filters: [],
       } as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toBeUndefined();
@@ -344,7 +357,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldIdFilter("el-open")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toBeUndefined();
@@ -370,7 +384,8 @@ describe("resolveOptionGrouping", () => {
 
     const result = await resolveOptionGrouping(
       groupByValueId([fieldIdFilter("el-rank__c-1")]) as never,
-      "workspace-1"
+      "workspace-1",
+      "dir-1"
     );
 
     expect(result.optionLabels).toBeUndefined();
@@ -408,5 +423,206 @@ describe("pruneOptionLabels", () => {
     const rows = [{ "FeedbackRecords.valueId": "c-gone", "FeedbackRecords.count": 1 }];
 
     expect(pruneOptionLabels(groupByValueId() as never, rows, labels)).toBeUndefined();
+  });
+});
+
+describe("matrix label maps (ENG-3312)", () => {
+  const matrix = {
+    id: "el-matrix",
+    type: "matrix",
+    headline: { default: "How much do you agree?" },
+    rows: [
+      { id: "r-easy", label: { default: "It was easy" } },
+      { id: "r-fast", label: { default: "It was fast" } },
+    ],
+    columns: [
+      { id: "c-no", label: { default: "Disagree" } },
+      { id: "c-mid", label: { default: "Neutral" } },
+      { id: "c-yes", label: { default: "Agree" } },
+    ],
+  };
+  const matrixQuery = (filters: unknown[] = []) => ({
+    measures: ["FeedbackRecords.count"],
+    dimensions: ["FeedbackRecords.fieldId", "FeedbackRecords.valueId"],
+    filters,
+  });
+  const groupFilter = {
+    member: "FeedbackRecords.fieldGroupLabel",
+    operator: "equals",
+    values: ["How much do you agree?"],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    givenWorkspace([
+      {
+        mapping: { elementId: "el-matrix", surveyId: "survey-1", customFieldLabel: null },
+        survey: surveyWith("survey-1", matrix),
+      },
+      {
+        mapping: { elementId: "el-single", surveyId: "survey-2", customFieldLabel: null },
+        survey: surveyWith("survey-2", singleSelect("el-single", "Country", [{ id: "c-de", label: "DE" }])),
+      },
+    ]);
+  });
+
+  test("a Field Group filter pins the matrix: statements and scale points in survey order", async () => {
+    const result = await resolveOptionGrouping(matrixQuery([groupFilter]) as never, "workspace-1", "dir-1");
+
+    expect(result.pinned).toBe(true);
+    expect(Object.entries(result.fieldLabels ?? {})).toEqual([
+      ["el-matrix__r-easy", "It was easy"],
+      ["el-matrix__r-fast", "It was fast"],
+    ]);
+    expect(Object.keys(result.optionLabels ?? {})).toEqual(["c-no", "c-mid", "c-yes"]);
+  });
+
+  test("a pinned map is shipped whole, so an unpicked scale point still gets a column", async () => {
+    const grouping = await resolveOptionGrouping(matrixQuery([groupFilter]) as never, "workspace-1", "dir-1");
+    const rows = [{ "FeedbackRecords.fieldId": "el-matrix__r-easy", "FeedbackRecords.valueId": "c-yes" }];
+
+    expect(Object.keys(pruneChartLabels(grouping, rows).optionLabels ?? {})).toEqual([
+      "c-no",
+      "c-mid",
+      "c-yes",
+    ]);
+  });
+
+  test("unpinned, the workspace-wide maps are pruned to the rows but keep survey order", async () => {
+    const grouping = await resolveOptionGrouping(matrixQuery() as never, "workspace-1", "dir-1");
+    const rows = [
+      { "FeedbackRecords.fieldId": "el-matrix__r-fast", "FeedbackRecords.valueId": "c-yes" },
+      { "FeedbackRecords.fieldId": "el-matrix__r-fast", "FeedbackRecords.valueId": "c-no" },
+    ];
+
+    expect(grouping.pinned).toBe(false);
+    expect(pruneChartLabels(grouping, rows)).toEqual({
+      optionLabels: { "c-no": "Disagree", "c-yes": "Agree" },
+      fieldLabels: { "el-matrix__r-fast": "It was fast" },
+    });
+  });
+
+  test("a same-headline matrix in another directory adds no rows or columns", async () => {
+    const otherMatrix = {
+      ...matrix,
+      id: "el-other",
+      rows: [{ id: "r-other", label: { default: "Only in directory B" } }],
+      columns: [{ id: "c-other", label: { default: "B scale point" } }],
+    };
+    mocks.getFeedbackSourcesWithMappings.mockResolvedValue([
+      {
+        feedbackDirectoryId: "dir-1",
+        formbricksMappings: [{ elementId: "el-matrix", surveyId: "survey-1", customFieldLabel: null }],
+      },
+      {
+        feedbackDirectoryId: "dir-2",
+        formbricksMappings: [{ elementId: "el-other", surveyId: "survey-3", customFieldLabel: null }],
+      },
+    ]);
+    mocks.getSurvey.mockImplementation(async (surveyId: string) =>
+      surveyId === "survey-3" ? surveyWith("survey-3", otherMatrix) : surveyWith("survey-1", matrix)
+    );
+
+    const result = await resolveOptionGrouping(matrixQuery([groupFilter]) as never, "workspace-1", "dir-1");
+
+    expect(Object.keys(result.fieldLabels ?? {})).toEqual(["el-matrix__r-easy", "el-matrix__r-fast"]);
+    expect(Object.keys(result.optionLabels ?? {})).toEqual(["c-no", "c-mid", "c-yes"]);
+  });
+
+  test("a filter on one statement's field id keeps only that statement", async () => {
+    const result = await resolveOptionGrouping(
+      matrixQuery([
+        { member: "FeedbackRecords.fieldId", operator: "equals", values: ["el-matrix__r-fast"] },
+      ]) as never,
+      "workspace-1",
+      "dir-1"
+    );
+
+    expect(result.fieldLabels).toEqual({ "el-matrix__r-fast": "It was fast" });
+    expect(Object.keys(result.optionLabels ?? {})).toEqual(["c-no", "c-mid", "c-yes"]);
+  });
+
+  test("grouping by fieldId alone resolves row labels without an option map", async () => {
+    const result = await resolveOptionGrouping(
+      { measures: ["FeedbackRecords.count"], dimensions: ["FeedbackRecords.fieldId"], filters: [] } as never,
+      "workspace-1",
+      "dir-1"
+    );
+
+    expect(result.optionLabels).toBeUndefined();
+    expect(Object.keys(result.fieldLabels ?? {})).toEqual(["el-matrix__r-easy", "el-matrix__r-fast"]);
+  });
+});
+
+describe("resolveDatasetValueLabels", () => {
+  const delivery = {
+    ...surveyWith(
+      "survey-1",
+      singleSelect("q1", "Delivery", [
+        { id: "late", label: "Late" },
+        { id: "other", label: "Somewhere else" },
+      ])
+    ),
+    name: "Delivery survey",
+    endings: [
+      { id: "end-1", type: "endScreen", headline: { default: "<p>Thanks!</p>" } },
+      { id: "end-2", type: "redirectToUrl", url: "https://example.com", label: "Shop" },
+      { id: "end-3", type: "endScreen", headline: { default: "" } },
+    ],
+  };
+  const elsewhere = {
+    ...surveyWith("survey-2", singleSelect("q2", "Other dataset", [{ id: "secret", label: "Secret" }])),
+    name: "Another dataset's survey",
+    endings: [{ id: "end-9", type: "redirectToUrl", label: "Elsewhere" }],
+  };
+
+  beforeEach(() => {
+    mocks.getFeedbackSourcesWithMappings.mockReset();
+    mocks.getSurvey.mockReset();
+    mocks.getFeedbackSourcesWithMappings.mockResolvedValue([
+      { feedbackDirectoryId: "dir-1", formbricksMappings: [{ elementId: "q1", surveyId: "survey-1" }] },
+      { feedbackDirectoryId: "dir-2", formbricksMappings: [{ elementId: "q2", surveyId: "survey-2" }] },
+    ]);
+    mocks.getSurvey.mockImplementation(async (surveyId: string) =>
+      [delivery, elsewhere].find((survey) => survey.id === surveyId)
+    );
+  });
+
+  test("an answer's option reads its label, and the shared other bucket the generic Other", async () => {
+    expect(await resolveDatasetValueLabels("FeedbackRecords.valueId", "ws-1", "dir-1")).toEqual({
+      late: "Late",
+      other: "Other",
+    });
+  });
+
+  test("a source id reads its survey's name", async () => {
+    expect(await resolveDatasetValueLabels("FeedbackRecords.sourceId", "ws-1", "dir-1")).toEqual({
+      "survey-1": "Delivery survey",
+    });
+  });
+
+  test("an ending reads its headline or a redirect's label; a blank one has none", async () => {
+    expect(await resolveDatasetValueLabels("FeedbackRecords.metadataEndingId", "ws-1", "dir-1")).toEqual({
+      "end-1": "Thanks!",
+      "end-2": "Shop",
+    });
+  });
+
+  test("never labels from a survey mapped into another dataset", async () => {
+    const labels = await Promise.all(
+      ["FeedbackRecords.valueId", "FeedbackRecords.sourceId", "FeedbackRecords.metadataEndingId"].map(
+        (field) => resolveDatasetValueLabels(field, "ws-1", "dir-1")
+      )
+    );
+    const all = Object.assign({}, ...labels);
+    expect(all).not.toHaveProperty("secret");
+    expect(all).not.toHaveProperty("survey-2");
+    expect(all).not.toHaveProperty("end-9");
+    expect(mocks.getSurvey).not.toHaveBeenCalledWith("survey-2");
+  });
+
+  test("any other field has no labels, and reads nothing", async () => {
+    expect(await resolveDatasetValueLabels("FeedbackRecords.sourceName", "ws-1", "dir-1")).toEqual({});
+    expect(mocks.getFeedbackSourcesWithMappings).not.toHaveBeenCalled();
   });
 });

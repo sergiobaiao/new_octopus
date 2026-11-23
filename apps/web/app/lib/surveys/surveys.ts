@@ -1,13 +1,16 @@
 import { TFunction } from "i18next";
 import { TEmbeddedDataType } from "@formbricks/types/embedded-data";
 import {
+  coerceToEmbeddedDataType,
   getComputedEmbeddedFields,
   getIngestedEmbeddedFields,
 } from "@formbricks/types/embedded-data-resolver";
 import { TSurveyQuota } from "@formbricks/types/quota";
 import {
   TResponseFilterCriteria,
+  TResponseFilterCriteriaShown,
   TResponseHiddenFieldsFilter,
+  TResponseStatusFilter,
   TSurveyContactAttributes,
   TSurveyMetaFieldFilter,
 } from "@formbricks/types/responses";
@@ -21,15 +24,15 @@ import {
   SelectedFilterValue,
 } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/components/response-filter-context";
 import {
+  ElementFilterOptions,
   ElementOption,
   ElementOptions,
   OptionsType,
-} from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/components/ElementsComboBox";
-import { ElementFilterOptions } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/components/ResponseFilter";
+} from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/components/response-filter-options";
 import { getLocalizedValue } from "@/lib/i18n/utils";
 import { getReservedFilterEntries } from "@/lib/response/utils";
 import { recallToHeadline } from "@/lib/utils/recall";
-import { getReservedFieldLabel } from "@/modules/analysis/lib/reserved-field-display";
+import { getReservedFieldLabel } from "@/modules/embedded-data/lib/field-display";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
 
 const conditionOptions: Record<string, string[]> = {
@@ -80,15 +83,12 @@ const getElementFilterOption = (
   };
 
   switch (element.type) {
+    // Other included: "Includes either/all … Other" match answers with a write-in.
     case TSurveyElementTypeEnum.MultipleChoiceSingle:
-      return {
-        ...baseOption,
-        filterComboBoxOptions: element.choices?.map((c) => c.label) ?? [""],
-      };
     case TSurveyElementTypeEnum.MultipleChoiceMulti:
       return {
         ...baseOption,
-        filterComboBoxOptions: element.choices?.filter((c) => c.id !== "other").map((c) => c.label) ?? [""],
+        filterComboBoxOptions: element.choices?.map((c) => c.label) ?? [""],
       };
     case TSurveyElementTypeEnum.PictureSelection:
       return {
@@ -154,6 +154,8 @@ const getTypedFieldOperators = (dataType: TEmbeddedDataType): string[] => {
 
 // Operator label → criteria op for the typed field groups. "Is before"/"Is after" reuse the
 // comparison ops: jsonb compares same-format ISO strings lexicographically, i.e. chronologically.
+// A date field's row is then re-read against its *value* by `buildDateFieldCondition`, which is
+// where a day-granular comparison stops being a plain `lessThan`/`greaterThan` (ENG-3232).
 const TYPED_FIELD_OP_MAP: Record<string, string> = {
   ...META_OP_MAP,
   "Is greater than": "greaterThan",
@@ -166,10 +168,110 @@ const TYPED_FIELD_OP_MAP: Record<string, string> = {
 
 type TTypedFieldFilterCondition = NonNullable<TResponseFilterCriteria["reserved"]>[string];
 
+/** `YYYY-MM-DD`: what the filter's date input emits, and one of the two stored date spellings. */
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
 /**
- * One filter row → one typed condition, coerced to the field's dataType (a number field must send a
- * real number — a string-typed `equals` never matches a jsonb number). Returns null when the row
- * cannot form a valid condition, so half-filled rows drop instead of matching wrongly.
+ * The exclusive upper bound of `9999-12-31`, the one day with no representable successor.
+ *
+ * `toISOString` switches to ISO 8601's expanded year form past it and returns `+010000-01-01T…`,
+ * whose first ten characters are `+010000-01`; `+` sorts below every digit, so as a `max` it would
+ * empty the window. The bound is only ever compared lexicographically, though, and all it has to do
+ * is sort above every value that day can hold — which `9999-12-32` does, for both stored spellings.
+ * Nothing can sit *on* it either: `coerceToEmbeddedDataType` refuses day 32, so no stored value is
+ * ever equal to it. Naming a real successor is not the requirement; ordering correctly is.
+ */
+const LAST_DAY_EXCLUSIVE_BOUND = "9999-12-32";
+
+/**
+ * The UTC day after a `YYYY-MM-DD`, in the same spelling — the exclusive upper bound of that day.
+ *
+ * Through UTC arithmetic rather than string arithmetic so month, year and leap-day ends roll over,
+ * and deliberately not through the local-zone constructor: `new Date(2026, 8, 1)` is midnight
+ * wherever the browser happens to be, which lands the boundary on the wrong day for anyone east or
+ * west of Greenwich — the same saved filter would then answer differently per viewer.
+ *
+ * Past the last representable day it hands back {@link LAST_DAY_EXCLUSIVE_BOUND} rather than giving
+ * up: a day-granular filter on `9999-12-31` still has to cover the instants stored on it, and
+ * comparing against the bare date instead would miss `9999-12-31T10:30:00Z` on "on that day" and
+ * match it on "after that day".
+ */
+const nextUtcDay = (dateOnly: string): string => {
+  const day = new Date(`${dateOnly}T00:00:00.000Z`);
+  day.setUTCDate(day.getUTCDate() + 1);
+
+  const next = day.toISOString().slice(0, 10);
+  return DATE_ONLY_PATTERN.test(next) ? next : LAST_DAY_EXCLUSIVE_BOUND;
+};
+
+/**
+ * One date filter row → the condition that compares it against the value as *stored*, normalized
+ * here at filter time rather than at ingest (ENG-3232).
+ *
+ * The mismatch it resolves: the value arrives from an `<input type="date">`, so it is always a day,
+ * while the column holds exactly what was ingested — a day (`2026-09-01`) for `?signup=2026-09-01`,
+ * an instant (`2026-09-01T10:30:00Z`) when one was sent. Stored values are left exactly as they
+ * arrived (no backfill; machine-facing values stay ISO 8601), so the filter is the one place the two
+ * granularities can be made to meet, and a day-granular value becomes a day-wide window:
+ *
+ * - `equals` → `[day, next day)`. That is what makes it match the instants recorded on that day and
+ *   not only a stored date-only twin — the reported miss. `notEquals` → the complement.
+ * - `before` → `< day`, unchanged: every stored value on that day sorts at or after the bare date,
+ *   so the day is already excluded, which is what "before 1 Sep" means.
+ * - `after` → `>= next day`. The same boundary read from the other end: `> day` matched
+ *   `2026-09-01T10:30:00Z`, an instant *on* 1 Sep, which is the other half of the bug.
+ *
+ * The window is UTC because the stored datetimes are — `coerceToEmbeddedDataType` admits neither an
+ * offset nor a zone-less datetime, and nothing on the value records the respondent's zone, so there
+ * is no other clock available to read a day against. A value that is already a full datetime names
+ * the instant it means, so it is compared as-is.
+ *
+ * Every bound is written in the stored ISO spelling, which is what lets one lexicographic window
+ * cover both stored forms at once: `"2026-09-01" <= "2026-09-01T10:30:00Z" < "2026-09-02"` holds as
+ * text exactly as it does in time. A datetime bound would not — `"2026-09-02"` sorts *before*
+ * `"2026-09-02T00:00:00.000Z"`, so a next-day-midnight upper bound would pull a stored date-only 2
+ * Sep into 1 Sep's window.
+ */
+export const buildDateFieldCondition = (op: string, value: string): TTypedFieldFilterCondition | null => {
+  // Validated through the read seam rather than a second copy of its rules: a value outside the
+  // stored subset (`2026-02-30`, `01/09/2026`, an offset datetime) can never equal a stored one, and
+  // comparing it anyway would cut the ISO ordering at an arbitrary point. Dropping the row is the
+  // same stance the boolean arm takes on `"yes"`.
+  if (coerceToEmbeddedDataType(value, "date") === undefined) return null;
+  // Null only for a value that already names an instant: it means what it says, so it is compared
+  // as-is. Every date-only value has a bound, the last day included.
+  const dayAfter = DATE_ONLY_PATTERN.test(value) ? nextUtcDay(value) : null;
+
+  switch (op) {
+    case "equals":
+      return dayAfter ? { op: "inRange", min: value, max: dayAfter } : { op, value };
+    case "notEquals":
+      return dayAfter ? { op: "notInRange", min: value, max: dayAfter } : { op, value };
+    case "lessThan":
+      return { op, value };
+    case "greaterThan":
+      return dayAfter ? { op: "greaterEqual", value: dayAfter } : { op, value };
+    // The date menu offers nothing else, so anything here was crafted rather than picked: fail
+    // closed, like a text op on a boolean field.
+    default:
+      return null;
+  }
+};
+
+/**
+ * One filter row → one typed condition, coerced to the field's **stored** form — which is not always
+ * the obvious reading of its dataType. A number field must send a real number, because a
+ * string-typed `equals` never matches a jsonb number. A boolean field must send the *string*
+ * `"true"` / `"false"`, because that is what the ingest contract writes: `ZResponseDataValue` has no
+ * boolean member, so nothing under `data`, `variables` or `meta` is ever a jsonb boolean and a real
+ * boolean here matched no row at all (ENG-3231). The picker below already offers a boolean field
+ * exactly those two spellings as its options, so the value reaches this function in its stored form
+ * and all this has to do is stop converting it. A date field is the one whose *value* decides its
+ * condition rather than only its operator, because the picker is day-granular and the column is
+ * not — see {@link buildDateFieldCondition}.
+ *
+ * Returns null when the row cannot form a valid condition, so half-filled rows drop instead of
+ * matching wrongly.
  */
 const buildTypedFieldCondition = (
   filterType: FilterValue["filterType"],
@@ -193,8 +295,9 @@ const buildTypedFieldCondition = (
   if (dataType === "boolean") {
     if (op !== "equals" && op !== "notEquals") return null;
     if (value !== "true" && value !== "false") return null;
-    return { op, value: value === "true" } as TTypedFieldFilterCondition;
+    return { op, value };
   }
+  if (dataType === "date") return buildDateFieldCondition(op, value);
   return { op, value } as TTypedFieldFilterCondition;
 };
 
@@ -534,9 +637,14 @@ const processMatrixFilter = (
     filterType.filterComboBoxValue &&
     typeof filterType.filterComboBoxValue === "string"
   ) {
+    // Rules on several rows of one matrix share its condition, each row a key of its own.
+    const existing = filters.data![elementId];
     filters.data![elementId] = {
       op: "matrix",
-      value: { [filterType.filterValue]: filterType.filterComboBoxValue },
+      value: {
+        ...(existing?.op === "matrix" ? existing.value : {}),
+        [filterType.filterValue]: filterType.filterComboBoxValue,
+      },
     };
   }
 };
@@ -555,6 +663,9 @@ const processElementFilters = (
   elements.forEach(({ filterType, elementType }) => {
     const elementId = elementType.id ?? "";
     const element = surveyElements.find((q) => q.id === elementId);
+    // A second rule on the same question (a range: "> 1" and "< 5") must not replace the first, so the
+    // first moves to `dataAnd` and both apply. Matrix rows already share one condition.
+    const previous = filters.data?.[elementId];
 
     switch (elementType.elementType) {
       case TSurveyElementTypeEnum.OpenText:
@@ -588,6 +699,10 @@ const processElementFilters = (
         processMatrixFilter(filterType, elementId, filters);
         break;
     }
+    const current = filters.data?.[elementId];
+    if (previous && current && current !== previous && current.op !== "matrix") {
+      filters.dataAnd = [...(filters.dataAnd ?? []), { key: elementId, condition: previous }];
+    }
   });
 };
 
@@ -615,7 +730,9 @@ const processEqualsNotEqualsFilter = (
     }
   } else if (targetKey === "others") {
     filters.others = filters.others || {};
-    if (filterType.filterValue === "Equals") {
+    if (filterType.filterValue === "Is any of" && Array.isArray(filterType.filterComboBoxValue)) {
+      filters.others[label ?? ""] = { op: "in", value: filterType.filterComboBoxValue };
+    } else if (filterType.filterValue === "Equals") {
       filters.others[label ?? ""] = { op: "equals", value: filterType.filterComboBoxValue as string };
     } else if (filterType.filterValue === "Not equals") {
       filters.others[label ?? ""] = { op: "notEquals", value: filterType.filterComboBoxValue as string };
@@ -719,6 +836,37 @@ const processQuotaFilters = (quotas: FilterValue[], filters: TResponseFilterCrit
   });
 };
 
+const isShownFilterOp = (value: unknown): value is TResponseFilterCriteriaShown["op"] =>
+  value === "shown" || value === "notShown";
+
+// Shown / not shown rows → the `shown` criteria group (ENG-6951). A row without a target or with any
+// other value is left out.
+const processShownFilters = (rows: FilterValue[], filters: TResponseFilterCriteria) => {
+  for (const { filterType, shownTarget } of rows) {
+    const op = filterType.filterComboBoxValue;
+    if (!shownTarget || !isShownFilterOp(op)) continue;
+    const condition: TResponseFilterCriteriaShown = { ...shownTarget, op };
+    filters.shown = [...(filters.shown ?? []), condition];
+  }
+};
+
+/** One status narrows by `finished` or `outcome`; several mean any of them. */
+const applyResponseStatuses = (
+  statuses: readonly TResponseStatusFilter[],
+  filters: TResponseFilterCriteria
+): void => {
+  if (statuses.length === 0) return;
+  if (statuses.length > 1) {
+    filters.statuses = [...statuses];
+  } else if (statuses[0] === "complete") {
+    filters.finished = true;
+  } else if (statuses[0] === "partial") {
+    filters.finished = false;
+  } else {
+    filters.outcome = "lowQuality";
+  }
+};
+
 // get the formatted filter expression to fetch filtered responses
 export const getFormattedFilters = (
   survey: TSurvey,
@@ -735,6 +883,7 @@ export const getFormattedFilters = (
   const hiddenFields: FilterValue[] = [];
   const variables: FilterValue[] = [];
   const quotas: FilterValue[] = [];
+  const shown: FilterValue[] = [];
 
   selectedFilter.filter.forEach((filter) => {
     if (filter.elementType?.type === "Elements") {
@@ -753,15 +902,12 @@ export const getFormattedFilters = (
       variables.push(filter);
     } else if (filter.elementType?.type === "Quotas") {
       quotas.push(filter);
+    } else if (filter.elementType?.type === OptionsType.SHOWN) {
+      shown.push(filter);
     }
   });
 
-  // for completed responses
-  if (selectedFilter.responseStatus === "complete") {
-    filters["finished"] = true;
-  } else if (selectedFilter.responseStatus === "partial") {
-    filters["finished"] = false;
-  }
+  applyResponseStatuses(selectedFilter.responseStatuses, filters);
 
   // for date range responses
   if (dateRange.from && dateRange.to) {
@@ -778,7 +924,9 @@ export const getFormattedFilters = (
       notApplied: [],
     };
     tags.forEach((tag) => {
-      if (tag.filterType.filterComboBoxValue === "Applied") {
+      if (tag.filterType.filterValue === "Is any of" && Array.isArray(tag.filterType.filterComboBoxValue)) {
+        filters.tags!.appliedAny = [...tag.filterType.filterComboBoxValue];
+      } else if (tag.filterType.filterComboBoxValue === "Applied") {
         filters.tags?.applied?.push(tag.elementType.label ?? "");
       } else {
         filters.tags?.notApplied?.push(tag.elementType.label ?? "");
@@ -808,6 +956,7 @@ export const getFormattedFilters = (
 
   processReservedFilters(meta, survey, filters);
   processQuotaFilters(quotas, filters);
+  processShownFilters(shown, filters);
 
   return filters;
 };

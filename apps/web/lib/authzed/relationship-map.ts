@@ -22,9 +22,13 @@ import {
  * not want.
  */
 
-/** `Membership.role` → `organization#<relation>@user`. Exactly one applies to a given membership. */
+/**
+ * `Membership.role` → `organization#<relation>@user`. Exactly one applies to a given membership.
+ * `dashboard_viewer` (ADR-0025) reaches only `workspace#dashboard_read` through its team grants.
+ */
 export const ORGANIZATION_RELATIONS = {
   [OrganizationRole.billing]: "billing",
+  [OrganizationRole.dashboard_viewer]: "dashboard_viewer",
   [OrganizationRole.manager]: "manager",
   [OrganizationRole.member]: "member",
   [OrganizationRole.owner]: "owner",
@@ -49,6 +53,18 @@ export const WORKSPACE_API_KEY_RELATIONS = {
   [ApiKeyPermission.read]: "reader",
   [ApiKeyPermission.write]: "writer",
 } as const satisfies Record<ApiKeyPermission, string>;
+
+/**
+ * `Survey` facts → `survey#<relation>` (ENG-3282). Which of these a survey carries is decided by
+ * `expectedSurveyRelationships` in `./survey`; this is only the vocabulary, shared with the backfill so
+ * the audit derives the expected set from the same names the projector writes.
+ */
+export const SURVEY_RELATIONS = {
+  owner: "owner",
+  privateOwner: "private_owner",
+  sharedWorkspace: "shared_workspace",
+  workspace: "workspace",
+} as const;
 
 /**
  * An API key's organization-level access rights.

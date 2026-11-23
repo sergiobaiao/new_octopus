@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ZOverlay } from "../../types/common";
+import { ZOverlayColor, ZOverlayOpacity } from "../../types/overlay";
 import { ZLogo } from "../../types/styling";
 import { ZSurveyBlocks } from "../../types/surveys/blocks";
 import {
@@ -57,6 +58,12 @@ const ZSurveyBase = z.object({
   status: z.enum(SurveyStatus).describe("The status of the survey"),
   thankYouMessage: z.string().nullable().describe("The thank you message of the survey"),
   showLanguageSwitch: z.boolean().nullable().describe("Whether to show the language switch"),
+  autoSelectLanguage: z
+    .boolean()
+    .nullable()
+    .describe(
+      "Whether to open the survey in the respondent's browser language when it matches an enabled survey language"
+    ),
   showThankYouMessage: z.boolean().nullable().describe("Whether to show the thank you message"),
   welcomeCard: z
     .object({
@@ -90,6 +97,9 @@ const ZSurveyBase = z.object({
   recontactDays: z.number().nullable().describe("Days before recontacting"),
   displayLimit: z.number().nullable().describe("Display limit for the survey"),
   autoClose: z.number().nullable().describe("Auto close time in seconds"),
+  keepEndingCardOpen: z
+    .boolean()
+    .describe("Keep the ending card open until the respondent closes it instead of closing after 3 seconds"),
   autoComplete: z.number().nullable().describe("Auto complete time in seconds"),
   delay: z.number().describe("Delay before showing survey"),
   publishOn: z.coerce.date().nullable().describe("Date when the survey should be published"),
@@ -110,6 +120,8 @@ const ZSurveyBase = z.object({
       placement: ZPlacement.nullish(),
       clickOutsideClose: z.boolean().nullish(),
       overlay: ZOverlay.nullish(),
+      overlayColor: ZOverlayColor.nullish(),
+      overlayOpacity: ZOverlayOpacity.nullish(),
     })
     .nullable()
     .describe("Workspace specific overwrites"),

@@ -1,3 +1,4 @@
+import { getUserVisibleSurveyWhere } from "@/lib/survey/visibility/actor-context";
 import { getTranslate } from "@/lingodotdev/server";
 import { ContactsPageLayout } from "@/modules/ee/contacts/components/contacts-page-layout";
 import { getContactAttributeKeys } from "@/modules/ee/contacts/lib/contact-attribute-keys";
@@ -7,14 +8,20 @@ import { getIsContactsEnabled } from "@/modules/ee/license-check/lib/utils";
 import { getWorkspaceAuth } from "@/modules/workspaces/lib/utils";
 import { CreateSegmentModal } from "./components/create-segment-modal";
 
-export const SegmentsPage = async ({ params: paramsProps }: { params: Promise<{ workspaceId: string }> }) => {
+export const SegmentsPage = async ({
+  params: paramsProps,
+}: {
+  readonly params: Promise<{ workspaceId: string }>;
+}) => {
   const params = await paramsProps;
   const t = await getTranslate();
 
-  const { isReadOnly, organization, workspace } = await getWorkspaceAuth(params.workspaceId);
+  const { isReadOnly, organization, session, workspace } = await getWorkspaceAuth(params.workspaceId);
 
   const [segments, contactAttributeKeys] = await Promise.all([
-    getSegments(workspace.id),
+    getUserVisibleSurveyWhere(session.user.id, organization.id).then((where) =>
+      getSegments(workspace.id, where)
+    ),
     getContactAttributeKeys(workspace.id),
   ]);
 
@@ -50,6 +57,7 @@ export const SegmentsPage = async ({ params: paramsProps }: { params: Promise<{ 
         contactAttributeKeys={contactAttributeKeys}
         isContactsEnabled={isContactsEnabled}
         isReadOnly={isReadOnly}
+        workspaceId={workspace.id}
       />
     </ContactsPageLayout>
   );

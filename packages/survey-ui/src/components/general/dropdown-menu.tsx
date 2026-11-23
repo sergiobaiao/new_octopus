@@ -1,6 +1,8 @@
 import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
 import * as React from "react";
+import { FB_PART } from "@/lib/parts";
+import { SurveyPortalContainerContext } from "@/lib/portal-container";
 import { cn } from "@/lib/utils";
 
 function DropdownMenu({ ...props }: Readonly<React.ComponentProps<typeof DropdownMenuPrimitive.Root>>) {
@@ -23,9 +25,18 @@ function DropdownMenuContent({
   ref,
   ...props
 }: Readonly<React.ComponentProps<typeof DropdownMenuPrimitive.Content>>) {
+  // The portal renders outside the survey root, so it copies the survey's light/dark appearance
+  // (set by the renderer on the first #fbjs) to keep the menu in the same palette.
+  const appearance =
+    typeof document === "undefined"
+      ? undefined
+      : (document.getElementById("fbjs")?.dataset.appearance ?? undefined);
+  // Dashboard previews hand in their own container so the open menu stays inside the preview box.
+  const portalContainer = React.useContext(SurveyPortalContainerContext);
+
   return (
-    <DropdownMenuPrimitive.Portal>
-      <div id="fbjs">
+    <DropdownMenuPrimitive.Portal container={portalContainer ?? undefined}>
+      <div id="fbjs" data-appearance={appearance}>
         <DropdownMenuPrimitive.Content
           ref={ref}
           data-slot="dropdown-menu-content"
@@ -51,8 +62,8 @@ function DropdownMenuItem({
   variant = "default",
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Item> & {
-  inset?: boolean;
-  variant?: "default" | "destructive";
+  readonly inset?: boolean;
+  readonly variant?: "default" | "destructive";
 }) {
   return (
     <DropdownMenuPrimitive.Item
@@ -77,6 +88,9 @@ function DropdownMenuCheckboxItem({
   return (
     <DropdownMenuPrimitive.CheckboxItem
       data-slot="dropdown-menu-checkbox-item"
+      // The open list of a dropdown choice question: each item is a choice, and it carries the
+      // state itself (role="menuitemcheckbox" + aria-checked), so `[aria-checked="true"]` styles it.
+      data-fb-part={FB_PART.option}
       className={cn(
         "focus:bg-accent focus:text-accent-foreground relative flex cursor-pointer items-center gap-2 rounded-sm py-1.5 pr-2 pl-8 text-sm outline-none select-none focus-visible:outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_*]:cursor-pointer [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
@@ -105,6 +119,8 @@ function DropdownMenuRadioItem({
   return (
     <DropdownMenuPrimitive.RadioItem
       data-slot="dropdown-menu-radio-item"
+      // See DropdownMenuCheckboxItem: role="menuitemradio" + aria-checked on the hooked item itself.
+      data-fb-part={FB_PART.option}
       className={cn(
         "focus:bg-accent focus:text-accent-foreground relative flex cursor-pointer items-center gap-2 rounded-sm py-1.5 pr-2 pl-8 text-sm outline-none select-none focus-visible:outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_*]:cursor-pointer [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
@@ -125,7 +141,7 @@ function DropdownMenuLabel({
   inset,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Label> & {
-  inset?: boolean;
+  readonly inset?: boolean;
 }) {
   return (
     <DropdownMenuPrimitive.Label
@@ -170,7 +186,7 @@ function DropdownMenuSubTrigger({
   children,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.SubTrigger> & {
-  inset?: boolean;
+  readonly inset?: boolean;
 }) {
   return (
     <DropdownMenuPrimitive.SubTrigger

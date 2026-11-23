@@ -30,10 +30,67 @@ export const exampleData = {
     // No props needed
   },
 
+  accountDeletedEmail: {
+    // No props needed
+  },
+
   ssoRecoveryFactorsRemovedEmail: {
     passwordRemoved: true,
     twoFactorRemoved: true,
+    apiKeysRemoved: true,
     securitySettingsLink: "https://app.formbricks.com/account/settings/profile",
+  },
+
+  attachmentExportReadyEmail: {
+    surveyName: "Mystery shopper visit",
+    archiveSize: "5.7 GB",
+    fileCount: "4,812",
+    includedFileCount: "4,812",
+    sizeLimit: "5 GB",
+    retentionMonths: "3",
+    expiryDate: "February 3, 2027",
+    truncated: false,
+    downloadLink: "https://app.formbricks.com/attachment-exports/cm8cmpnjj000108jfdr9exp01",
+  },
+
+  attachmentExportFailedEmail: {
+    surveyName: "Mystery shopper visit",
+    reason: "build_timeout" as const,
+    maxFiles: "5,000",
+    responsesLink: "https://app.formbricks.com/workspaces/ws/surveys/survey/responses",
+  },
+
+  memberRetentionNoticeEmail: {
+    organizationName: "Acme",
+    deactivateDate: "Dec 7, 2026",
+    loginLink: "https://app.formbricks.com/auth/login",
+  },
+
+  surveyRetentionNoticeEmail: {
+    organizationName: "Acme",
+    responseDeletions: [
+      {
+        name: "Customer Satisfaction Survey",
+        url: "https://app.formbricks.com/workspaces/example-workspace-id/surveys/example-survey-id/summary",
+        count: "1,204",
+        deleteDate: "Dec 7, 2026",
+      },
+    ],
+    archivedSurveys: [
+      {
+        name: "Website Feedback 2023",
+        url: "https://app.formbricks.com/workspaces/example-workspace-id/surveys/example-survey-id-2/summary",
+        archiveDate: "Dec 7, 2026",
+        deleteDate: "Jan 6, 2027",
+      },
+    ],
+    settingsLink:
+      "https://app.formbricks.com/organizations/example-organization-id/settings/data-retention/exemptions",
+  },
+
+  ssoSignInHintEmail: {
+    providerNames: ["Microsoft"],
+    loginLink: "https://app.formbricks.com/auth/login",
   },
 
   inviteEmail: {
@@ -174,7 +231,8 @@ export const exampleData = {
     ],
     hiddenFields: [
       {
-        id: "userId",
+        id: "user_id",
+        name: "User ID",
         value: "user-abc-123",
       },
     ],

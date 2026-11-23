@@ -1,13 +1,15 @@
 import "server-only";
+import { mapWithConcurrency } from "@/lib/utils/map-with-concurrency";
 import type { TApiKeyProjectionTargets } from "./api-key";
 import {
+  SURVEY_SCOPED_RESOURCE_TYPES,
   type TAuthzedObservationSummary,
   type TAuthzedParentEdge,
   type TAuthzedPermissionMismatch,
   type TAuthzedSourceRef,
   findMismatchedPermissionRelations,
   findUnprojectedSourceRefs,
-  getManagedResourceTypes,
+  getOrganizationScopedResourceTypes,
   sourceRefKey,
   summarizeObservation,
 } from "./backfill-diff";
@@ -16,6 +18,7 @@ import {
   type TAuthzedFeedbackDirectoryAssignmentTarget,
   type TAuthzedMembershipTarget,
   type TAuthzedOrganizationSource,
+  type TAuthzedSurveySource,
   type TAuthzedTeamMembershipTarget,
   type TAuthzedWorkspaceSource,
   type TAuthzedWorkspaceTeamTarget,
@@ -24,11 +27,15 @@ import {
   organizationExists,
   readOrganizationIdPage,
   readOrganizationSource,
+  readSurveyIdPage,
+  readSurveySource,
   readWorkspaceSource,
 } from "./backfill-source";
 import type { TAuthzedClient, TAuthzedRelationship } from "./client";
 import {
+  AUTHZED_BACKFILL_ORGANIZATION_CONCURRENCY,
   AUTHZED_BACKFILL_ORGANIZATION_PAGE_SIZE,
+  AUTHZED_BACKFILL_SURVEY_PAGE_SIZE,
   AUTHZED_MAX_PARALLEL_RELATIONSHIP_DELETES,
   AUTHZED_MAX_PRUNED_RESOURCES_PER_RUN,
   AUTHZED_MAX_TRACKED_ORPHAN_REFS,
@@ -43,7 +50,7 @@ import { forEachRelationshipPage, readAllRelationships } from "./relationship-re
 import type { TTeamWorkspaceProjectionTargets } from "./team-workspace";
 
 /**
- * Relationship backfill and repair, organized around one organization at a time.
+ * Relationship backfill and repair, organized around the organization as the unit of work.
  *
  * **Command-line use only** — see the note on `./backfill-source`. This module performs no
  * authorization check, because it runs as an operator against the whole database.
@@ -53,6 +60,10 @@ import type { TTeamWorkspaceProjectionTargets } from "./team-workspace";
  * without consulting any other. It also means backfill and single-organization repair are the same
  * code path with a different unit list, and that a partial run leaves complete graphs for the
  * organizations it finished rather than a fragment of every tenant's graph.
+ *
+ * Closed units are also what let a full sweep process several at once: no two organizations share a
+ * resource, so their writes cannot collide. Each records into its own tallies, merged in ID order once
+ * its page is done, so concurrency changes how long a run takes and not what it reports.
  *
  * This module cannot write. It reaches mutations only through an injected capability object, and it
  * imports neither `getAuthzedClient` nor any reconciler — so a dry run is inert by construction rather
@@ -71,12 +82,19 @@ export type TAuthzedBackfillApply = Readonly<{
   reconcileFeedbackDirectories: (
     targets: TFeedbackDirectoryProjectionTargets
   ) => Promise<TAuthzedProjectionResult>;
+  reconcileSurveys: (surveyIds: ReadonlyArray<string>) => Promise<TAuthzedProjectionResult>;
   reconcileTeamWorkspace: (targets: TTeamWorkspaceProjectionTargets) => Promise<TAuthzedProjectionResult>;
 }>;
 
+/**
+ * `survey` (ENG-3282) is its own scope rather than part of `all`: surveys outnumber grants by orders of
+ * magnitude, and `all` is what the six-hourly audit runs, so folding them in would make that audit
+ * proportional to the number of surveys.
+ */
 export type TAuthzedBackfillScope =
   | Readonly<{ afterOrganizationId?: string; kind: "all" }>
   | Readonly<{ kind: "organization"; organizationId: string }>
+  | Readonly<{ afterSurveyId?: string; kind: "survey" }>
   | Readonly<{ kind: "workspace"; workspaceId: string }>;
 
 export type TAuthzedBackfillRequest = Readonly<{
@@ -113,6 +131,10 @@ export type TAuthzedBackfillSource = Readonly<{
     page: Readonly<{ afterOrganizationId?: string; limit?: number }>
   ) => Promise<ReadonlyArray<string>>;
   readOrganizationSource: (organizationId: string) => Promise<TAuthzedOrganizationSource>;
+  readSurveyIdPage: (
+    page: Readonly<{ afterSurveyId?: string; limit?: number }>
+  ) => Promise<ReadonlyArray<string>>;
+  readSurveySource: (surveyIds: ReadonlyArray<string>) => Promise<TAuthzedSurveySource>;
   readWorkspaceSource: (workspaceId: string) => Promise<TAuthzedWorkspaceSource>;
 }>;
 
@@ -122,6 +144,8 @@ export const defaultBackfillSource: TAuthzedBackfillSource = {
   organizationExists,
   readOrganizationIdPage,
   readOrganizationSource,
+  readSurveyIdPage,
+  readSurveySource,
   readWorkspaceSource,
 };
 
@@ -135,7 +159,7 @@ export type TAuthzedBackfillDependencies = Readonly<{
 export type TAuthzedBackfillCounters = Readonly<{
   failed: number;
   /**
-   * Relationships on a deliberately unprojected resource type — `survey`, `dashboard`, `response`.
+   * Relationships on a deliberately unprojected resource type — `dashboard`, `response`.
    *
    * Expected to be 0, and structurally so: every read this tool issues filters to a managed type, so
    * there is no path by which an unprojected type is observed. The classification behind it is kept
@@ -193,6 +217,8 @@ export type TAuthzedBackfillResult = Readonly<{
   counters: TAuthzedBackfillCounters;
   failures: ReadonlyArray<TAuthzedBackfillFailure>;
   lastOrganizationId: string | null;
+  /** The `survey` scope's resume cursor: the last survey a page covered. `null` for other scopes. */
+  lastSurveyId: string | null;
   /**
    * Parent edges PostgreSQL contradicts.
    *
@@ -206,7 +232,7 @@ export type TAuthzedBackfillResult = Readonly<{
   mode: "apply" | "dry_run";
   orphanScope: "all" | "known_resources";
   orphans: ReadonlyArray<TAuthzedSourceRef>;
-  scope: "all" | "organization" | "workspace";
+  scope: TAuthzedBackfillScope["kind"];
   status: "drifted" | "failed" | "reconciled";
   /**
    * Set when the counters are not exact. Either way, re-run before concluding anything.
@@ -245,11 +271,26 @@ type TReconcileTargets = Readonly<{
   feedbackDirectoryAssignments: ReadonlyArray<TAuthzedFeedbackDirectoryAssignmentTarget>;
   feedbackDirectoryIds: ReadonlyArray<string>;
   memberships: ReadonlyArray<TAuthzedMembershipTarget>;
+  surveyIds: ReadonlyArray<string>;
   teamIds: ReadonlyArray<string>;
   teamMemberships: ReadonlyArray<TAuthzedTeamMembershipTarget>;
   workspaceIds: ReadonlyArray<string>;
   workspaceTeamGrants: ReadonlyArray<TAuthzedWorkspaceTeamTarget>;
 }>;
+
+const NO_TARGETS: TReconcileTargets = {
+  apiKeyIds: [],
+  apiKeyWorkspaceGrants: [],
+  feedbackDirectoryAssignmentObjectIds: [],
+  feedbackDirectoryAssignments: [],
+  feedbackDirectoryIds: [],
+  memberships: [],
+  surveyIds: [],
+  teamIds: [],
+  teamMemberships: [],
+  workspaceIds: [],
+  workspaceTeamGrants: [],
+};
 
 /**
  * Turn missing source records into reconciler targets.
@@ -266,6 +307,7 @@ const toRepairTargets = (refs: ReadonlyArray<TAuthzedSourceRef>): TReconcileTarg
   const feedbackDirectoryAssignments: TAuthzedFeedbackDirectoryAssignmentTarget[] = [];
   const feedbackDirectoryIds: string[] = [];
   const memberships: TAuthzedMembershipTarget[] = [];
+  const surveyIds: string[] = [];
   const teamIds: string[] = [];
   const teamMemberships: TAuthzedTeamMembershipTarget[] = [];
   const workspaceIds: string[] = [];
@@ -295,6 +337,9 @@ const toRepairTargets = (refs: ReadonlyArray<TAuthzedSourceRef>): TReconcileTarg
       case "membership":
         memberships.push({ organizationId: ref.organizationId, userId: ref.userId });
         break;
+      case "survey":
+        surveyIds.push(ref.surveyId);
+        break;
       case "team":
         teamIds.push(ref.teamId);
         break;
@@ -317,6 +362,7 @@ const toRepairTargets = (refs: ReadonlyArray<TAuthzedSourceRef>): TReconcileTarg
     feedbackDirectoryAssignments,
     feedbackDirectoryIds,
     memberships,
+    surveyIds,
     teamIds,
     teamMemberships,
     workspaceIds,
@@ -398,6 +444,7 @@ const mergeTargets = (left: TReconcileTargets, right: TReconcileTargets): TRecon
   feedbackDirectoryAssignments: [...left.feedbackDirectoryAssignments, ...right.feedbackDirectoryAssignments],
   feedbackDirectoryIds: [...left.feedbackDirectoryIds, ...right.feedbackDirectoryIds],
   memberships: [...left.memberships, ...right.memberships],
+  surveyIds: [...left.surveyIds, ...right.surveyIds],
   teamIds: [...left.teamIds, ...right.teamIds],
   teamMemberships: [...left.teamMemberships, ...right.teamMemberships],
   workspaceIds: [...left.workspaceIds, ...right.workspaceIds],
@@ -446,6 +493,11 @@ const reconcileTargets = async (
           apply.deleteFeedbackDirectoryAssignmentResources(assignmentIds),
         { assignmentIds: targets.feedbackDirectoryAssignmentObjectIds }
       ),
+    () =>
+      runChunked(
+        ({ surveyIds }: Readonly<{ surveyIds: ReadonlyArray<string> }>) => apply.reconcileSurveys(surveyIds),
+        { surveyIds: targets.surveyIds }
+      ),
   ];
 
   for (const step of steps) {
@@ -456,6 +508,40 @@ const reconcileTargets = async (
   }
 
   return undefined;
+};
+
+/**
+ * Read every relationship on each named resource.
+ *
+ * Bounded windows rather than one read at a time: an organization with many workspaces would
+ * otherwise cost that many sequential round trips. The bound is the same one that caps parallel
+ * relationship deletes, so this cannot outrun the connection budget the rest of the module assumes.
+ *
+ * Each filter resolves its own revision, which is fine: an observation is only ever used to name the
+ * source record a relationship implies, and the reconciler re-reads PostgreSQL before acting on it.
+ * Nothing here compares two resources against each other.
+ */
+const observeResources = async (
+  client: Pick<TAuthzedClient, "readRelationships">,
+  filters: ReadonlyArray<Readonly<{ resourceId: string; resourceType: string }>>
+): Promise<Readonly<{ relationships: ReadonlyArray<TAuthzedRelationship>; snapshot: string | null }>> => {
+  const relationships: TAuthzedRelationship[] = [];
+  let snapshot: string | null = null;
+
+  for (let start = 0; start < filters.length; start += AUTHZED_MAX_PARALLEL_RELATIONSHIP_DELETES) {
+    const observations = await Promise.all(
+      filters
+        .slice(start, start + AUTHZED_MAX_PARALLEL_RELATIONSHIP_DELETES)
+        .map((filter) => readAllRelationships(client, filter))
+    );
+
+    for (const observation of observations) {
+      relationships.push(...observation.relationships);
+      snapshot = observation.snapshot?.token ?? snapshot;
+    }
+  }
+
+  return { relationships, snapshot };
 };
 
 /**
@@ -487,30 +573,7 @@ const observeOrganizationResources = async (
     })),
   ];
 
-  const relationships: TAuthzedRelationship[] = [];
-  let snapshot: string | null = null;
-
-  // Bounded windows rather than one read at a time: an organization with many workspaces would
-  // otherwise cost that many sequential round trips. The bound is the same one that caps parallel
-  // relationship deletes, so this cannot outrun the connection budget the rest of the module assumes.
-  //
-  // Each filter resolves its own revision, which is fine: an observation is only ever used to name the
-  // source record a relationship implies, and the reconciler re-reads PostgreSQL before acting on it.
-  // Nothing here compares two resources against each other.
-  for (let start = 0; start < filters.length; start += AUTHZED_MAX_PARALLEL_RELATIONSHIP_DELETES) {
-    const observations = await Promise.all(
-      filters
-        .slice(start, start + AUTHZED_MAX_PARALLEL_RELATIONSHIP_DELETES)
-        .map((filter) => readAllRelationships(client, filter))
-    );
-
-    for (const observation of observations) {
-      relationships.push(...observation.relationships);
-      snapshot = observation.snapshot?.token ?? snapshot;
-    }
-  }
-
-  return { relationships, snapshot };
+  return observeResources(client, filters);
 };
 
 /**
@@ -528,6 +591,7 @@ type TRunState = {
   ignored: number;
   invalid: number;
   lastOrganizationId: string | null;
+  lastSurveyId: string | null;
   mismatchedParentCount: number;
   readonly mismatchedParents: TAuthzedParentEdge[];
   mismatchedPermissionCount: number;
@@ -551,6 +615,7 @@ const createRunState = (): TRunState => ({
   ignored: 0,
   invalid: 0,
   lastOrganizationId: null,
+  lastSurveyId: null,
   mismatchedParentCount: 0,
   mismatchedParents: [],
   mismatchedPermissionCount: 0,
@@ -621,6 +686,33 @@ const recordMismatchedPermissions = (
 ): void => {
   state.mismatchedPermissionCount += mismatches.length;
   pushCapped(state.mismatchedPermissions, mismatches);
+};
+
+/**
+ * Fold one organization's tallies into the run's.
+ *
+ * The snapshot and the survey cursor are run-level and never set by a unit, so they are left alone.
+ */
+const mergeUnitState = (run: TRunState, unit: TRunState): void => {
+  run.failed += unit.failed;
+  run.ignored += unit.ignored;
+  run.invalid += unit.invalid;
+  run.mismatchedParentCount += unit.mismatchedParentCount;
+  run.mismatchedPermissionCount += unit.mismatchedPermissionCount;
+  run.missingCount += unit.missingCount;
+  run.orphaned += unit.orphaned;
+  run.pruned += unit.pruned;
+  run.reconciled += unit.reconciled;
+  run.scanned += unit.scanned;
+  run.skipped += unit.skipped;
+  run.unmanagedCount += unit.unmanagedCount;
+  run.truncated ||= unit.truncated;
+  run.lastOrganizationId = unit.lastOrganizationId ?? run.lastOrganizationId;
+  pushCapped(run.failures, unit.failures);
+  pushCapped(run.mismatchedParents, unit.mismatchedParents);
+  pushCapped(run.mismatchedPermissions, unit.mismatchedPermissions);
+  pushCapped(run.orphans, unit.orphans);
+  pushCapped(run.unmanaged, unit.unmanaged);
 };
 
 /**
@@ -765,6 +857,7 @@ const processOrganization = async (ctx: TRunContext, organizationId: string): Pr
         feedbackDirectoryAssignments: source.feedbackDirectoryAssignments,
         feedbackDirectoryIds: source.feedbackDirectoryIds,
         memberships: source.memberships,
+        surveyIds: [],
         teamIds: source.teamIds,
         teamMemberships: source.teamMemberships,
         workspaceIds: source.workspaceIds,
@@ -839,14 +932,14 @@ const tallySweepPage = async (
  * turning the only mode that can remove stale relationships into one that fails permanently on exactly
  * the deployments that need it. Only the prunable refs are accumulated, and the budget bounds those.
  */
-const sweepGlobalOrphans = async (ctx: TRunContext): Promise<void> => {
+const sweepGlobalOrphans = async (ctx: TRunContext, resourceTypes: ReadonlyArray<string>): Promise<void> => {
   const { state } = ctx;
   // Bounded by the budget: past it nothing will be pruned anyway, so there is no reason to hold more.
   const prunable: TAuthzedSourceRef[] = [];
   const seenOrphanRefs = new Set<string>();
   let sweepOrphans = 0;
 
-  for (const resourceType of getManagedResourceTypes()) {
+  for (const resourceType of resourceTypes) {
     await forEachRelationshipPage(ctx.client, { resourceType }, async (relationships) => {
       const fresh = await tallySweepPage(ctx, seenOrphanRefs, relationships);
       sweepOrphans += fresh.length;
@@ -921,6 +1014,7 @@ const toWorkspaceSourceRefs = (
           : [];
       }
     ),
+    ...source.surveyIds.map((surveyId): TAuthzedSourceRef => ({ kind: "survey", surveyId })),
     { kind: "workspace", workspaceId },
   ];
 };
@@ -948,7 +1042,15 @@ const observeWorkspace = async (
         })
     ),
   ]);
-  const summary = summarizeObservation(observations.flatMap(({ relationships }) => relationships));
+  // A workspace can hold thousands of surveys, so these go through the bounded windows instead.
+  const surveys = await observeResources(
+    ctx.client,
+    source.surveyIds.map((surveyId) => ({ resourceId: surveyId, resourceType: "survey" }))
+  );
+  const summary = summarizeObservation([
+    ...observations.flatMap(({ relationships }) => relationships),
+    ...surveys.relationships,
+  ]);
   await recordObservationSummary(ctx, summary);
 
   if (ctx.mode === "dry_run") {
@@ -1079,6 +1181,7 @@ const processWorkspace = async (ctx: TRunContext, workspaceId: string): Promise<
         feedbackDirectoryAssignments: source.feedbackDirectoryAssignments,
         feedbackDirectoryIds: [],
         memberships: [],
+        surveyIds: source.surveyIds,
         teamIds: [],
         teamMemberships: [],
         // Naming the workspace projects its parent edge when the row exists, and removes *every*
@@ -1107,6 +1210,41 @@ const processWorkspace = async (ctx: TRunContext, workspaceId: string): Promise<
   state.reconciled++;
 };
 
+/**
+ * Process one page of organizations a bounded number at a time, then record them in ID order.
+ *
+ * Each organization tallies into its own state rather than the run's, so the capped report lists come
+ * out in the same order however the calls interleave — otherwise which hundred failures a broken run
+ * reports would depend on which round trips happened to finish first.
+ */
+const processOrganizationPage = async (
+  ctx: TRunContext,
+  organizationIds: ReadonlyArray<string>
+): Promise<void> => {
+  const units = await mapWithConcurrency(
+    organizationIds,
+    AUTHZED_BACKFILL_ORGANIZATION_CONCURRENCY,
+    async (organizationId) => {
+      const unit = createRunState();
+      try {
+        await processOrganization({ ...ctx, state: unit }, organizationId);
+      } catch (error) {
+        // `processOrganization` reports its own failures, so this only meets the unexpected — an injected
+        // apply capability that rejects instead of returning `{ status: "failed" }`, say. Recorded rather
+        // than rethrown: a rejection would abandon the page while its other workers kept writing, and the
+        // run would end with no report and no resume cursor.
+        recordFailure(unit, organizationId, error);
+      }
+
+      return unit;
+    }
+  );
+
+  for (const unit of units) {
+    mergeUnitState(ctx.state, unit);
+  }
+};
+
 /** Walk every organization by keyset page. */
 const enumerateOrganizations = async (ctx: TRunContext, afterOrganizationId?: string): Promise<void> => {
   let cursor = afterOrganizationId;
@@ -1132,17 +1270,106 @@ const enumerateOrganizations = async (ctx: TRunContext, afterOrganizationId?: st
       return;
     }
 
-    // Strictly sequential, and not only to avoid write contention: `lastOrganizationId` is the resume
-    // cursor, so processing out of order would let a resume skip an organization that failed while a
-    // later one succeeded.
-    for (const organizationId of organizationIds) {
-      await processOrganization(ctx, organizationId);
-    }
+    // Pages stay strictly sequential, because `lastOrganizationId` is the resume cursor: it may only
+    // advance past an organization once that organization has finished. Merging a page only after every
+    // unit on it is done keeps that true even though the units within it run concurrently.
+    await processOrganizationPage(ctx, organizationIds);
     cursor = organizationIds.at(-1);
   }
 };
 
+/**
+ * One page of the `survey` scope: observe each survey's relationships, then converge them.
+ *
+ * Orphans — relationships on surveys whose row is gone — are not reachable from a page of existing
+ * rows; the scope's own sweep finds those, exactly as the full sweep does for organizations.
+ */
+const processSurveyPage = async (ctx: TRunContext, surveyIds: ReadonlyArray<string>): Promise<void> => {
+  const { state } = ctx;
+  state.scanned += surveyIds.length;
+
+  let source: TAuthzedSurveySource;
+  try {
+    source = await ctx.sourceReads.readSurveySource(surveyIds);
+  } catch (error) {
+    recordFailure(state, "", error);
+
+    return;
+  }
+
+  if (ctx.mode === "dry_run") {
+    try {
+      const observation = await observeResources(
+        ctx.client,
+        source.surveyIds.map((surveyId) => ({ resourceId: surveyId, resourceType: "survey" }))
+      );
+      const summary = summarizeObservation(observation.relationships);
+      state.missingCount += findUnprojectedSourceRefs(
+        source.surveyIds.map((surveyId): TAuthzedSourceRef => ({ kind: "survey", surveyId })),
+        summary.sourceRefs
+      ).length;
+      recordMismatchedPermissions(
+        state,
+        findMismatchedPermissionRelations(source.expectedRelationships, summary.managedRelationships)
+      );
+    } catch (error) {
+      state.truncated = true;
+      recordFailure(state, "", error);
+    }
+
+    return;
+  }
+
+  const failure = await reconcileTargets(ctx.apply, { ...NO_TARGETS, surveyIds: source.surveyIds });
+  if (failure) {
+    recordProjectionFailure(state, "", failure);
+
+    return;
+  }
+
+  state.reconciled += source.surveyIds.length;
+};
+
+/** Walk every survey by keyset page, then sweep survey relationships for rows that are gone. */
+const runSurveyScope = async (ctx: TRunContext, afterSurveyId?: string): Promise<void> => {
+  let cursor = afterSurveyId;
+
+  for (;;) {
+    let surveyIds: ReadonlyArray<string>;
+    try {
+      surveyIds = await ctx.sourceReads.readSurveyIdPage({
+        afterSurveyId: cursor,
+        limit: AUTHZED_BACKFILL_SURVEY_PAGE_SIZE,
+      });
+    } catch (error) {
+      ctx.state.truncated = true;
+      recordFailure(ctx.state, "", error);
+      break;
+    }
+
+    if (surveyIds.length === 0) break;
+
+    // Keyset pagination: the next page starts after this one, and pages are bounded on purpose.
+    await processSurveyPage(ctx, surveyIds); // NOSONAR
+    cursor = surveyIds.at(-1);
+    ctx.state.lastSurveyId = cursor ?? ctx.state.lastSurveyId;
+  }
+
+  try {
+    await sweepGlobalOrphans(ctx, SURVEY_SCOPED_RESOURCE_TYPES);
+  } catch (error) {
+    ctx.state.truncated = true;
+    recordFailure(ctx.state, "", error);
+  }
+};
+
 const runScope = async (ctx: TRunContext, scope: TAuthzedBackfillScope): Promise<void> => {
+  if (scope.kind === "survey") {
+    await runSurveyScope(ctx, scope.afterSurveyId);
+
+    return;
+  }
+
   if (scope.kind === "workspace") {
     await processWorkspace(ctx, scope.workspaceId);
 
@@ -1167,7 +1394,7 @@ const runScope = async (ctx: TRunContext, scope: TAuthzedBackfillScope): Promise
   // and it is the only thing that can find a resource no organization can reach.
   await enumerateOrganizations(ctx, scope.afterOrganizationId);
   try {
-    await sweepGlobalOrphans(ctx);
+    await sweepGlobalOrphans(ctx, getOrganizationScopedResourceTypes());
   } catch (error) {
     ctx.state.truncated = true;
     recordFailure(ctx.state, "", error);
@@ -1234,7 +1461,8 @@ export const runAuthzedBackfill = async (
     // caller passing 0 would make an over-cap unit invisible in `status`.
     maxPrune: Math.max(1, Math.min(request.maxPrune, AUTHZED_MAX_PRUNED_RESOURCES_PER_RUN)),
     mode: request.mode,
-    ownsOrphanAccounting: request.scope.kind !== "all",
+    // The two streaming scopes count orphans in their sweep; the narrow ones own them per unit.
+    ownsOrphanAccounting: request.scope.kind !== "all" && request.scope.kind !== "survey",
     sourceReads,
     state,
   };
@@ -1263,10 +1491,11 @@ export const runAuthzedBackfill = async (
     },
     failures: state.failures,
     lastOrganizationId: state.lastOrganizationId,
+    lastSurveyId: state.lastSurveyId,
     mismatchedParents: state.mismatchedParents,
     mismatchedPermissions: state.mismatchedPermissions,
     mode: request.mode,
-    orphanScope: request.scope.kind === "all" ? "all" : "known_resources",
+    orphanScope: request.scope.kind === "all" || request.scope.kind === "survey" ? "all" : "known_resources",
     orphans: state.orphans,
     scope: request.scope.kind,
     status: toRunStatus(state),

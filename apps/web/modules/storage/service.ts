@@ -10,7 +10,7 @@ import {
   getSignedUploadUrl,
 } from "@formbricks/storage";
 import { Result, err, ok } from "@formbricks/types/error-handlers";
-import { type TAccessType } from "@formbricks/types/storage";
+import { type TAccessType, getMimeTypeForFileName } from "@formbricks/types/storage";
 import { sanitizeFileName } from "./utils";
 
 const SAFE_FILE_PATH_SEGMENT = /^[A-Za-z0-9_-]+$/;
@@ -30,10 +30,26 @@ const SAFE_FILE_PATH_SEGMENT = /^[A-Za-z0-9_-]+$/;
 const hasTraversalSegment = (fileName: string): boolean =>
   fileName.split("/").some((segment) => segment === "." || segment === "..");
 
+/**
+ * `hasTraversalSegment` on the name as given and on one more decode of it.
+ *
+ * The key is built from the name as given: the route hands over the name its router has already decoded
+ * once, and objects are stored under that name. The extra decode here never feeds the key. It only catches
+ * a `%252e%252e` that arrives as `%2e%2e`, so the traversal guard does not depend on whether a proxy or
+ * storage backend decodes paths. Only the `%2e` (dot) and `%2f` (slash) escapes are read, so a bare `%`
+ * elsewhere in the name cannot stop the check, as a full `decodeURIComponent` would.
+ */
+const hasTraversalSegmentOrEncodedForm = (fileName: string): boolean =>
+  hasTraversalSegment(fileName) ||
+  hasTraversalSegment(fileName.replaceAll(/%2e/gi, ".").replaceAll(/%2f/gi, "/"));
+
+/**
+ * Presigns an upload. The object's `Content-Type` is derived from the file's extension and signed into
+ * the policy, so the uploader cannot store (and the storage route cannot later echo) a type of its own.
+ */
 export const getSignedUrlForUpload = async (
   fileName: string,
   workspaceId: string,
-  fileType: string,
   accessType: TAccessType,
   maxFileUploadSize: number = 1024 * 1024 * 10, // 10MB
   filePathSegments: string[] = []
@@ -57,6 +73,11 @@ export const getSignedUrlForUpload = async (
       return err({ code: StorageErrorCode.InvalidInput });
     }
 
+    const contentType = getMimeTypeForFileName(safeFileName);
+    if (!contentType) {
+      return err({ code: StorageErrorCode.InvalidInput });
+    }
+
     const encodedFilePathSegments = filePathSegments.map((segment) => encodeURIComponent(segment));
     const fileNameWithoutExtension = safeFileName.split(".").slice(0, -1).join(".");
     const fileExtension = safeFileName.split(".").pop();
@@ -64,7 +85,12 @@ export const getSignedUrlForUpload = async (
     const updatedFileName = `${fileNameWithoutExtension}--fid--${randomUUID()}.${fileExtension}`;
     const filePath = [workspaceId, accessType, ...filePathSegments].join("/");
 
-    const signedUrlResult = await getSignedUploadUrl(updatedFileName, fileType, filePath, maxFileUploadSize);
+    const signedUrlResult = await getSignedUploadUrl(
+      updatedFileName,
+      contentType,
+      filePath,
+      maxFileUploadSize
+    );
 
     if (!signedUrlResult.ok) {
       return signedUrlResult;
@@ -103,20 +129,18 @@ export const getFileStreamForDownload = async (
   fallbackId?: string
 ): Promise<Result<FileStreamResult, StorageError>> => {
   try {
-    const fileNameDecoded = decodeURIComponent(fileName);
-
-    // Checked after the decode: the route param is already URL-decoded once, so a `%252e%252e`
-    // traversal only becomes `..` here.
-    if (hasTraversalSegment(fileName) || hasTraversalSegment(fileNameDecoded)) {
+    if (hasTraversalSegmentOrEncodedForm(fileName)) {
       return err({ code: StorageErrorCode.InvalidInput });
     }
 
-    const primaryKey = `${primaryId}/${accessType}/${fileNameDecoded}`;
+    // `fileName` is already decoded (once, by the route's router), which is how the object is stored.
+    // Decoding it again would turn a stored `%20` into a space and throw on a bare `%`.
+    const primaryKey = `${primaryId}/${accessType}/${fileName}`;
 
     const streamResult = await getFileStream(primaryKey);
 
     if (!streamResult.ok && streamResult.error.code === StorageErrorCode.FileNotFoundError && fallbackId) {
-      const fallbackKey = `${fallbackId}/${accessType}/${fileNameDecoded}`;
+      const fallbackKey = `${fallbackId}/${accessType}/${fileName}`;
       return await getFileStream(fallbackKey);
     }
 
@@ -139,8 +163,14 @@ export const deleteFile = async (
   fallbackId?: string
 ) => {
   // Same reasoning as the download path: a `..` segment would let an authorized caller delete objects
-  // outside the workspace prefix they were authorized against.
-  if (hasTraversalSegment(fileName)) {
+  // outside the workspace prefix they were authorized against. An empty segment or a `\` is refused too:
+  // a backend or proxy that merges `//` or maps `\` to `/` would turn `surveys//{other}/…` into another
+  // survey's key. Real keys never hold either, so refusing only leaves an object behind.
+  if (
+    hasTraversalSegmentOrEncodedForm(fileName) ||
+    fileName.includes("\\") ||
+    fileName.split("/").includes("")
+  ) {
     return err({ code: StorageErrorCode.InvalidInput });
   }
 
@@ -169,4 +199,69 @@ export const deleteFilesByWorkspaceId = async (workspaceId: string, environmentI
   }
 
   return results[0];
+};
+
+/**
+ * Best-effort storage cleanup for a workspace that has just been deleted.
+ *
+ * Both callers (workspace deletion and organization deletion) run this *after* the database cascade
+ * has committed, so there is nothing left to roll back and no row left pointing at these objects.
+ * A storage failure — S3 unconfigured, bucket unreachable, objects already gone — is therefore
+ * logged and swallowed: reporting the deletion as failed would be a lie, since the records really
+ * are gone. The cost of that choice is orphaned objects when storage is down, which is the same
+ * trade-off `deleteWorkspace` has always made.
+ */
+export const deleteWorkspaceFilesBestEffort = async (workspace: {
+  id: string;
+  legacyEnvironmentId?: string | null;
+}): Promise<void> => {
+  // Pre-#8044 uploads are keyed by the environment id the workspace was migrated from, so both
+  // prefixes have to go. A null id is dropped here and never reaches deleteFilesByPrefix.
+  const legacyPrefixes = [workspace.legacyEnvironmentId].filter((prefix): prefix is string =>
+    Boolean(prefix)
+  );
+
+  try {
+    const result = await deleteFilesByWorkspaceId(workspace.id, legacyPrefixes);
+
+    if (!result.ok) {
+      logger.error({ error: result.error, workspaceId: workspace.id }, "Error deleting S3 files");
+    }
+  } catch (error) {
+    logger.error({ error, workspaceId: workspace.id }, "Error deleting S3 files");
+  }
+};
+
+/**
+ * Delete a deleted survey's whole upload folder. Returns whether it worked, so the deletion-cleanup drain
+ * can retry a failure; logs it either way.
+ *
+ * Since #8044 the client upload route keys every response upload as
+ * `{workspaceId}/private/surveys/{surveyId}/elements/{elementId}/{file}`, so this one prefix reaches
+ * files a scan of `response.data` cannot: answers to an upload element since removed from the survey,
+ * and files a respondent uploaded but never submitted. Pre-#8044 uploads sit flat under
+ * `{prefix}/private/` with no survey in the key, so for those the response scan remains the only way.
+ *
+ * Only for a survey that is already deleted. On a live survey (a response reset) the same sweep would
+ * also take the upload of a respondent who is mid-survey. The prefix is built from the survey's own
+ * row, never from response data, and the trailing slash keeps one survey id from matching another
+ * that starts with it. The drain checks the survey is gone before calling this.
+ */
+export const deleteSurveyUploadFolder = async ({
+  workspaceId,
+  surveyId,
+}: {
+  workspaceId: string;
+  surveyId: string;
+}): Promise<boolean> => {
+  try {
+    const result = await deleteFilesByPrefix(`${workspaceId}/private/surveys/${surveyId}/`);
+    if (!result.ok) {
+      logger.error({ error: result.error, workspaceId, surveyId }, "Error deleting a survey's S3 files");
+    }
+    return result.ok;
+  } catch (error) {
+    logger.error({ error, workspaceId, surveyId }, "Error deleting a survey's S3 files");
+    return false;
+  }
 };

@@ -1,6 +1,8 @@
 import { createEnv } from "@t3-oss/env-nextjs";
 import { z } from "zod";
+import { logger } from "@formbricks/logger";
 import { AI_PROVIDERS } from "@formbricks/types/ai";
+import { AI_MAX_TIMEOUT_MULTIPLIER } from "@formbricks/types/ai-timeout";
 import { isValidIanaTimeZone } from "@formbricks/types/common";
 import { throwEnvValidationError } from "./env-validation-error";
 
@@ -10,6 +12,27 @@ const isHttpUrl = (value: string): boolean => {
   try {
     const url = new URL(value);
     return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
+const isLoopbackHost = (hostname: string): boolean =>
+  hostname === "localhost" ||
+  hostname.endsWith(".localhost") ||
+  hostname === "127.0.0.1" ||
+  hostname === "[::1]" ||
+  hostname === "::1";
+
+// Mirrors isSecureCredentialUrl in packages/ai: the client secret is sent to this URL, so plain http is
+// only acceptable on loopback. Not imported from @formbricks/ai on purpose — next.config.mjs and the
+// pre-build scripts load this module, and that package drags the whole AI SDK graph in with it. The
+// two copies are held together by `env.test.ts` ("agrees with @formbricks/ai"), which checks startup
+// validation against the package's predicate over the same table of URLs.
+const isSecureCredentialUrl = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || (url.protocol === "http:" && isLoopbackHost(url.hostname));
   } catch {
     return false;
   }
@@ -32,6 +55,41 @@ const ZMcpOauthJwksUrl = z.url().refine(isValidMcpOauthJwksUrl, {
   message: "MCP_OAUTH_JWKS_URL must be a valid http(s) URL without credentials or a fragment",
 });
 
+/**
+ * An exact redirect URI an operator lets anonymous MCP client registration claim (ENG-3471). On top of
+ * the JWKS URL rules (a host, no credentials): https only, because a registered callback is where
+ * authorization codes are delivered; no fragment at all, not even an empty `#` (RFC 6749 §3.1.2); no
+ * `*`, so nobody configures a wildcard expecting it to match — the allowlist compares exact strings;
+ * and not a loopback host, because Better Auth refuses loopback redirects for the `web` clients these
+ * register as, so such an entry could never be used.
+ */
+const isLoopbackHostname = (hostname: string): boolean =>
+  hostname === "localhost" ||
+  hostname.endsWith(".localhost") ||
+  hostname === "[::1]" ||
+  hostname.startsWith("127.");
+
+const isValidDcrRedirectUri = (value: string): boolean => {
+  if (!isValidMcpOauthJwksUrl(value) || value.includes("#") || value.includes("*")) return false;
+  const url = new URL(value);
+  return url.protocol === "https:" && !isLoopbackHostname(url.hostname);
+};
+
+const ZDcrRedirectUri = z.url().refine(isValidDcrRedirectUri, {
+  message:
+    "MCP_DCR_ALLOWED_REDIRECT_URIS entries must be exact, non-loopback https URLs without credentials, a fragment or a wildcard",
+});
+
+/** Comma-separated list; blank, and empty entries from a stray comma, count as unset. */
+const ZDcrRedirectUriList = z.preprocess((value) => {
+  if (typeof value !== "string") return value;
+  const entries = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return entries.length > 0 ? entries : undefined;
+}, z.array(ZDcrRedirectUri).optional());
+
 const ZAIConfigurationEnv = z.object({
   AI_PROVIDER: ZActiveAIProvider.optional(),
   AI_MODEL: z.string().optional(),
@@ -51,6 +109,13 @@ const ZAIConfigurationEnv = z.object({
   AI_OPENAI_COMPATIBLE_SUPPORTS_STRUCTURED_OUTPUTS: z.string().optional(),
   AI_OPENAI_COMPATIBLE_HEADERS_JSON: z.string().optional(),
   AI_OPENAI_COMPATIBLE_QUERY_PARAMS_JSON: z.string().optional(),
+  AI_OPENAI_COMPATIBLE_AUTH_MODE: z.string().optional(),
+  AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL: z.string().optional(),
+  AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID: z.string().optional(),
+  AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET: z.string().optional(),
+  AI_OPENAI_COMPATIBLE_OAUTH_SCOPE: z.string().optional(),
+  AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE: z.string().optional(),
+  AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON: z.string().optional(),
 });
 
 type TAIConfigurationEnv = z.infer<typeof ZAIConfigurationEnv>;
@@ -58,7 +123,15 @@ type TAIConfigurationEnv = z.infer<typeof ZAIConfigurationEnv>;
 const isJsonObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-type TEnvironmentIssuePath = keyof TAIConfigurationEnv | keyof TAuthzedConfigurationEnv;
+type TEnvironmentIssuePath =
+  | keyof TAIConfigurationEnv
+  | keyof TAuthzedConfigurationEnv
+  | keyof TAuthConfigurationEnv
+  | keyof TSesConfigurationEnv
+  | "EMAIL_SEND_AUDIT_ENABLED"
+  | "EMAIL_SEND_AUDIT_BUCKET"
+  | "EMAIL_SEND_AUDIT_KMS_KEY_ARN"
+  | "EMAIL_SEND_AUDIT_HMAC_KEY_ARN";
 
 const addEnvIssue = (ctx: z.RefinementCtx, path: TEnvironmentIssuePath, message: string): void => {
   ctx.addIssue({
@@ -161,6 +234,95 @@ const validateStringRecordEnv = (
   }
 };
 
+const OPENAI_COMPATIBLE_AUTH_MODES = ["api-key", "oauth2-client-credentials"] as const;
+const OPENAI_COMPATIBLE_OAUTH_AUTH_STYLES = ["basic", "post"] as const;
+const OAUTH_MODE_REQUIREMENT = "when AI_OPENAI_COMPATIBLE_AUTH_MODE=oauth2-client-credentials";
+
+const isOneOf = (allowed: readonly string[], value: string | undefined): boolean =>
+  !value?.trim() || allowed.includes(value.trim());
+
+// Mirrors the openai-compatible adapter's validate in packages/ai. Messages name the variable and
+// never echo its value: the client secret sits next to these in the same environment.
+const validateOpenAICompatibleAuthConfiguration = (
+  values: TAIConfigurationEnv,
+  ctx: z.RefinementCtx
+): void => {
+  const authMode = values.AI_OPENAI_COMPATIBLE_AUTH_MODE?.trim();
+
+  if (!isOneOf(OPENAI_COMPATIBLE_AUTH_MODES, authMode)) {
+    addEnvIssue(
+      ctx,
+      "AI_OPENAI_COMPATIBLE_AUTH_MODE",
+      `AI_OPENAI_COMPATIBLE_AUTH_MODE must be one of: ${OPENAI_COMPATIBLE_AUTH_MODES.join(", ")}`
+    );
+    return;
+  }
+
+  // Stray OAUTH_* variables in api-key mode are ignored, exactly as the adapter ignores them.
+  if (authMode !== "oauth2-client-credentials") {
+    return;
+  }
+
+  // In this mode every model request carries a bearer token, so the base URL is held to the same
+  // rule as the token URL. (In api-key mode plain http stays allowed for a keyless internal endpoint.)
+  const baseUrl = values.AI_OPENAI_COMPATIBLE_BASE_URL?.trim();
+
+  if (baseUrl && !isSecureCredentialUrl(baseUrl)) {
+    addEnvIssue(
+      ctx,
+      "AI_OPENAI_COMPATIBLE_BASE_URL",
+      `AI_OPENAI_COMPATIBLE_BASE_URL must be an https URL ${OAUTH_MODE_REQUIREMENT} (plain http is only allowed on localhost)`
+    );
+  }
+
+  const tokenUrl = values.AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL?.trim();
+
+  if (!tokenUrl) {
+    addEnvIssue(
+      ctx,
+      "AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL",
+      `AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL is required ${OAUTH_MODE_REQUIREMENT}`
+    );
+  } else if (!isSecureCredentialUrl(tokenUrl)) {
+    addEnvIssue(
+      ctx,
+      "AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL",
+      "AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL must be an https URL (plain http is only allowed on localhost)"
+    );
+  }
+
+  for (const path of [
+    "AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID",
+    "AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET",
+  ] as const) {
+    if (!values[path]?.trim()) {
+      addEnvIssue(ctx, path, `${path} is required ${OAUTH_MODE_REQUIREMENT}`);
+    }
+  }
+
+  if (!isOneOf(OPENAI_COMPATIBLE_OAUTH_AUTH_STYLES, values.AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE)) {
+    addEnvIssue(
+      ctx,
+      "AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE",
+      `AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE must be one of: ${OPENAI_COMPATIBLE_OAUTH_AUTH_STYLES.join(", ")}`
+    );
+  }
+
+  validateStringRecordEnv(
+    ctx,
+    "AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON",
+    values.AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON
+  );
+
+  if (values.AI_OPENAI_COMPATIBLE_API_KEY?.trim()) {
+    addEnvIssue(
+      ctx,
+      "AI_OPENAI_COMPATIBLE_API_KEY",
+      "AI_OPENAI_COMPATIBLE_API_KEY must not be set when AI_OPENAI_COMPATIBLE_AUTH_MODE=oauth2-client-credentials"
+    );
+  }
+};
+
 const validateOpenAICompatibleAIConfiguration = (values: TAIConfigurationEnv, ctx: z.RefinementCtx): void => {
   if (!values.AI_OPENAI_COMPATIBLE_BASE_URL) {
     addEnvIssue(
@@ -176,6 +338,7 @@ const validateOpenAICompatibleAIConfiguration = (values: TAIConfigurationEnv, ct
     "AI_OPENAI_COMPATIBLE_QUERY_PARAMS_JSON",
     values.AI_OPENAI_COMPATIBLE_QUERY_PARAMS_JSON
   );
+  validateOpenAICompatibleAuthConfiguration(values, ctx);
 };
 
 const validateActiveAIProviderConfiguration = (values: TAIConfigurationEnv, ctx: z.RefinementCtx): void => {
@@ -207,6 +370,14 @@ const ZSurveySchedulingLocalMinute = z.coerce.number().int().min(0).max(59);
 const emptyStringToUndefined = (value: unknown) =>
   typeof value === "string" && value.trim() === "" ? undefined : value;
 const ZOptionalNonEmptyString = z.preprocess(emptyStringToUndefined, z.string().trim().min(1).optional());
+/**
+ * Blank normalizes to unset, but a non-blank value is kept VERBATIM — no `.trim()`, which in zod is a
+ * transform and would rewrite the parsed value. For a secret that is fatal: an instance whose value
+ * carries a trailing newline (what `kubectl create secret --from-file` stores, and what the chart
+ * faithfully round-trips through `b64dec`) has been signing with the untrimmed string, so trimming it
+ * here would invalidate every session and every outstanding invite and verification link.
+ */
+const ZOptionalVerbatimSecret = z.preprocess(emptyStringToUndefined, z.string().min(1).optional());
 const ZAuthzedBoolean = z.enum(["true", "false", "1", "0"]);
 const ZAuthzedConsistency = z.enum(["minimize_latency", "fully_consistent"]).optional();
 const ZAuthzedToken = z
@@ -293,6 +464,131 @@ const validateAuthzedConfiguration = (values: TAuthzedConfigurationEnv, ctx: z.R
   }
 };
 
+/**
+ * The auth secret pair, validated at server start rather than at import.
+ *
+ * Kept out of the module-eval `superRefine` chain on purpose, for the same reason
+ * `assertAuthzedRuntimeConfiguration` is: `next build`, the AuthZed CLI and the typegen script all
+ * import this module with no secrets in scope, and a hard requirement there would fail the build
+ * rather than the misconfigured boot.
+ */
+const ZAuthConfigurationEnv = z.object({
+  BETTER_AUTH_SECRET: z.string().optional(),
+  NEXTAUTH_SECRET: z.string().optional(),
+});
+
+type TAuthConfigurationEnv = z.infer<typeof ZAuthConfigurationEnv>;
+
+/** Truthiness, not `!== undefined`: a blank secret must count as missing here too. */
+const hasValue = (value: string | undefined): value is string => Boolean(value?.trim());
+
+/** The floor Better Auth itself only warns about, and the one this file used to enforce via `.min(32)`. */
+const MIN_AUTH_SECRET_LENGTH = 32;
+
+const validateAuthConfiguration = (values: TAuthConfigurationEnv, ctx: z.RefinementCtx): void => {
+  const betterAuthSecret = values.BETTER_AUTH_SECRET;
+  const legacySecret = values.NEXTAUTH_SECRET;
+
+  if (!hasValue(betterAuthSecret) && !hasValue(legacySecret)) {
+    addEnvIssue(
+      ctx,
+      "BETTER_AUTH_SECRET",
+      "BETTER_AUTH_SECRET is required. Generate one with `openssl rand -hex 32`. " +
+        "(An instance that predates the rename may set NEXTAUTH_SECRET instead; either is accepted. " +
+        "AUTH_SECRET is not: Better Auth reads it, but Formbricks signs its own tokens and does not.)"
+    );
+    return;
+  }
+
+  // The length floor, kept where it still buys something and dropped only where it would trap someone.
+  //
+  // It applies when BETTER_AUTH_SECRET is the ONLY secret set — a fresh install, which has no migration
+  // constraint and would otherwise lose a guard it used to have: Better Auth's own sub-32 check is a
+  // `logger.warn` that scrolls past, and those characters become the HMAC key for session cookies and
+  // for every invite, verification, email-change and survey-PIN token.
+  //
+  // It does NOT apply when NEXTAUTH_SECRET is also set. That is the rename-in-progress shape this
+  // ticket exists to support: an operator copying a shorter legacy secret onto the new name must not be
+  // forced to change its value, because changing it signs everyone out and voids outstanding links.
+  // A legacy-only instance is likewise left alone — it boots today with no floor at all.
+  if (
+    hasValue(betterAuthSecret) &&
+    !hasValue(legacySecret) &&
+    betterAuthSecret.length < MIN_AUTH_SECRET_LENGTH
+  ) {
+    addEnvIssue(
+      ctx,
+      "BETTER_AUTH_SECRET",
+      `BETTER_AUTH_SECRET must be at least ${MIN_AUTH_SECRET_LENGTH} characters. ` +
+        "Generate one with `openssl rand -hex 32`. (Renaming a shorter secret from an older instance? " +
+        "Keep NEXTAUTH_SECRET set alongside it and the existing value is accepted as-is.)"
+    );
+  }
+};
+
+// SES-specific headers are opt-in; validate the pair before any email is sent.
+const ZSesConfigurationEnv = z.object({
+  SES_CONFIGURATION_SET: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^[a-zA-Z0-9_-]+$/)
+    .optional(),
+  SES_EMAIL_ENVIRONMENT: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^[a-zA-Z0-9_-]+$/)
+    .optional(),
+});
+type TSesConfigurationEnv = z.infer<typeof ZSesConfigurationEnv>;
+
+const validateSesConfiguration = (values: TSesConfigurationEnv, ctx: z.RefinementCtx): void => {
+  if (values.SES_CONFIGURATION_SET && !values.SES_EMAIL_ENVIRONMENT) {
+    addEnvIssue(
+      ctx,
+      "SES_EMAIL_ENVIRONMENT",
+      "SES_EMAIL_ENVIRONMENT is required when SES_CONFIGURATION_SET is set"
+    );
+  }
+  if (values.SES_EMAIL_ENVIRONMENT && !values.SES_CONFIGURATION_SET) {
+    addEnvIssue(
+      ctx,
+      "SES_CONFIGURATION_SET",
+      "SES_CONFIGURATION_SET is required when SES_EMAIL_ENVIRONMENT is set"
+    );
+  }
+};
+
+const ZEmailSendAuditEnv = z.object({
+  EMAIL_SEND_AUDIT_ENABLED: z.enum(["1", "0"]).optional(),
+  EMAIL_SEND_AUDIT_BUCKET: z.string().min(1).optional(),
+  EMAIL_SEND_AUDIT_KMS_KEY_ARN: z.string().min(1).optional(),
+  EMAIL_SEND_AUDIT_HMAC_KEY_ARN: z.string().min(1).optional(),
+  SES_EMAIL_ENVIRONMENT: ZSesConfigurationEnv.shape.SES_EMAIL_ENVIRONMENT,
+});
+
+const validateEmailSendAuditConfiguration = (
+  values: z.infer<typeof ZEmailSendAuditEnv>,
+  ctx: z.RefinementCtx
+): void => {
+  if (values.EMAIL_SEND_AUDIT_ENABLED !== "1") return;
+  if (values.SES_EMAIL_ENVIRONMENT !== "production_eu" && values.SES_EMAIL_ENVIRONMENT !== "staging") {
+    addEnvIssue(
+      ctx,
+      "EMAIL_SEND_AUDIT_ENABLED",
+      "Email send auditing is limited to EU production and staging"
+    );
+  }
+  for (const key of [
+    "EMAIL_SEND_AUDIT_BUCKET",
+    "EMAIL_SEND_AUDIT_KMS_KEY_ARN",
+    "EMAIL_SEND_AUDIT_HMAC_KEY_ARN",
+  ] as const) {
+    if (!values[key]) addEnvIssue(ctx, key, `${key} is required when email send auditing is enabled`);
+  }
+};
+
 const parsedEnv = createEnv({
   onValidationError: throwEnvValidationError,
   /*
@@ -300,6 +596,10 @@ const parsedEnv = createEnv({
    * Will throw if you access these variables on the client.
    */
   server: {
+    AI_TIMEOUT_MULTIPLIER: z.preprocess(
+      emptyStringToUndefined,
+      z.coerce.number().min(1).max(AI_MAX_TIMEOUT_MULTIPLIER).default(1)
+    ),
     AI_PROVIDER: ZActiveAIProvider.optional(),
     AI_MODEL: z.string().optional(),
     AIRTABLE_CLIENT_ID: z.string().optional(),
@@ -311,6 +611,8 @@ const parsedEnv = createEnv({
     BREVO_LIST_ID: z.string().optional(),
     DATABASE_URL: z.url(),
     DANGEROUSLY_ALLOW_WEBHOOK_INTERNAL_URLS: z.enum(["1", "0"]).optional(),
+    // Bounded so a misconfiguration cannot pin a background-worker slot for minutes.
+    WEBHOOK_DELIVERY_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).optional(),
     DEBUG_SHOW_RESET_LINK: z.enum(["1", "0"]).optional(),
     // DEBUG is a common ambient env var in CI/tooling, so we accept arbitrary strings here
     // and only treat "1" as enabling Formbricks-specific debug behavior downstream.
@@ -331,15 +633,38 @@ const parsedEnv = createEnv({
     // Cloud-only: when "1", the personal-email sign-up block also applies to invited users.
     // Default (unset/"0") exempts invites — see isSignupEmailDomainBlocked.
     SIGNUP_DOMAIN_CHECK_ON_INVITES: z.enum(["1", "0"]).optional(),
+    /**
+     * Grace window for single-use links minted before the ENG-2758 fix, which carry no `suToken`.
+     *
+     * An ISO 8601 date (`YYYY-MM-DD`); unsigned **encrypted** links are accepted until 00:00 UTC on
+     * it, and rejected from then on. Unset means no grace at all, which is the secure default.
+     *
+     * While it is set the deployment accepts a single-use credential that is bound to no survey, so
+     * a link issued for one survey opens any other on the same instance. On a multi-tenant
+     * deployment that is cross-organisation. Set it only on a single-tenant instance, only long
+     * enough to re-issue the outstanding links, and never without an explicit security decision.
+     */
+    SINGLE_USE_LEGACY_UNSIGNED_UNTIL: z.iso.date().optional(),
     BULLMQ_WORKER_CONCURRENCY: z.coerce.number().int().min(1).optional(),
     BULLMQ_WORKER_COUNT: z.coerce.number().int().min(1).optional(),
     BULLMQ_EXTERNAL_WORKER_ENABLED: z.enum(["1", "0"]).optional(),
     BULLMQ_WORKER_ENABLED: z.enum(["1", "0"]).optional(),
     E2E_TESTING: z.enum(["1", "0"]).optional(),
     EMAIL_AUTH_DISABLED: z.enum(["1", "0"]).optional(),
+    // Scales the per-organization, per-sender and per-deployment email caps
+    // (modules/email/lib/email-rate-limits.ts), for deployments that legitimately send more than the defaults
+    // allow. Per-recipient caps are not scaled. Blank counts as unset, so a templated empty value does not stop
+    // boot.
+    EMAIL_RATE_LIMIT_MULTIPLIER: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.coerce.number().positive().max(100).optional().default(1)
+    ),
     EMAIL_VERIFICATION_DISABLED: z.enum(["1", "0"]).optional(),
     ENCRYPTION_KEY: z.string(),
     ENTERPRISE_LICENSE_KEY: z.string().optional(),
+    // Development only: a local licence server for QA. Ignored unless NODE_ENV is "development" and the
+    // host is loopback (`resolveLicenseServerUrl` in modules/ee/license-check/lib/license-server-url.ts).
+    ENTERPRISE_LICENSE_SERVER_URL: z.url().optional(),
     ENVIRONMENT: z.enum(["production", "staging"]).prefault("production"),
     GITHUB_ID: z.string().optional(),
     GITHUB_SECRET: z.string().optional(),
@@ -366,6 +691,13 @@ const parsedEnv = createEnv({
     AI_OPENAI_COMPATIBLE_SUPPORTS_STRUCTURED_OUTPUTS: z.string().optional(),
     AI_OPENAI_COMPATIBLE_HEADERS_JSON: z.string().optional(),
     AI_OPENAI_COMPATIBLE_QUERY_PARAMS_JSON: z.string().optional(),
+    AI_OPENAI_COMPATIBLE_AUTH_MODE: z.string().optional(),
+    AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL: z.string().optional(),
+    AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID: z.string().optional(),
+    AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET: z.string().optional(),
+    AI_OPENAI_COMPATIBLE_OAUTH_SCOPE: z.string().optional(),
+    AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE: z.string().optional(),
+    AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON: z.string().optional(),
     CUBEJS_API_SECRET: z.string().trim().min(1),
     CUBEJS_API_URL: z.url(),
     CUBEJS_JWT_AUDIENCE: ZOptionalNonEmptyString,
@@ -393,14 +725,24 @@ const parsedEnv = createEnv({
     POSTHOG_KEY: z.string().optional(),
     LOG_LEVEL: z.enum(["debug", "info", "warn", "error", "fatal"]).optional(),
     MAIL_FROM: z.email().optional(),
+    // `NEXTAUTH_*` are the undocumented backward-compatible alias for `BETTER_AUTH_*` (ENG-2599);
+    // lib/constants.ts resolves the pair and explains why the alias is permanent.
+    //
+    // `ZOptionalNonEmptyString`, not `z.string().optional()`: a blank value has to normalize to
+    // *unset* so it falls through to the other variable. `.env.example` ships these keys empty, and an
+    // empty secret is not "no secret" — it is a falsy one, which Better Auth silently replaces with
+    // its own hardcoded default. `assertAuthRuntimeConfiguration` then refuses to start if neither is
+    // actually set, so blank fails loudly at boot instead of quietly at the first invite.
     NEXTAUTH_URL: z.url().optional(),
-    NEXTAUTH_SECRET: z.string().optional(),
-    // Better Auth (ENG-1054). Optional during the additive migration; BA requires a strong
-    // (>=32 char) secret in production and throws if unset there. Enforce the floor when set so a
-    // weak secret can't silently ship (it stays optional for the pre-cutover rollout).
-    BETTER_AUTH_SECRET: z.string().min(32).optional(),
+    NEXTAUTH_SECRET: ZOptionalVerbatimSecret,
+    // No length floor: Better Auth itself only warns below 32 characters, and a hard failure here
+    // would trap an operator renaming a shorter legacy secret — the one fix available to them would be
+    // changing its value, which invalidates every session and outstanding token. Warned about at boot
+    // instead (`warnOnAuthSecretRisks`).
+    BETTER_AUTH_SECRET: ZOptionalVerbatimSecret,
     BETTER_AUTH_URL: z.url().optional(),
     MCP_OAUTH_JWKS_URL: ZMcpOauthJwksUrl.optional(),
+    MCP_DCR_ALLOWED_REDIRECT_URIS: ZDcrRedirectUriList,
     MAIL_FROM_NAME: z.string().optional(),
     NOTION_OAUTH_CLIENT_ID: z.string().optional(),
     NOTION_OAUTH_CLIENT_SECRET: z.string().optional(),
@@ -409,6 +751,7 @@ const parsedEnv = createEnv({
     OIDC_DISPLAY_NAME: z.string().optional(),
     OIDC_ISSUER: z.string().optional(),
     OIDC_SIGNING_ALGORITHM: z.string().optional(),
+    REDIS_TLS_CA: z.string().min(1).optional(),
     REDIS_URL:
       process.env.NODE_ENV === "test"
         ? z.string().optional()
@@ -444,6 +787,7 @@ const parsedEnv = createEnv({
     SENTRY_DSN: z.string().optional(),
     SLACK_CLIENT_ID: z.string().optional(),
     SLACK_CLIENT_SECRET: z.string().optional(),
+    ...ZSesConfigurationEnv.shape,
     SMTP_HOST: z.string().min(1).optional(),
     SMTP_PORT: z.string().min(1).optional(),
     SMTP_SECURE_ENABLED: z.enum(["1", "0"]).optional(),
@@ -451,6 +795,7 @@ const parsedEnv = createEnv({
     SMTP_PASSWORD: z.string().min(1).optional(),
     SMTP_AUTHENTICATED: z.enum(["1", "0"]).optional(),
     SMTP_REJECT_UNAUTHORIZED_TLS: z.enum(["1", "0"]).optional(),
+    SMTP_REQUIRE_TLS: z.enum(["1", "0"]).optional(),
     STRIPE_SECRET_KEY: z.string().optional(),
     STRIPE_WEBHOOK_SECRET: z.string().optional(),
     STRIPE_PUBLISHABLE_KEY: z.string().optional(),
@@ -486,6 +831,10 @@ const parsedEnv = createEnv({
     PROMETHEUS_ENABLED: z.enum(["1", "0"]).optional(),
     USER_MANAGEMENT_MINIMUM_ROLE: z.enum(["owner", "manager", "disabled"]).optional(),
     AUDIT_LOG_ENABLED: z.enum(["1", "0"]).optional(),
+    EMAIL_SEND_AUDIT_ENABLED: z.enum(["1", "0"]).optional(),
+    EMAIL_SEND_AUDIT_BUCKET: z.string().min(1).optional(),
+    EMAIL_SEND_AUDIT_KMS_KEY_ARN: z.string().min(1).optional(),
+    EMAIL_SEND_AUDIT_HMAC_KEY_ARN: z.string().min(1).optional(),
     AUDIT_LOG_GET_USER_IP: z.enum(["1", "0"]).optional(),
     SESSION_MAX_AGE: z
       .string()
@@ -495,6 +844,14 @@ const parsedEnv = createEnv({
     SURVEY_SCHEDULING_TIME_ZONE: ZSurveySchedulingTimeZone.optional().default("Europe/Berlin"),
     SURVEY_SCHEDULING_LOCAL_HOUR: ZSurveySchedulingLocalHour.optional().default(0),
     SURVEY_SCHEDULING_LOCAL_MINUTE: ZSurveySchedulingLocalMinute.optional().default(0),
+    // Online upgrade settings.
+    FORMBRICKS_DEPLOYMENT_ID: z.string().min(1).optional(),
+    MIGRATE_DATABASE_URL: z.string().optional(),
+    FORMBRICKS_UPGRADE_MODE: z.enum(["online", "maintenance"]).optional(),
+    // "1" disables visibility mutations; stored restrictions remain enforced.
+    SURVEY_VISIBILITY_FORCE_DISABLED: z.enum(["1", "0"]).optional(),
+    // ENG-3282: most surveys one workspace may hold (archived included). Unset means 10,000.
+    SURVEY_WORKSPACE_LIMIT: z.coerce.number().int().positive().optional(),
   },
   client: {},
 
@@ -505,6 +862,7 @@ const parsedEnv = createEnv({
    * 💡 You'll get type errors if not all variables from `server` & `client` are included here.
    */
   runtimeEnv: {
+    AI_TIMEOUT_MULTIPLIER: process.env.AI_TIMEOUT_MULTIPLIER,
     AI_PROVIDER: process.env.AI_PROVIDER,
     AI_MODEL: process.env.AI_MODEL,
     AIRTABLE_CLIENT_ID: process.env.AIRTABLE_CLIENT_ID,
@@ -514,11 +872,13 @@ const parsedEnv = createEnv({
     BETTER_AUTH_SECRET: process.env.BETTER_AUTH_SECRET,
     BETTER_AUTH_URL: process.env.BETTER_AUTH_URL,
     MCP_OAUTH_JWKS_URL: process.env.MCP_OAUTH_JWKS_URL,
+    MCP_DCR_ALLOWED_REDIRECT_URIS: process.env.MCP_DCR_ALLOWED_REDIRECT_URIS,
     BREVO_API_KEY: process.env.BREVO_API_KEY,
     BREVO_LIST_ID: process.env.BREVO_LIST_ID,
     CRON_SECRET: process.env.CRON_SECRET,
     DATABASE_URL: process.env.DATABASE_URL,
     DANGEROUSLY_ALLOW_WEBHOOK_INTERNAL_URLS: process.env.DANGEROUSLY_ALLOW_WEBHOOK_INTERNAL_URLS,
+    WEBHOOK_DELIVERY_TIMEOUT_MS: process.env.WEBHOOK_DELIVERY_TIMEOUT_MS,
     DEBUG: process.env.DEBUG,
     DEBUG_SHOW_RESET_LINK: process.env.DEBUG_SHOW_RESET_LINK,
     AUTH_DEFAULT_ORGANIZATION_ID: process.env.AUTH_SSO_DEFAULT_ORGANIZATION_ID,
@@ -532,15 +892,18 @@ const parsedEnv = createEnv({
     AUTHZED_SYSTEM_KEY: process.env.AUTHZED_SYSTEM_KEY,
     AUTHZED_TOKEN: process.env.AUTHZED_TOKEN,
     SIGNUP_DOMAIN_CHECK_ON_INVITES: process.env.SIGNUP_DOMAIN_CHECK_ON_INVITES,
+    SINGLE_USE_LEGACY_UNSIGNED_UNTIL: process.env.SINGLE_USE_LEGACY_UNSIGNED_UNTIL,
     BULLMQ_EXTERNAL_WORKER_ENABLED: process.env.BULLMQ_EXTERNAL_WORKER_ENABLED,
     BULLMQ_WORKER_CONCURRENCY: process.env.BULLMQ_WORKER_CONCURRENCY,
     BULLMQ_WORKER_COUNT: process.env.BULLMQ_WORKER_COUNT,
     BULLMQ_WORKER_ENABLED: process.env.BULLMQ_WORKER_ENABLED,
     E2E_TESTING: process.env.E2E_TESTING,
     EMAIL_AUTH_DISABLED: process.env.EMAIL_AUTH_DISABLED,
+    EMAIL_RATE_LIMIT_MULTIPLIER: process.env.EMAIL_RATE_LIMIT_MULTIPLIER,
     EMAIL_VERIFICATION_DISABLED: process.env.EMAIL_VERIFICATION_DISABLED,
     ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
     ENTERPRISE_LICENSE_KEY: process.env.ENTERPRISE_LICENSE_KEY,
+    ENTERPRISE_LICENSE_SERVER_URL: process.env.ENTERPRISE_LICENSE_SERVER_URL,
     ENVIRONMENT: process.env.ENVIRONMENT,
     GITHUB_ID: process.env.GITHUB_ID,
     GITHUB_SECRET: process.env.GITHUB_SECRET,
@@ -568,6 +931,13 @@ const parsedEnv = createEnv({
       process.env.AI_OPENAI_COMPATIBLE_SUPPORTS_STRUCTURED_OUTPUTS,
     AI_OPENAI_COMPATIBLE_HEADERS_JSON: process.env.AI_OPENAI_COMPATIBLE_HEADERS_JSON,
     AI_OPENAI_COMPATIBLE_QUERY_PARAMS_JSON: process.env.AI_OPENAI_COMPATIBLE_QUERY_PARAMS_JSON,
+    AI_OPENAI_COMPATIBLE_AUTH_MODE: process.env.AI_OPENAI_COMPATIBLE_AUTH_MODE,
+    AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL: process.env.AI_OPENAI_COMPATIBLE_OAUTH_TOKEN_URL,
+    AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID: process.env.AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_ID,
+    AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET: process.env.AI_OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET,
+    AI_OPENAI_COMPATIBLE_OAUTH_SCOPE: process.env.AI_OPENAI_COMPATIBLE_OAUTH_SCOPE,
+    AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE: process.env.AI_OPENAI_COMPATIBLE_OAUTH_AUTH_STYLE,
+    AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON: process.env.AI_OPENAI_COMPATIBLE_OAUTH_EXTRA_PARAMS_JSON,
     CUBEJS_API_SECRET: process.env.CUBEJS_API_SECRET,
     CUBEJS_API_URL: process.env.CUBEJS_API_URL,
     CUBEJS_JWT_AUDIENCE: process.env.CUBEJS_JWT_AUDIENCE,
@@ -595,6 +965,11 @@ const parsedEnv = createEnv({
     SURVEY_SCHEDULING_LOCAL_HOUR: process.env.SURVEY_SCHEDULING_LOCAL_HOUR,
     SURVEY_SCHEDULING_LOCAL_MINUTE: process.env.SURVEY_SCHEDULING_LOCAL_MINUTE,
     SURVEY_SCHEDULING_TIME_ZONE: process.env.SURVEY_SCHEDULING_TIME_ZONE,
+    FORMBRICKS_DEPLOYMENT_ID: process.env.FORMBRICKS_DEPLOYMENT_ID,
+    MIGRATE_DATABASE_URL: process.env.MIGRATE_DATABASE_URL,
+    FORMBRICKS_UPGRADE_MODE: process.env.FORMBRICKS_UPGRADE_MODE,
+    SURVEY_VISIBILITY_FORCE_DISABLED: process.env.SURVEY_VISIBILITY_FORCE_DISABLED,
+    SURVEY_WORKSPACE_LIMIT: process.env.SURVEY_WORKSPACE_LIMIT,
     SENTRY_DSN: process.env.SENTRY_DSN,
     NOTION_OAUTH_CLIENT_ID: process.env.NOTION_OAUTH_CLIENT_ID,
     NOTION_OAUTH_CLIENT_SECRET: process.env.NOTION_OAUTH_CLIENT_SECRET,
@@ -603,6 +978,7 @@ const parsedEnv = createEnv({
     OIDC_DISPLAY_NAME: process.env.OIDC_DISPLAY_NAME,
     OIDC_ISSUER: process.env.OIDC_ISSUER,
     OIDC_SIGNING_ALGORITHM: process.env.OIDC_SIGNING_ALGORITHM,
+    REDIS_TLS_CA: process.env.REDIS_TLS_CA,
     REDIS_URL: process.env.REDIS_URL,
     PASSWORD_HIBP_CHECK_DISABLED: process.env.PASSWORD_HIBP_CHECK_DISABLED,
     PASSWORD_RESET_DISABLED: process.env.PASSWORD_RESET_DISABLED,
@@ -620,12 +996,15 @@ const parsedEnv = createEnv({
     SAML_DATABASE_URL: process.env.SAML_DATABASE_URL,
     SLACK_CLIENT_ID: process.env.SLACK_CLIENT_ID,
     SLACK_CLIENT_SECRET: process.env.SLACK_CLIENT_SECRET,
+    SES_CONFIGURATION_SET: process.env.SES_CONFIGURATION_SET,
+    SES_EMAIL_ENVIRONMENT: process.env.SES_EMAIL_ENVIRONMENT,
     SMTP_HOST: process.env.SMTP_HOST,
     SMTP_PASSWORD: process.env.SMTP_PASSWORD,
     SMTP_PORT: process.env.SMTP_PORT,
     SMTP_SECURE_ENABLED: process.env.SMTP_SECURE_ENABLED,
     SMTP_USER: process.env.SMTP_USER,
     SMTP_REJECT_UNAUTHORIZED_TLS: process.env.SMTP_REJECT_UNAUTHORIZED_TLS,
+    SMTP_REQUIRE_TLS: process.env.SMTP_REQUIRE_TLS,
     SMTP_AUTHENTICATED: process.env.SMTP_AUTHENTICATED,
     STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY,
     STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET,
@@ -643,6 +1022,10 @@ const parsedEnv = createEnv({
     PROMETHEUS_EXPORTER_PORT: process.env.PROMETHEUS_EXPORTER_PORT,
     USER_MANAGEMENT_MINIMUM_ROLE: process.env.USER_MANAGEMENT_MINIMUM_ROLE,
     AUDIT_LOG_ENABLED: process.env.AUDIT_LOG_ENABLED,
+    EMAIL_SEND_AUDIT_ENABLED: process.env.EMAIL_SEND_AUDIT_ENABLED,
+    EMAIL_SEND_AUDIT_BUCKET: process.env.EMAIL_SEND_AUDIT_BUCKET,
+    EMAIL_SEND_AUDIT_KMS_KEY_ARN: process.env.EMAIL_SEND_AUDIT_KMS_KEY_ARN,
+    EMAIL_SEND_AUDIT_HMAC_KEY_ARN: process.env.EMAIL_SEND_AUDIT_HMAC_KEY_ARN,
     AUDIT_LOG_GET_USER_IP: process.env.AUDIT_LOG_GET_USER_IP,
     SESSION_MAX_AGE: process.env.SESSION_MAX_AGE,
     SENTRY_ENVIRONMENT: process.env.SENTRY_ENVIRONMENT,
@@ -650,8 +1033,12 @@ const parsedEnv = createEnv({
 });
 
 const ZPostParseEnv = ZAIConfigurationEnv.extend(ZAuthzedConfigurationEnv.shape)
+  .extend(ZSesConfigurationEnv.shape)
+  .extend(ZEmailSendAuditEnv.shape)
   .superRefine(validateActiveAIProviderConfiguration)
-  .superRefine(validateAuthzedConfiguration);
+  .superRefine(validateAuthzedConfiguration)
+  .superRefine(validateSesConfiguration)
+  .superRefine(validateEmailSendAuditConfiguration);
 const postParseResult = ZPostParseEnv.safeParse(parsedEnv);
 
 if (!postParseResult.success) {
@@ -670,17 +1057,77 @@ export const assertAuthzedRuntimeConfiguration = (): void => {
       addEnvIssue(
         ctx,
         "AUTHZED_ENABLED",
-        "Formbricks v6 requires AUTHZED_ENABLED=true; configure SpiceDB before starting the server. See https://formbricks.com/docs/self-hosting/advanced/authzed-operations"
+        "Formbricks v6 requires AUTHZED_ENABLED=true; configure SpiceDB before starting the server. See https://formbricks.com/docs/self-hosting/configuration/authzed-operations"
       );
     }
     // Report missing credentials even when enablement was omitted.
     validateAuthzedConfiguration({ ...values, AUTHZED_ENABLED: "true" }, ctx);
     if (values.AUTHZED_CONSISTENCY !== "fully_consistent") {
-      addEnvIssue(ctx, "AUTHZED_CONSISTENCY", "Formbricks v6 requires AUTHZED_CONSISTENCY=fully_consistent");
+      // Name the value found: a pre-v6 .env carries `minimize_latency`, and the fix is a one-line edit.
+      // Safe to echo — the schema has already narrowed it to an enum member or undefined.
+      const current =
+        values.AUTHZED_CONSISTENCY === undefined ? "is not set" : `is "${values.AUTHZED_CONSISTENCY}"`;
+      addEnvIssue(
+        ctx,
+        "AUTHZED_CONSISTENCY",
+        `Formbricks v6 requires AUTHZED_CONSISTENCY=fully_consistent, but it ${current}. Set AUTHZED_CONSISTENCY=fully_consistent in your .env or deployment environment and restart. See https://formbricks.com/docs/self-hosting/configuration/authzed-operations`
+      );
     }
   }).safeParse(env);
 
   if (!result.success) {
     throwEnvValidationError(result.error.issues);
+  }
+};
+
+/**
+ * Refuse to start without an auth secret.
+ *
+ * Deliberately a runtime assertion rather than a module-eval refinement — see
+ * `ZAuthConfigurationEnv`. Called from `instrumentation.ts` (behind the build-phase guard) and from
+ * `scripts/docker/validate-env.ts --server`, which the container entrypoint runs before migrations.
+ * Without it, a fresh install that set neither variable signs in and only then discovers that invites
+ * and verification links cannot be minted.
+ */
+export const assertAuthRuntimeConfiguration = (): void => {
+  const result = ZAuthConfigurationEnv.superRefine(validateAuthConfiguration).safeParse(env);
+
+  if (!result.success) {
+    throwEnvValidationError(result.error.issues);
+  }
+};
+
+/**
+ * Warn about the two auth-secret configurations that work but will bite.
+ *
+ * Never logs the secrets, their lengths, or any prefix of them: this goes to pino and on to SigNoz,
+ * and the precedent for anything secret-adjacent is `auth.ts`'s `sendVerificationEmail`, which logs
+ * the domain and never the address, the token, or the URL.
+ */
+export const warnOnAuthSecretRisks = (): void => {
+  // Compared verbatim: two secrets differing only in trailing whitespace ARE different secrets, and
+  // that is exactly the pair an operator most needs told about.
+  const betterAuthSecret = env.BETTER_AUTH_SECRET;
+  const nextAuthSecret = env.NEXTAUTH_SECRET;
+
+  // The add-instead-of-rename footgun: BETTER_AUTH_SECRET wins, so adding it with a NEW value rather
+  // than moving the existing one across silently invalidates every session and every outstanding
+  // invite, verification and email-change link.
+  if (betterAuthSecret && nextAuthSecret && betterAuthSecret !== nextAuthSecret) {
+    logger.warn(
+      "BETTER_AUTH_SECRET and NEXTAUTH_SECRET are both set to different values. BETTER_AUTH_SECRET wins, " +
+        "so sessions and outstanding invite, verification and email-change links signed with the other one " +
+        "are no longer valid. To keep them, set BETTER_AUTH_SECRET to the value NEXTAUTH_SECRET already had."
+    );
+  }
+
+  // Better Auth warns below 32 too; ours is the actionable version, since we accept the shorter value.
+  const resolvedSecret = betterAuthSecret ?? nextAuthSecret;
+  if (resolvedSecret && resolvedSecret.length < 32) {
+    logger.warn(
+      "The configured auth secret is shorter than the recommended 32 characters. It signs session " +
+        "cookies and every invite, verification and email-change token, so a short one is worth rotating " +
+        "— generate a replacement with `openssl rand -hex 32`. Rotating invalidates existing sessions and links."
+    );
   }
 };

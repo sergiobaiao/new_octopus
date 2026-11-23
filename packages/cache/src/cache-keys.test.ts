@@ -32,6 +32,17 @@ describe("@formbricks/cache cacheKeys", () => {
       });
     });
 
+    describe("custom css namespace", () => {
+      test("should version reprocessed output by processor version and source hash", () => {
+        expect(createCacheKey.customCss.reprocessed("survey", 3, "abc123")).toBe(
+          "fb:custom-css:survey:v3:abc123"
+        );
+        expect(createCacheKey.customCss.reprocessed("survey", 4, "abc123")).not.toBe(
+          createCacheKey.customCss.reprocessed("survey", 3, "abc123")
+        );
+      });
+    });
+
     describe("organization namespace", () => {
       test("should create organization billing key", () => {
         const key = createCacheKey.organization.billing("org-123");
@@ -93,6 +104,12 @@ describe("@formbricks/cache cacheKeys", () => {
         expect(loginKey).toBe("fb:rate_limit:auth:login:user-456:1640995300");
       });
 
+      test("should create an in-flight key apart from every window's key", () => {
+        expect(createCacheKey.rateLimit.inFlight("api:v3:charts:in-flight", "key-abc")).toBe(
+          "fb:rate_limit:api:v3:charts:in-flight:key-abc:in_flight"
+        );
+      });
+
       test("should convert window start number to string", () => {
         const key = createCacheKey.rateLimit.core("webhook", "endpoint-789", 0);
         expect(key).toBe("fb:rate_limit:webhook:endpoint-789:0");
@@ -108,6 +125,69 @@ describe("@formbricks/cache cacheKeys", () => {
       });
     });
 
+    describe("creative stats namespace", () => {
+      test("keys one UTC day's counters of a creative, and the day's flush sets", () => {
+        expect(createCacheKey.creativeStats.devices("2026-10-16", "clcr1")).toBe(
+          "fb:creative-stats:{2026-10-16}:clcr1:devices"
+        );
+        expect(createCacheKey.creativeStats.pages("2026-10-16", "clcr1")).toBe(
+          "fb:creative-stats:{2026-10-16}:clcr1:pages"
+        );
+        expect(createCacheKey.creativeStats.pending("2026-10-16")).toBe(
+          "fb:creative-stats:{2026-10-16}:pending"
+        );
+        expect(createCacheKey.creativeStats.flushing("2026-10-16")).toBe(
+          "fb:creative-stats:{2026-10-16}:flushing"
+        );
+      });
+
+      test("puts every key used by a day's Redis scripts in the same cluster slot", () => {
+        const day = "2026-10-16";
+        const keys = [
+          createCacheKey.creativeStats.pending(day),
+          createCacheKey.creativeStats.flushing(day),
+          createCacheKey.creativeStats.devices(day, "clcr1"),
+          createCacheKey.creativeStats.pages(day, "clcr1"),
+          createCacheKey.creativeStats.devices(day, "clcr2"),
+          createCacheKey.creativeStats.pages(day, "clcr2"),
+        ];
+        expect(keys.map((key) => /\{([^}]+)\}/.exec(key)?.[1])).toEqual(Array(keys.length).fill(day));
+      });
+
+      test("keeps the old untagged keys readable during a rolling upgrade", () => {
+        const day = "2026-10-16";
+        expect(createCacheKey.creativeStats.legacyDevices(day, "clcr1")).toBe(
+          "fb:creative-stats:2026-10-16:clcr1:devices"
+        );
+        expect(createCacheKey.creativeStats.legacyPages(day, "clcr1")).toBe(
+          "fb:creative-stats:2026-10-16:clcr1:pages"
+        );
+        expect(createCacheKey.creativeStats.legacyPending(day)).toBe("fb:creative-stats:2026-10-16:pending");
+        expect(createCacheKey.creativeStats.legacyFlushing(day)).toBe(
+          "fb:creative-stats:2026-10-16:flushing"
+        );
+      });
+
+      test("rejects an empty tagged day", () => {
+        expect(() => createCacheKey.creativeStats.devices("", "clcr1")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+        expect(() => createCacheKey.creativeStats.pages("", "clcr1")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+        expect(() => createCacheKey.creativeStats.pending("")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+        expect(() => createCacheKey.creativeStats.flushing("")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+
+      test("keys the countable creative ids by workspace, next to its state, and by the ids' hash", () => {
+        expect(createCacheKey.workspace.creativeIds("clws1", "ab12")).toBe("fb:env:clws1:creative-ids:ab12");
+      });
+    });
+
     describe("hub namespace", () => {
       test("should create feedback record tenant key", () => {
         const key = createCacheKey.hub.feedbackRecordTenant("0194d8a0-3d55-7ff4-9f62-8d02c3fbcfe8");
@@ -117,6 +197,14 @@ describe("@formbricks/cache cacheKeys", () => {
       test("should throw error for empty feedback record id", () => {
         expect(() => createCacheKey.hub.feedbackRecordTenant("")).toThrow(
           "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+    });
+
+    describe("survey import namespace", () => {
+      test("scopes an idempotency key to the user who sent it", () => {
+        expect(createCacheKey.surveyImport.idempotency("user-1", "abc123")).toBe(
+          "fb:survey_import:user-1:idempotency:abc123"
         );
       });
     });

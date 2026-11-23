@@ -4,34 +4,21 @@ import { TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import { TSegment } from "@formbricks/types/segment";
 import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
-import { TSurvey, TSurveyQuestion, TSurveyQuestionTypeEnum } from "@formbricks/types/surveys/types";
+import {
+  TSurvey,
+  TSurveyQuestion,
+  TSurveyQuestionTypeEnum,
+  ZSurveyStyling,
+} from "@formbricks/types/surveys/types";
 import * as videoValidation from "@/lib/utils/video-upload";
 import * as fileValidation from "@/modules/storage/utils";
 import {
   anySurveyHasFilters,
   checkForInvalidImagesInQuestions,
   checkForInvalidMediaInBlocks,
-  isAppSurveyMissingTriggersToPublish,
   transformPrismaSurvey,
   validateMediaAndPrepareBlocks,
 } from "./utils";
-
-describe("isAppSurveyMissingTriggersToPublish", () => {
-  test("flags a non-draft app survey with no triggers", () => {
-    expect(isAppSurveyMissingTriggersToPublish("app", "inProgress", [])).toBe(true);
-    expect(isAppSurveyMissingTriggersToPublish("app", "paused", null)).toBe(true);
-    expect(isAppSurveyMissingTriggersToPublish("app", "completed", undefined)).toBe(true);
-  });
-
-  test("allows a non-draft app survey that has at least one trigger", () => {
-    expect(isAppSurveyMissingTriggersToPublish("app", "inProgress", [{ actionClassId: "a" }])).toBe(false);
-  });
-
-  test("ignores draft app surveys and non-app surveys", () => {
-    expect(isAppSurveyMissingTriggersToPublish("app", "draft", [])).toBe(false);
-    expect(isAppSurveyMissingTriggersToPublish("link", "inProgress", [])).toBe(false);
-  });
-});
 
 describe("transformPrismaSurvey", () => {
   test("transforms prisma survey without segment", () => {
@@ -111,6 +98,33 @@ describe("transformPrismaSurvey", () => {
       displayPercentage: null,
       segment: null,
     });
+  });
+
+  test("drops stored theme values that could add CSS and keeps the valid ones", () => {
+    const storedStyling = {
+      brandColor: { light: "#64748b" },
+      buttonHeight: "40px",
+      inputShadow: "0 1px 2px red; } body { display: none",
+      fontFamily: "Inter, sans-serif",
+      elementHeadlineFontWeight: "heavy",
+      background: { bgType: "color", bg: "url(https://example.com/x.png)" },
+    };
+
+    const { styling } = transformPrismaSurvey<TSurvey>({ id: "survey1", styling: storedStyling });
+
+    expect(ZSurveyStyling.parse(styling)).toMatchObject({
+      brandColor: { light: "#64748b" },
+      buttonHeight: "40px",
+      fontFamily: "Inter, sans-serif",
+    });
+    expect(styling?.inputShadow).toBeUndefined();
+    expect(styling?.elementHeadlineFontWeight).toBeUndefined();
+    expect(styling?.background?.bg).toBeUndefined();
+  });
+
+  test("leaves a survey read without its styling column without one", () => {
+    expect(transformPrismaSurvey({ id: "survey1" })).not.toHaveProperty("styling");
+    expect(transformPrismaSurvey<TSurvey>({ id: "survey1", styling: null }).styling).toBeNull();
   });
 });
 

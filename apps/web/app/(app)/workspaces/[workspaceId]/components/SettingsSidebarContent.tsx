@@ -5,15 +5,17 @@ import {
   BlocksIcon,
   BrushIcon,
   Building2Icon,
+  ChartColumnIcon,
   ChevronDownIcon,
   CodeXmlIcon,
   CreditCardIcon,
+  DatabaseIcon,
   FoldersIcon,
   GlobeIcon,
+  HourglassIcon,
   KeyIcon,
   LanguagesIcon,
   ListChecksIcon,
-  Loader2,
   ShieldIcon,
   TagIcon,
   UnplugIcon,
@@ -27,45 +29,47 @@ import { TOrganizationRole } from "@formbricks/types/memberships";
 import { cn } from "@/lib/cn";
 import { getAccessFlags } from "@/lib/membership/utils";
 import {
+  SWITCHER_DROPDOWN_CONTENT_CLASS_NAME,
+  SwitcherDropdownBody,
+} from "@/modules/settings/components/switcher-dropdown-body";
+import {
   accountSettingsPath,
   organizationSettingsPath,
   workspaceSettingsPath,
 } from "@/modules/settings/lib/routes";
 import {
   DropdownMenu,
-  DropdownMenuCheckboxItem,
   DropdownMenuContent,
-  DropdownMenuGroup,
   DropdownMenuTrigger,
 } from "@/modules/ui/components/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/modules/ui/components/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/modules/ui/components/tooltip";
 
 interface SettingsSidebarContentProps {
-  workspaceId: string;
-  workspaceName: string;
-  organizationId: string;
-  organizationName: string;
-  membershipRole?: TOrganizationRole;
-  isFormbricksCloud: boolean;
-  isCollapsed: boolean;
-  isTextVisible: boolean;
+  readonly workspaceId: string;
+  readonly workspaceName: string;
+  readonly organizationId: string;
+  readonly organizationName: string;
+  readonly membershipRole?: TOrganizationRole;
+  readonly isFormbricksCloud: boolean;
+  readonly isCollapsed: boolean;
+  readonly isTextVisible: boolean;
   // Hidden when the user has no workspace (org/account settings still render).
-  hideWorkspaceSection?: boolean;
+  readonly hideWorkspaceSection?: boolean;
   // Workspace switcher
-  workspaces: { id: string; name: string }[];
-  isLoadingWorkspaces: boolean;
-  onWorkspaceChange: (id: string) => void;
-  onWorkspaceDropdownOpen: () => void;
-  errorWorkspaces?: string | null;
-  onWorkspaceRetry?: () => void;
+  readonly workspaces: { id: string; name: string }[];
+  readonly isLoadingWorkspaces: boolean;
+  readonly onWorkspaceChange: (id: string) => void;
+  readonly onWorkspaceDropdownOpen: () => void;
+  readonly errorWorkspaces?: string | null;
+  readonly onWorkspaceRetry?: () => void;
   // Organization switcher
-  organizations: { id: string; name: string }[];
-  isLoadingOrganizations: boolean;
-  onOrganizationChange: (id: string) => void;
-  onOrganizationDropdownOpen: () => void;
-  errorOrganizations?: string | null;
-  onOrganizationRetry?: () => void;
+  readonly organizations: { id: string; name: string }[];
+  readonly isLoadingOrganizations: boolean;
+  readonly onOrganizationChange: (id: string) => void;
+  readonly onOrganizationDropdownOpen: () => void;
+  readonly errorOrganizations?: string | null;
+  readonly onOrganizationRetry?: () => void;
 }
 
 interface NavItem {
@@ -174,6 +178,7 @@ const SettingsNavLink = ({
 
 const SectionHeader = ({
   label,
+  switcherType,
   isCollapsed,
   isTextVisible,
   switcherName,
@@ -186,6 +191,7 @@ const SectionHeader = ({
   onSwitcherOpen,
 }: Readonly<{
   label: string;
+  switcherType?: "organization" | "workspace";
   isCollapsed: boolean;
   isTextVisible: boolean;
   switcherName?: string;
@@ -197,46 +203,6 @@ const SectionHeader = ({
   onSwitcherChange?: (id: string) => void;
   onSwitcherOpen?: () => void;
 }>) => {
-  const { t } = useTranslation();
-
-  const renderSwitcherContent = () => {
-    if (isLoadingSwitcher) {
-      return (
-        <div className="flex items-center justify-center py-2">
-          <Loader2 className="size-4 animate-spin" />
-        </div>
-      );
-    }
-
-    if (errorSwitcher) {
-      return (
-        <div className="px-2 py-4 text-center">
-          <p className="mb-2 text-sm text-red-600">{errorSwitcher}</p>
-          <button
-            type="button"
-            onClick={onSwitcherRetry}
-            className="text-xs text-slate-600 underline hover:text-slate-800">
-            {t("common.try_again")}
-          </button>
-        </div>
-      );
-    }
-
-    return (
-      <DropdownMenuGroup className="overflow-y-auto">
-        {switcherItems?.map((item) => (
-          <DropdownMenuCheckboxItem
-            key={item.id}
-            checked={item.id === currentId}
-            onClick={() => onSwitcherChange?.(item.id)}
-            className="cursor-pointer text-sm">
-            {item.name}
-          </DropdownMenuCheckboxItem>
-        ))}
-      </DropdownMenuGroup>
-    );
-  };
-
   if (isCollapsed) {
     return null;
   }
@@ -248,14 +214,23 @@ const SectionHeader = ({
         isTextVisible ? "opacity-0" : "opacity-100"
       )}>
       <span className="shrink-0 text-xs font-semibold tracking-wider text-slate-500 uppercase">{label}</span>
-      {switcherName && switcherItems && onSwitcherChange && (
+      {switcherType && switcherName && switcherItems && onSwitcherChange && (
         <DropdownMenu onOpenChange={(open) => open && onSwitcherOpen?.()}>
           <DropdownMenuTrigger className="ml-auto flex max-w-[50%] min-w-0 items-center gap-1 rounded-md border border-slate-200 px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50">
             <span className="truncate">{switcherName}</span>
             <ChevronDownIcon className="size-3" />
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="max-h-[300px]">
-            {renderSwitcherContent()}
+          <DropdownMenuContent align="end" className={SWITCHER_DROPDOWN_CONTENT_CLASS_NAME}>
+            <SwitcherDropdownBody
+              type={switcherType}
+              isLoading={isLoadingSwitcher ?? false}
+              error={errorSwitcher ?? null}
+              onRetry={() => onSwitcherRetry?.()}
+              items={switcherItems}
+              selectedId={currentId ?? ""}
+              onSelect={onSwitcherChange}
+              showSettings={false}
+            />
           </DropdownMenuContent>
         </DropdownMenu>
       )}
@@ -288,7 +263,7 @@ export const SettingsSidebarContent = ({
 }: SettingsSidebarContentProps) => {
   const pathname = usePathname();
   const { t } = useTranslation();
-  const { isMember, isBilling, isOwner, isManager } = getAccessFlags(membershipRole);
+  const { isMember, isBilling, isOwner, isManager, isDashboardViewer } = getAccessFlags(membershipRole);
   const isOwnerOrManager = isOwner || isManager;
   const iconClassName = "h-4 w-4 shrink-0";
 
@@ -315,6 +290,15 @@ export const SettingsSidebarContent = ({
       label: t("common.survey_languages"),
       href: workspaceSettingsPath(workspaceId, "languages"),
       icon: <LanguagesIcon className={iconClassName} />,
+      disabled: isBilling,
+    },
+    // Directly below Survey Languages: both are things a survey is composed from rather than things
+    // the workspace is connected to, and an author reaches for them at the same point.
+    {
+      id: "embedded-data",
+      label: t("common.embedded_data"),
+      href: workspaceSettingsPath(workspaceId, "embedded-data"),
+      icon: <DatabaseIcon className={iconClassName} />,
       disabled: isBilling,
     },
     {
@@ -385,6 +369,14 @@ export const SettingsSidebarContent = ({
       disabled: !isOwnerOrManager,
     },
     {
+      id: "org-data-retention",
+      label: t("workspace.settings.data_retention.nav_label"),
+      href: organizationSettingsPath(organizationId, "data-retention"),
+      icon: <HourglassIcon className={iconClassName} />,
+      // Members read the policies and exemptions; History is owners and managers only (ENG-3695).
+      hidden: isBilling,
+    },
+    {
       id: "org-domain",
       label: t("common.domain"),
       href: organizationSettingsPath(organizationId, "domain"),
@@ -405,6 +397,13 @@ export const SettingsSidebarContent = ({
       icon: <ShieldIcon className={iconClassName} />,
       hidden: isFormbricksCloud,
       disabled: isMember || isBilling,
+    },
+    {
+      id: "org-usage",
+      label: t("workspace.settings.usage.nav_label"),
+      href: organizationSettingsPath(organizationId, "usage"),
+      icon: <ChartColumnIcon className={iconClassName} />,
+      hidden: !isOwnerOrManager || isFormbricksCloud,
     },
   ];
 
@@ -427,9 +426,16 @@ export const SettingsSidebarContent = ({
       label: t("common.authorized_apps"),
       href: accountSettingsPath("authorized-apps"),
       icon: <UnplugIcon className={iconClassName} />,
+      // Kept for a Dashboard viewer (U2): it can grant an app dashboard reads over OAuth, so it must be
+      // able to see and revoke what it granted.
       disabled: isBilling,
     },
   ];
+
+  // A Dashboard viewer (ADR-0025) keeps the organization switcher, Profile and Notifications, and none of
+  // the workspace or organization settings.
+  const visibleOrganizationItems = isDashboardViewer ? [] : organizationItems;
+  const isWorkspaceSectionHidden = hideWorkspaceSection || isDashboardViewer;
 
   const disabledMessage = t("common.you_are_not_authorized_to_perform_this_action");
 
@@ -453,10 +459,11 @@ export const SettingsSidebarContent = ({
 
   return (
     <div className="flex flex-col overflow-y-auto">
-      {!hideWorkspaceSection && (
+      {!isWorkspaceSectionHidden && (
         <div>
           <SectionHeader
             label={t("common.workspace")}
+            switcherType="workspace"
             isCollapsed={isCollapsed}
             isTextVisible={isTextVisible}
             switcherName={workspaceName}
@@ -472,22 +479,27 @@ export const SettingsSidebarContent = ({
         </div>
       )}
 
-      <div>
-        <SectionHeader
-          label={t("common.organization")}
-          isCollapsed={isCollapsed}
-          isTextVisible={isTextVisible}
-          switcherName={organizationName}
-          switcherItems={organizations}
-          isLoadingSwitcher={isLoadingOrganizations}
-          errorSwitcher={errorOrganizations}
-          onSwitcherRetry={onOrganizationRetry}
-          currentId={organizationId}
-          onSwitcherChange={onOrganizationChange}
-          onSwitcherOpen={onOrganizationDropdownOpen}
-        />
-        {renderSection(organizationItems)}
-      </div>
+      {/* A section with nothing to open (a Dashboard viewer's organization) is left out rather than shown
+          as a bare heading; the main navigation still switches organizations. */}
+      {visibleOrganizationItems.length > 0 && (
+        <div>
+          <SectionHeader
+            label={t("common.organization")}
+            switcherType="organization"
+            isCollapsed={isCollapsed}
+            isTextVisible={isTextVisible}
+            switcherName={organizationName}
+            switcherItems={organizations}
+            isLoadingSwitcher={isLoadingOrganizations}
+            errorSwitcher={errorOrganizations}
+            onSwitcherRetry={onOrganizationRetry}
+            currentId={organizationId}
+            onSwitcherChange={onOrganizationChange}
+            onSwitcherOpen={onOrganizationDropdownOpen}
+          />
+          {renderSection(visibleOrganizationItems)}
+        </div>
+      )}
 
       <div>
         <SectionHeader label={t("common.account")} isCollapsed={isCollapsed} isTextVisible={isTextVisible} />

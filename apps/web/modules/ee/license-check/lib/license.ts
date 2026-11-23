@@ -1,6 +1,5 @@
 import "server-only";
 import { cache as reactCache } from "react";
-import { ProxyAgent } from "undici";
 import { z } from "zod";
 import { createCacheKey } from "@formbricks/cache";
 import { prisma } from "@formbricks/database";
@@ -10,17 +9,26 @@ import { COMMUNITY_WORKSPACE_LIMIT, E2E_TESTING } from "@/lib/constants";
 import { env } from "@/lib/env";
 import { hashString } from "@/lib/hash-string";
 import { getInstanceId } from "@/lib/instance";
+import { type TProxiedRequestInit, proxyDispatcher } from "@/lib/proxy-dispatcher";
 import {
   TEnterpriseLicenseDetails,
   TEnterpriseLicenseFeatures,
   TLicenseStatus,
 } from "@/modules/ee/license-check/types/enterprise-license";
+import { getDefaultLicenseServerUrl, resolveLicenseServerUrl } from "./license-server-url";
 
-// Module-level ProxyAgent singleton — reused across all license fetches to avoid leaking
-// socket pools on every call (ProxyAgent owns connection pools and should not be created
-// per-request in long-lived processes).
-const _proxyUrl = env.HTTPS_PROXY ?? env.HTTP_PROXY;
-const _proxyDispatcher = _proxyUrl ? new ProxyAgent(_proxyUrl) : undefined;
+const LICENSE_SERVER_URL = resolveLicenseServerUrl({
+  nodeEnv: env.NODE_ENV,
+  environment: env.ENVIRONMENT,
+  overrideUrl: env.ENTERPRISE_LICENSE_SERVER_URL,
+});
+const IS_LICENSE_SERVER_OVERRIDDEN = LICENSE_SERVER_URL !== getDefaultLicenseServerUrl(env.ENVIRONMENT);
+
+if (env.ENTERPRISE_LICENSE_SERVER_URL && !IS_LICENSE_SERVER_OVERRIDDEN) {
+  logger.warn(
+    "ENTERPRISE_LICENSE_SERVER_URL is ignored: it only applies to a development server with a loopback host"
+  );
+}
 
 // Configuration
 const CONFIG = {
@@ -33,10 +41,7 @@ const CONFIG = {
     RETRY_DELAY_MS: 1000,
   },
   API: {
-    ENDPOINT:
-      env.ENVIRONMENT === "staging"
-        ? "https://staging.ee.formbricks.com/api/licenses/check"
-        : "https://ee.formbricks.com/api/licenses/check",
+    ENDPOINT: `${LICENSE_SERVER_URL}/api/licenses/check`,
     TIMEOUT_MS: 5000,
   },
 } as const;
@@ -107,6 +112,9 @@ const LicenseFeaturesSchema = z.object({
   feedbackDirectories: z.boolean().default(false),
   dashboards: z.boolean().default(false),
   workflows: z.boolean().default(false),
+  dataRetention: z.boolean().default(false),
+  // A licence server that predates the flag omits it, which keeps Creatives off (ENG-6602).
+  creatives: z.boolean().default(false),
 });
 
 const LicenseDetailsSchema = z.object({
@@ -143,6 +151,11 @@ const getCacheIdentifier = () => {
   if (!env.ENTERPRISE_LICENSE_KEY) {
     return "no-license"; // No license key provided
   }
+  // A local licence server's answers (development only, see `resolveLicenseServerUrl`) get their own
+  // slots, so turning the override off doesn't serve them as the real server's for up to four days.
+  if (IS_LICENSE_SERVER_OVERRIDDEN) {
+    return hashString(`${env.ENTERPRISE_LICENSE_KEY}@${LICENSE_SERVER_URL}`);
+  }
   return hashString(env.ENTERPRISE_LICENSE_KEY); // Valid license key
 };
 
@@ -177,6 +190,8 @@ const DEFAULT_FEATURES: TEnterpriseLicenseFeatures = {
   feedbackDirectories: false,
   dashboards: false,
   workflows: false,
+  dataRetention: false,
+  creatives: false,
 };
 
 // Helper functions
@@ -398,11 +413,11 @@ const fetchLicenseFromServerInternal = async (retryCount = 0): Promise<TEnterpri
 
     const res = await fetch(CONFIG.API.ENDPOINT, {
       body: JSON.stringify(payload),
-      dispatcher: _proxyDispatcher,
+      dispatcher: proxyDispatcher,
       headers: { "Content-Type": "application/json" },
       method: "POST",
       signal: AbortSignal.timeout(CONFIG.API.TIMEOUT_MS),
-    } as RequestInit & { dispatcher?: ProxyAgent });
+    } as TProxiedRequestInit);
 
     if (res.ok) {
       const responseJson = (await res.json()) as { data: unknown };

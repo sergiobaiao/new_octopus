@@ -6,7 +6,12 @@ import { PrismaErrorType } from "@formbricks/database/types/error";
 import { ok, okVoid } from "@formbricks/types/error-handlers";
 import { TSurveyQuota } from "@formbricks/types/quota";
 import { getDisplayForResponseValidation } from "@/lib/display/service";
-import { evaluateResponseQuotas } from "@/modules/ee/quotas/lib/evaluation-service";
+import {
+  evaluateResponseQuotas,
+  loadQuotaEvaluationContext,
+} from "@/modules/ee/quotas/lib/evaluation-service";
+import { requestEmailAuditErasureRequired } from "@/modules/email/lib/email-audit-maintenance";
+import { enqueueReplacedSignatureFileCleanup } from "@/modules/storage/lib/replaced-signature-files";
 import { deleteDisplay } from "../display";
 import {
   deleteResponse,
@@ -61,16 +66,26 @@ vi.mock("../utils", () => ({
   findAndDeleteUploadedFilesInResponse: vi.fn(),
 }));
 
+vi.mock("@/modules/storage/lib/replaced-signature-files", () => ({
+  enqueueReplacedSignatureFileCleanup: vi.fn(),
+}));
+
 vi.mock("@/modules/ee/quotas/lib/evaluation-service", () => ({
   evaluateResponseQuotas: vi.fn(),
+  loadQuotaEvaluationContext: vi.fn(),
 }));
 
 vi.mock("@/lib/display/service", () => ({
   getDisplayForResponseValidation: vi.fn(),
 }));
 
+vi.mock("@/modules/email/lib/email-audit-maintenance", () => ({
+  requestEmailAuditErasureRequired: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("@formbricks/database", () => ({
   prisma: {
+    $transaction: vi.fn(),
     response: {
       findUnique: vi.fn(),
       delete: vi.fn(),
@@ -91,6 +106,8 @@ vi.mock("@formbricks/database", () => ({
 describe("Response Lib", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(prisma.$transaction).mockImplementation(async (callback) => callback(prisma as never));
+    vi.mocked(requestEmailAuditErasureRequired).mockResolvedValue(undefined);
   });
 
   describe("getResponse", () => {
@@ -316,17 +333,32 @@ describe("Response Lib", () => {
       expect(prisma.response.delete).toHaveBeenCalledWith({
         where: { id: responseId },
       });
+      expect(requestEmailAuditErasureRequired).toHaveBeenCalledWith({ responseId }, prisma);
       expect(deleteDisplay).toHaveBeenCalledWith(response.displayId);
       expect(getSurveyQuestions).toHaveBeenCalledWith(response.surveyId);
+      // The survey id comes from the deleted row: it is what binds a survey-scoped upload key to this
+      // response, and the survey read here does not select one.
       expect(findAndDeleteUploadedFilesInResponse).toHaveBeenCalledWith(
         response.data,
         survey,
+        response.surveyId,
         survey.workspaceId
       );
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.data).toEqual(response);
       }
+    });
+
+    test("stops the delete when email copy erasure cannot be requested", async () => {
+      vi.mocked(prisma.response.delete).mockResolvedValue(response);
+      vi.mocked(requestEmailAuditErasureRequired).mockRejectedValueOnce(new Error("audit unavailable"));
+
+      const result = await deleteResponse(responseId);
+
+      expect(result.ok).toBe(false);
+      expect(prisma.response.delete).toHaveBeenCalledOnce();
+      expect(deleteDisplay).not.toHaveBeenCalled();
     });
 
     test("return an error if deleteDisplay fails", async () => {
@@ -410,6 +442,47 @@ describe("Response Lib", () => {
       vi.mocked(getDisplayForResponseValidation).mockResolvedValue(validDisplay);
     });
 
+    describe("replaced Signature images (ENG-6810)", () => {
+      const storedRow = { ...existingResponseRow, data: { sig: "/storage/ws/private/old.png" } };
+
+      test("queues the cleanup after the write, from the stored data to the written data", async () => {
+        vi.mocked(prisma.response.findUnique).mockResolvedValue(storedRow as any);
+        vi.mocked(prisma.response.update).mockResolvedValue(response);
+
+        await updateResponse(responseId, responseInput);
+
+        expect(enqueueReplacedSignatureFileCleanup).toHaveBeenCalledExactlyOnceWith(
+          prisma,
+          { surveyId: storedRow.surveyId, previousData: storedRow.data, nextData: response.data },
+          { bestEffort: true }
+        );
+        expect(vi.mocked(prisma.response.update).mock.invocationCallOrder[0]).toBeLessThan(
+          vi.mocked(enqueueReplacedSignatureFileCleanup).mock.invocationCallOrder[0]
+        );
+      });
+
+      test("queues nothing when the update fails", async () => {
+        vi.mocked(prisma.response.findUnique).mockResolvedValue(storedRow as any);
+        vi.mocked(prisma.response.update).mockRejectedValue(new Error("write failed"));
+
+        const result = await updateResponse(responseId, responseInput);
+
+        expect(result.ok).toBe(false);
+        expect(enqueueReplacedSignatureFileCleanup).not.toHaveBeenCalled();
+      });
+
+      test("reads and queues nothing for a write that carries no data", async () => {
+        vi.mocked(prisma.response.update).mockResolvedValue(response);
+        const { data: _data, ...withoutData } = responseInput;
+        vi.mocked(prisma.response.findUnique).mockClear();
+
+        await updateResponse(responseId, { ...withoutData, contactId: null, displayId: null } as any);
+
+        expect(prisma.response.findUnique).not.toHaveBeenCalled();
+        expect(enqueueReplacedSignatureFileCleanup).not.toHaveBeenCalled();
+      });
+    });
+
     test("update the response and revalidate caches including singleUseId", async () => {
       vi.mocked(prisma.response.update).mockResolvedValue(response);
 
@@ -473,7 +546,11 @@ describe("Response Lib", () => {
       const result = await updateResponse(responseId, inputWithoutLinks);
 
       expect(result.ok).toBe(true);
-      expect(prisma.response.findUnique).not.toHaveBeenCalled();
+      // The only read is the stored data for the replaced-signature cleanup, not the tenant anchor.
+      expect(prisma.response.findUnique).toHaveBeenCalledExactlyOnceWith({
+        where: { id: responseId },
+        select: { surveyId: true, data: true },
+      });
       expect(prisma.contact.findUnique).not.toHaveBeenCalled();
       expect(getDisplayForResponseValidation).not.toHaveBeenCalled();
       expect(prisma.response.update).toHaveBeenCalledTimes(1);
@@ -619,6 +696,9 @@ describe("Response Lib", () => {
       };
     };
     let mockTx: MockTx;
+    const quotaContext = { quotas: [], survey: { id: "survey-id" } } as unknown as Awaited<
+      ReturnType<typeof loadQuotaEvaluationContext>
+    >;
 
     beforeEach(() => {
       vi.clearAllMocks();
@@ -634,8 +714,21 @@ describe("Response Lib", () => {
         },
       };
       vi.mocked(getDisplayForResponseValidation).mockResolvedValue(validDisplay);
+      vi.mocked(loadQuotaEvaluationContext).mockResolvedValue(quotaContext);
 
       prisma.$transaction = vi.fn(async (cb: any) => cb(mockTx));
+    });
+
+    test("reads the quota definitions before opening the transaction, not inside it (ENG-3285)", async () => {
+      vi.mocked(mockTx.response.update).mockResolvedValue(response);
+      vi.mocked(evaluateResponseQuotas).mockResolvedValue({ shouldEndSurvey: false });
+
+      await updateResponseWithQuotaEvaluation(responseId, response.surveyId, responseInput);
+
+      expect(loadQuotaEvaluationContext).toHaveBeenCalledWith(response.surveyId);
+      expect(vi.mocked(loadQuotaEvaluationContext).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(prisma.$transaction).mock.invocationCallOrder[0]
+      );
     });
 
     test("update response and continue when quota evaluation says not to end survey", async () => {
@@ -646,7 +739,7 @@ describe("Response Lib", () => {
         refreshedResponse: null,
       });
 
-      const result = await updateResponseWithQuotaEvaluation(responseId, responseInput);
+      const result = await updateResponseWithQuotaEvaluation(responseId, response.surveyId, responseInput);
 
       expect(mockTx.response.update).toHaveBeenCalledWith({
         where: { id: responseId },
@@ -662,6 +755,7 @@ describe("Response Lib", () => {
         // The row just written, so `reserved` quota operands resolve (ENG-1840).
         response,
         tx: mockTx,
+        quotaContext,
       });
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -678,7 +772,7 @@ describe("Response Lib", () => {
         refreshedResponse: null,
       });
 
-      const result = await updateResponseWithQuotaEvaluation(responseId, responseInput);
+      const result = await updateResponseWithQuotaEvaluation(responseId, response.surveyId, responseInput);
 
       expect(evaluateResponseQuotas).toHaveBeenCalledWith({
         surveyId: responseWithoutLanguage.surveyId,
@@ -690,6 +784,7 @@ describe("Response Lib", () => {
         // The row just written, so `reserved` quota operands resolve (ENG-1840).
         response: responseWithoutLanguage,
         tx: mockTx,
+        quotaContext,
       });
       expect(result.ok).toBe(true);
     });
@@ -703,7 +798,7 @@ describe("Response Lib", () => {
         refreshedResponse: refreshedResponse,
       });
 
-      const result = await updateResponseWithQuotaEvaluation(responseId, responseInput);
+      const result = await updateResponseWithQuotaEvaluation(responseId, response.surveyId, responseInput);
 
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -719,7 +814,7 @@ describe("Response Lib", () => {
         refreshedResponse: null,
       });
 
-      const result = await updateResponseWithQuotaEvaluation(responseId, responseInput);
+      const result = await updateResponseWithQuotaEvaluation(responseId, response.surveyId, responseInput);
 
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -739,7 +834,7 @@ describe("Response Lib", () => {
         refreshedResponse: null,
       });
 
-      const result = await updateResponseWithQuotaEvaluation(responseId, responseInput);
+      const result = await updateResponseWithQuotaEvaluation(responseId, response.surveyId, responseInput);
 
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -761,7 +856,7 @@ describe("Response Lib", () => {
         })
       );
 
-      const result = await updateResponseWithQuotaEvaluation(responseId, responseInput);
+      const result = await updateResponseWithQuotaEvaluation(responseId, response.surveyId, responseInput);
 
       expect(result.ok).toBe(false);
       if (!result.ok) {

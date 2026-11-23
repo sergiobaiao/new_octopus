@@ -10,11 +10,22 @@ import { sendToPipeline } from "@/app/lib/pipelines";
 import { can } from "@/lib/authorization";
 import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { applyAnonymizePolicy } from "@/lib/response/anonymize";
+import { buildDataByQuestionCode } from "@/lib/response/data-by-question-code";
 import { getSurvey } from "@/lib/survey/service";
+import {
+  SURVEY_ACTION_FOR_METHOD,
+  canApiKeyReachSurveyResource,
+  getApiKeyVisibleSurveyWhere,
+} from "@/lib/survey/visibility/api-key";
 import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
 import { formatValidationErrorsForV1Api, validateResponseData } from "@/modules/api/lib/validation";
 import { resolveStorageUrlsInObject, validateClientFileUploads } from "@/modules/storage/utils";
-import { createResponseWithQuotaEvaluation, getResponses, getResponsesByWorkspaceIds } from "./lib/response";
+import {
+  createResponseWithQuotaEvaluation,
+  getQuestionCodesBySurveyId,
+  getResponses,
+  getResponsesByWorkspaceIds,
+} from "./lib/response";
 
 export const GET = withV1ApiWrapper({
   handler: async ({ req, authentication }) => {
@@ -42,7 +53,11 @@ export const GET = withV1ApiWrapper({
             { type: "apiKey", id: authentication.apiKeyId },
             getWorkspaceAuthorizationActionForMethod("GET"),
             { type: "workspace", id: survey.workspaceId }
-          ))
+          )) ||
+          !(await canApiKeyReachSurveyResource(authentication.apiKeyId, "survey.response_read", {
+            type: "survey",
+            id: survey.id,
+          }))
         ) {
           return {
             response: responses.unauthorizedResponse(),
@@ -54,12 +69,28 @@ export const GET = withV1ApiWrapper({
         const workspaceIds = [
           ...new Set(authentication.workspacePermissions.map((permission) => permission.workspaceId)),
         ];
-        const workspaceResponses = await getResponsesByWorkspaceIds(workspaceIds, limit, offset);
+        const workspaceResponses = await getResponsesByWorkspaceIds(
+          workspaceIds,
+          limit,
+          offset,
+          await getApiKeyVisibleSurveyWhere()
+        );
         allResponses.push(...workspaceResponses);
       }
+      const questionCodes = await getQuestionCodesBySurveyId([
+        ...new Set(allResponses.map((r) => r.surveyId)),
+      ]);
       return {
         response: responses.successResponse(
-          allResponses.map((r) => ({ ...r, data: resolveStorageUrlsInObject(r.data) }))
+          allResponses.map((r) => {
+            const data = resolveStorageUrlsInObject(r.data);
+            return {
+              ...r,
+              data,
+              // Like the webhook body: the same values keyed by question code.
+              dataByQuestionCode: buildDataByQuestionCode(data, questionCodes.get(r.surveyId) ?? {}),
+            };
+          })
         ),
       };
     } catch (error) {
@@ -143,6 +174,17 @@ export const POST = withV1ApiWrapper({
         return {
           response: surveyResult.error,
         };
+      }
+
+      // ENG-3282: writing a response writes into its survey, so a restricted survey is out of the key's
+      // reach here as on GET — and with the permission v2's POST requires.
+      if (
+        !(await canApiKeyReachSurveyResource(authentication.apiKeyId, SURVEY_ACTION_FOR_METHOD.POST, {
+          type: "survey",
+          id: surveyResult.survey.id,
+        }))
+      ) {
+        return { response: responses.unauthorizedResponse() };
       }
 
       if (

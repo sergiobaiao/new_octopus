@@ -9,6 +9,11 @@ import { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
 import { cn } from "@/lib/cn";
 import {
+  type TSurveyLinkedCreative,
+  isDestinationSettingLocked,
+  joinCreativeNames,
+} from "@/modules/ee/creatives/lib/survey-side";
+import {
   type TSurveySchedulingConfig,
   getSurveySchedulingTimeLabel,
 } from "@/modules/survey/scheduling/lib/config";
@@ -30,7 +35,11 @@ interface ResponseOptionsCardProps {
   isSpamProtectionAllowed: boolean;
   surveySchedulingConfig: TSurveySchedulingConfig;
   locale: TUserLocale;
+  /** The linked creatives: a creative's Destination can't be PIN-protected. */
+  linkedCreatives?: readonly TSurveyLinkedCreative[];
 }
+
+const NO_CREATIVES: readonly TSurveyLinkedCreative[] = [];
 
 export const ResponseOptionsCard = ({
   localSurvey,
@@ -39,6 +48,7 @@ export const ResponseOptionsCard = ({
   isSpamProtectionAllowed,
   surveySchedulingConfig,
   locale,
+  linkedCreatives = NO_CREATIVES,
 }: Readonly<ResponseOptionsCardProps>) => {
   const { t } = useTranslation();
   const { toCalendarDate, getMinimumSurveySchedulingCalendarDate } = useMemo(
@@ -83,6 +93,10 @@ export const ResponseOptionsCard = ({
   const isCloseOnDateEnabled = localSurvey.closeOn !== null;
 
   const isPinProtectionEnabled = localSurvey.pin !== null;
+  const isPinLocked = isDestinationSettingLocked({
+    creatives: linkedCreatives,
+    isOn: isPinProtectionEnabled,
+  });
 
   const [verifyProtectWithPinError, setVerifyProtectWithPinError] = useState<string | null>(null);
 
@@ -314,7 +328,7 @@ export const ResponseOptionsCard = ({
         "w-full space-y-2 rounded-lg border border-slate-300 bg-white"
       )}>
       <Collapsible.CollapsibleTrigger asChild className="h-full w-full cursor-pointer">
-        <div className="inline-flex px-4 py-4">
+        <button type="button" className="inline-flex px-4 py-4 text-left">
           <div className="flex items-center pr-5 pl-2">
             <CheckIcon
               strokeWidth={3}
@@ -327,7 +341,7 @@ export const ResponseOptionsCard = ({
               {t("workspace.surveys.edit.response_limits_redirections_and_more")}
             </p>
           </div>
-        </div>
+        </button>
       </Collapsible.CollapsibleTrigger>
       <Collapsible.CollapsibleContent className="flex flex-col overflow-hidden data-[state=closed]:animate-collapsible-up data-[state=open]:animate-collapsible-down">
         <hr className="py-1 text-slate-600" />
@@ -529,8 +543,15 @@ export const ResponseOptionsCard = ({
                 htmlId="protectSurveyWithPin"
                 isChecked={isPinProtectionEnabled}
                 onToggle={handleProtectSurveyWithPinToggle}
+                disabled={isPinLocked}
                 title={t("workspace.surveys.edit.protect_survey_with_pin")}
-                description={t("workspace.surveys.edit.protect_survey_with_pin_description")}
+                description={
+                  isPinLocked
+                    ? t("workspace.creatives.survey_side.pin_locked", {
+                        creatives: joinCreativeNames(linkedCreatives),
+                      })
+                    : t("workspace.surveys.edit.protect_survey_with_pin_description")
+                }
                 childBorder={true}>
                 <div className="p-4">
                   <Label htmlFor="headline" className="sr-only">
@@ -573,9 +594,9 @@ export const ResponseOptionsCard = ({
           {/*
            * Disabled while anonymizing, because anonymize overrides it: the ingest gate drops
            * `ipAddress` on a `privacy: "drop"` field regardless of `isCaptureIpEnabled`. Leaving the
-           * switch live would let an author turn IP capture "on" and see nothing captured. The stored
-           * value is left untouched rather than forced off, so turning anonymize back off restores
-           * whatever the author had chosen.
+           * switch live would let an author turn IP capture "on" and see nothing captured. It renders
+           * off, because that is what is in effect; the stored value is left untouched rather than
+           * forced off, so turning anonymize back off restores whatever the author had chosen.
            *
            * The description says so while it is disabled. Greying the switch out alone left the author
            * with no reason for it — two adjacent toggles that both decide whether the IP is stored, one
@@ -583,7 +604,7 @@ export const ResponseOptionsCard = ({
            */}
           <AdvancedOptionToggle
             htmlId="captureIp"
-            isChecked={captureIpToggle}
+            isChecked={captureIpToggle && !anonymizeResponsesToggle}
             onToggle={handleCaptureIpToggle}
             disabled={anonymizeResponsesToggle}
             title={t("workspace.surveys.edit.capture_ip_address")}

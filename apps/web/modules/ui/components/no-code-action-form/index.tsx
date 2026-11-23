@@ -14,8 +14,8 @@ import { InnerHtmlSelector } from "./components/inner-html-selector";
 import { PageUrlSelector } from "./components/page-url-selector";
 
 interface NoCodeActionFormProps {
-  form: UseFormReturn<TActionClassInput>;
-  isReadOnly: boolean;
+  readonly form: UseFormReturn<TActionClassInput>;
+  readonly isReadOnly: boolean;
 }
 
 export const NoCodeActionForm = ({ form, isReadOnly }: NoCodeActionFormProps) => {
@@ -23,6 +23,10 @@ export const NoCodeActionForm = ({ form, isReadOnly }: NoCodeActionFormProps) =>
   const { t } = useTranslation();
   return (
     <div data-testid="no-code-action-form">
+      {/* Mobile SDKs only fire code actions (ENG-3877), so a no-code action never triggers in an app. */}
+      <Alert variant="info" size="small" className="mb-4">
+        <AlertDescription>{t("workspace.actions.no_code_actions_websites_only")}</AlertDescription>
+      </Alert>
       <FormField
         name={`noCodeConfig.type`}
         control={control}

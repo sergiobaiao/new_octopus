@@ -6,8 +6,9 @@ import { useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import type { TOrganizationRole } from "@formbricks/types/memberships";
-import { getAccessFlags } from "@/lib/membership/utils";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getAccessFlags, getOrganizationRoleLabels } from "@/lib/membership/utils";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
+import { getAssignableOrganizationRoles } from "@/modules/ee/role-management/lib/assignable-roles";
 import { isRoleEditDisabled } from "@/modules/ee/role-management/lib/role-edit-rules";
 import { Badge } from "@/modules/ui/components/badge";
 import { Button } from "@/modules/ui/components/button";
@@ -21,16 +22,17 @@ import {
 import { updateInviteAction, updateMembershipAction } from "../actions";
 
 interface Role {
-  currentUserRole: TOrganizationRole;
-  memberRole: TOrganizationRole;
-  organizationId: string;
-  memberId?: string;
-  userId: string;
-  memberAccepted?: boolean;
-  inviteId?: string;
-  doesOrgHaveMoreThanOneOwner?: boolean;
-  isFormbricksCloud: boolean;
-  isUserManagementDisabledFromUi: boolean;
+  readonly currentUserRole: TOrganizationRole;
+  readonly memberRole: TOrganizationRole;
+  readonly organizationId: string;
+  readonly memberId?: string;
+  readonly userId: string;
+  readonly memberAccepted?: boolean;
+  readonly inviteId?: string;
+  readonly doesOrgHaveMoreThanOneOwner?: boolean;
+  readonly isFormbricksCloud: boolean;
+  readonly isDashboardViewerRoleEnabled: boolean;
+  readonly isUserManagementDisabledFromUi: boolean;
 }
 
 export function EditMembershipRole({
@@ -43,12 +45,14 @@ export function EditMembershipRole({
   inviteId,
   doesOrgHaveMoreThanOneOwner,
   isFormbricksCloud,
+  isDashboardViewerRoleEnabled,
   isUserManagementDisabledFromUi,
 }: Role) {
   const { t } = useTranslation();
   const router = useRouter();
   const [loading, setLoading] = useState(false);
 
+  const roleLabels = getOrganizationRoleLabels(t);
   const { isOwner, isManager } = getAccessFlags(currentUserRole);
   const isOwnerOrManager = isOwner || isManager;
 
@@ -95,18 +99,12 @@ export function EditMembershipRole({
     handleMemberRoleUpdate(role);
   };
 
-  const getMembershipRoles = () => {
-    let roles: string[] = ["member"];
-
-    if (isOwner) {
-      roles.push("manager", "owner");
-
-      if (isFormbricksCloud) {
-        roles.push("billing");
-      }
-    }
-    return roles;
-  };
+  const getMembershipRoles = () =>
+    getAssignableOrganizationRoles({
+      assignerRole: currentUserRole,
+      isFormbricksCloud,
+      isDashboardViewerRoleEnabled,
+    });
 
   if (isOwnerOrManager) {
     return (
@@ -118,7 +116,7 @@ export function EditMembershipRole({
             loading={loading}
             size="sm"
             variant="secondary">
-            <span className="ml-1 capitalize">{memberRole}</span>
+            <span className="ml-1">{roleLabels[memberRole]}</span>
             <ChevronDownIcon className="size-4" />
           </Button>
         </DropdownMenuTrigger>
@@ -128,11 +126,10 @@ export function EditMembershipRole({
               onValueChange={(value) => {
                 handleRoleChange(value.toLowerCase() as TOrganizationRole);
               }}
-              value={memberRole}
-              className="flex flex-col-reverse">
+              value={memberRole}>
               {getMembershipRoles().map((role) => (
-                <DropdownMenuRadioItem className="capitalize" key={role} value={role}>
-                  {role.toLowerCase()}
+                <DropdownMenuRadioItem key={role} value={role}>
+                  {roleLabels[role]}
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>
@@ -142,5 +139,5 @@ export function EditMembershipRole({
     );
   }
 
-  return <Badge size="tiny" type="gray" text={memberRole} className="capitalize" />;
+  return <Badge size="tiny" type="gray" text={roleLabels[memberRole]} />;
 }
