@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - v6-test
+      - v61-stage
 
 permissions:
   contents: read
@@ -127,8 +128,10 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.ref_name }}" == "main" ]]; then
             ROLLING_TAG="latest"
-          else
+          elif [[ "${{ github.ref_name }}" == "v6-test" ]]; then
             ROLLING_TAG="v6-latest"
+          else
+            ROLLING_TAG="${{ github.ref_name }}"
           fi
           docker buildx imagetools create \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${ROLLING_TAG} \
@@ -140,7 +143,9 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.ref_name }}" == "main" ]]; then
             ROLLING_TAG="latest"
-          else
+          elif [[ "${{ github.ref_name }}" == "v6-test" ]]; then
             ROLLING_TAG="v6-latest"
+          else
+            ROLLING_TAG="${{ github.ref_name }}"
           fi
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${ROLLING_TAG}

@@ -1,8 +1,8 @@
 diff --git a/apps/web/app/layout.tsx b/apps/web/app/layout.tsx
-index cc0fc401f..014541dc9 100644
+index 67a76cfe30..666d674598 100644
 --- a/apps/web/app/layout.tsx
 +++ b/apps/web/app/layout.tsx
-@@ -9,8 +9,8 @@ import "../modules/ui/globals.css";
+@@ -10,8 +10,8 @@ import "../modules/ui/globals.css";
  
  export const metadata: Metadata = {
    title: {
@@ -14,10 +14,10 @@ index cc0fc401f..014541dc9 100644
    description: "Open-Source Survey Suite",
  };
 diff --git a/apps/web/locales/en-US.json b/apps/web/locales/en-US.json
-index d9a08b5b3..4bf083813 100644
+index d20e40c579..ae5a1cf86f 100644
 --- a/apps/web/locales/en-US.json
 +++ b/apps/web/locales/en-US.json
-@@ -626,8 +626,8 @@
+@@ -665,8 +665,8 @@
      "email_customization_preview_email_subject": "Formbricks Email Customization Preview",
      "email_customization_preview_email_text": "This is an email preview to show you which logo will be rendered in the emails.",
      "email_footer_text_1": "Have a great day!",
@@ -29,7 +29,7 @@ index d9a08b5b3..4bf083813 100644
      "embed_survey_preview_email_fight_spam": "Help us fight spam and forward this mail to hola@formbricks.com",
      "embed_survey_preview_email_heading": "Preview Email Embed",
 diff --git a/apps/web/modules/api/v2/openapi-document.ts b/apps/web/modules/api/v2/openapi-document.ts
-index 4b6e71205..8e838e370 100644
+index 4b6e712053..8e838e3700 100644
 --- a/apps/web/modules/api/v2/openapi-document.ts
 +++ b/apps/web/modules/api/v2/openapi-document.ts
 @@ -29,8 +29,8 @@ import { contactPaths } from "@/modules/ee/contacts/api/v2/management/contacts/l
@@ -62,7 +62,7 @@ index 4b6e71205..8e838e370 100644
      },
      schemas: {
 diff --git a/apps/web/modules/auth/components/form-wrapper.tsx b/apps/web/modules/auth/components/form-wrapper.tsx
-index 48aa7ca10..79015dec2 100644
+index 48aa7ca10a..79015dec2c 100644
 --- a/apps/web/modules/auth/components/form-wrapper.tsx
 +++ b/apps/web/modules/auth/components/form-wrapper.tsx
 @@ -1,6 +1,5 @@
@@ -99,19 +99,19 @@ index 48aa7ca10..79015dec2 100644
          {children}
        </main>
 diff --git a/apps/web/modules/auth/lib/auth.ts b/apps/web/modules/auth/lib/auth.ts
-index a34fa183b..0e4742e51 100644
+index 05da699f7e..f5414d4951 100644
 --- a/apps/web/modules/auth/lib/auth.ts
 +++ b/apps/web/modules/auth/lib/auth.ts
-@@ -71,7 +71,7 @@ export const getUserLocale = async (userId: string): Promise<TUserLocale> => {
+@@ -105,7 +105,7 @@ export const getUserLocale = async (userId: string): Promise<TUserLocale> => {
   * analytics / Sentry / logger wiring are all live in better-auth-observability.ts.
   */
  export const auth = betterAuth({
 -  appName: "Formbricks",
 +  appName: "Octopus",
-   // ENG-1054: fall back to NEXTAUTH_SECRET (which already signed NextAuth's session cookies) when
-   // BETTER_AUTH_SECRET is unset. This keeps existing envs working AND guarantees BA's cookie signing
-   // uses the same secret the forward-auth proxy verifies with (session-cookie.ts) — a mismatch makes
-@@ -381,7 +381,7 @@ export const auth = betterAuth({
+   // Resolved in lib/constants.ts, which documents the BETTER_AUTH_* / NEXTAUTH_* alias. Passing it
+   // explicitly is what keeps BA's cookie signing on the same secret the forward-auth proxy verifies with
+   // (session-cookie.ts) and lib/jwt.ts signs app JWTs with; a divergence between any two of them is an
+@@ -485,7 +485,7 @@ export const auth = betterAuth({
      // User.twoFactorSecret|backupCodes into the twoFactor table, and move the login-time TOTP/
      // backup challenge out of the credentials authorize into Better Auth's flow.
      twoFactor({
@@ -120,47 +120,47 @@ index a34fa183b..0e4742e51 100644
        skipVerificationOnEnable: false, // require a valid TOTP before 2FA is enabled
        totpOptions: { digits: 6, period: 30 },
        backupCodeOptions: { amount: 10, length: 10, storeBackupCodes: "encrypted" },
-diff --git a/apps/web/modules/ee/two-factor-auth/lib/two-factor-auth.ts b/apps/web/modules/ee/two-factor-auth/lib/two-factor-auth.ts
-index ec1c8600f..a715a27b7 100644
---- a/apps/web/modules/ee/two-factor-auth/lib/two-factor-auth.ts
-+++ b/apps/web/modules/ee/two-factor-auth/lib/two-factor-auth.ts
-@@ -74,7 +74,7 @@ export const setupTwoFactorAuth = async (
-   });
+diff --git a/apps/web/modules/auth/lib/totp.ts b/apps/web/modules/auth/lib/totp.ts
+index 940e42efe1..9dcff019e8 100644
+--- a/apps/web/modules/auth/lib/totp.ts
++++ b/apps/web/modules/auth/lib/totp.ts
+@@ -48,7 +48,7 @@ export const generateTotpSecret = (): string => {
+  * otplib 12 wrote into the URI explicitly, so existing apps enrol the same way.
+  */
+ export const generateTotpKeyUri = (label: string, secret: string): string =>
+-  generateURI({ issuer: "Formbricks", label, secret });
++  generateURI({ issuer: "Octopus", label, secret });
  
-   const name = user.email || user.name || user.id.toString();
--  const keyUri = authenticator.keyuri(name, "Formbricks", secret);
-+  const keyUri = authenticator.keyuri(name, "Octopus", secret);
-   const dataUri = await qrcode.toDataURL(keyUri);
- 
-   return { secret, keyUri, dataUri, backupCodes };
-diff --git a/apps/web/modules/email/index.tsx b/apps/web/modules/email/index.tsx
-index 40b5ed971..f5c6624a6 100644
---- a/apps/web/modules/email/index.tsx
-+++ b/apps/web/modules/email/index.tsx
-@@ -107,7 +107,7 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
-     } as SMTPTransport.Options);
- 
-     const emailDefaults = {
--      from: `${MAIL_FROM_NAME ?? "Formbricks"} <${MAIL_FROM ?? "noreply@formbricks.com"}>`,
-+      from: `${MAIL_FROM_NAME ?? "Octopus"} <${MAIL_FROM ?? "noreply@formbricks.com"}>`,
+ /**
+  * Checks the validity of a TOTP token using a base32-encoded secret.
+diff --git a/apps/web/modules/email/lib/send-email.ts b/apps/web/modules/email/lib/send-email.ts
+index fa0f786641..7375a62c77 100644
+--- a/apps/web/modules/email/lib/send-email.ts
++++ b/apps/web/modules/email/lib/send-email.ts
+@@ -120,7 +120,7 @@ export const sendEmail = async ({ emailType, ...emailData }: SendEmailDataProps)
      };
+     const transporter = createTransport(transportOptions);
+ 
+-    const defaultFrom = `${MAIL_FROM_NAME ?? "Formbricks"} <${MAIL_FROM ?? "noreply@formbricks.com"}>`;
++    const defaultFrom = `${MAIL_FROM_NAME ?? "Octopus"} <${MAIL_FROM ?? "noreply@formbricks.com"}>`;
      await transporter.sendMail({
-       ...emailDefaults,
+       ...emailData,
+       from: emailData.from ?? defaultFrom,
 diff --git a/apps/web/modules/survey/link/lib/metadata-utils.ts b/apps/web/modules/survey/link/lib/metadata-utils.ts
-index 2c6f9d967..d83d145a5 100644
+index ea99d06cdc..2897ea469d 100644
 --- a/apps/web/modules/survey/link/lib/metadata-utils.ts
 +++ b/apps/web/modules/survey/link/lib/metadata-utils.ts
-@@ -84,7 +84,7 @@ export const getBasicSurveyMetadata = async (
+@@ -91,7 +91,7 @@ export const getBasicSurveyMetadata = async (
  
-   if (!titleFromMetadata) {
-     if (IS_FORMBRICKS_CLOUD) {
--      title = `${title} | Formbricks`;
-+      title = `${title} | Octopus`;
-     }
-   }
+   // Only the social-preview title is branded here: `<title>` already gets " | Formbricks" from the
+   // root layout's template, so suffixing `title` too rendered it twice on Cloud.
+-  const ogTitle = !titleFromMetadata && IS_FORMBRICKS_CLOUD ? `${title} | Formbricks` : title;
++  const ogTitle = !titleFromMetadata && IS_FORMBRICKS_CLOUD ? `${title} | Octopus` : title;
  
+   return {
+     title,
 diff --git a/apps/web/public/favicon/site.webmanifest b/apps/web/public/favicon/site.webmanifest
-index 3fe074952..10423d27c 100644
+index 3fe0749526..10423d27c6 100644
 --- a/apps/web/public/favicon/site.webmanifest
 +++ b/apps/web/public/favicon/site.webmanifest
 @@ -13,7 +13,7 @@
@@ -174,10 +174,10 @@ index 3fe074952..10423d27c 100644
    "theme_color": "#ffffff"
  }
 diff --git a/packages/email/src/components/email-template.tsx b/packages/email/src/components/email-template.tsx
-index 31d025f1f..36e3ae86d 100644
+index 8931e8a4af..4c2c217ee6 100644
 --- a/packages/email/src/components/email-template.tsx
 +++ b/packages/email/src/components/email-template.tsx
-@@ -14,8 +14,7 @@ import {
+@@ -2,8 +2,7 @@ import { Body, Column, Container, Head, Html, Img, Link, Row, Section, Tailwind,
  import { TEmailTemplateLegalProps } from "../types/email";
  import { TFunction } from "../types/translations";
  
@@ -187,7 +187,7 @@ index 31d025f1f..36e3ae86d 100644
  const FORCE_LIGHT_COLOR_SCHEME = "only light";
  /**
   * Widths are also emitted as `width` HTML attributes, in px, to match the `w-60` / `w-80` classes.
-@@ -76,15 +75,13 @@ export function EmailTemplate({
+@@ -64,15 +63,13 @@ export function EmailTemplate({
            <Row>
              <Column align="center" className="text-center">
                {isDefaultLogo ? (
@@ -210,7 +210,7 @@ index 31d025f1f..36e3ae86d 100644
                ) : (
                  <Img
                    data-testid="logo-image"
-@@ -101,13 +98,7 @@ export function EmailTemplate({
+@@ -89,13 +86,7 @@ export function EmailTemplate({
            </Container>
  
            <Section className="mt-4 text-center text-sm">
