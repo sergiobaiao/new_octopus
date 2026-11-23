@@ -27,6 +27,8 @@
 !apps
 !packages
 !docker/package.json
+# Fork: build-time patches applied by apps/web/Dockerfile (rebrand, see docker/patches/)
+!docker/patches
 
 # Dependencies and build output
 **/node_modules
