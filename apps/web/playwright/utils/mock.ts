@@ -145,6 +145,7 @@ export const surveys = {
     pictureSelectQuestion: {
       question: "Picture Select Question",
       description: "Picture Select Description",
+      firstChoiceAltText: "Blue coffee mug on a desk",
     },
     dateQuestion: {
       question: "Date Question",
@@ -173,6 +174,7 @@ export const surveys = {
     ranking: {
       question: "What is most important for you in life?",
       choices: ["Work", "Money", "Travel", "Family", "Friends"],
+      otherText: "Health",
     },
   },
   createWithLogicAndSubmit: {

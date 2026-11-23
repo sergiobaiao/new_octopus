@@ -1,9 +1,21 @@
 import { z } from "zod";
 import { ZActionClass, ZActionClassNoCodeConfig } from "../action-classes";
-import { ZColor, ZEndingCardUrl, ZId, ZOverlay, ZPlacement, ZStorageUrl, getZSafeUrl } from "../common";
+import {
+  ZColor,
+  ZEndingCardButtonLink,
+  ZEndingCardUrl,
+  ZId,
+  ZOverlay,
+  ZPlacement,
+  ZStorageUrl,
+  getZSafeUrl,
+} from "../common";
 import { ZContactAttributes } from "../contact-attribute";
+import { ZCustomCssStored } from "../custom-css";
 import { ZLinkedEmbeddedField } from "../embedded-data";
+import { linkedToDesiredEmbeddedFields, toLegacyEmbeddedFields } from "../embedded-data-mapping";
 import { type TI18nString, ZI18nString } from "../i18n";
+import { ZOverlayColor, ZOverlayOpacity } from "../overlay";
 import { isLegacyIdCharset, isLegacyVariableName } from "../safe-identifier";
 import { ZSegment } from "../segment";
 import { ZAllowedFileExtension } from "../storage";
@@ -63,8 +75,9 @@ export const ZSurveyEndScreenCard = ZSurveyEndingBase.extend({
   headline: ZI18nString.optional(),
   subheader: ZI18nString.optional(),
   buttonLabel: ZI18nString.optional(),
-  buttonLink: ZEndingCardUrl.optional(),
+  buttonLink: ZEndingCardButtonLink.optional(),
   imageUrl: ZStorageUrl.optional(),
+  imageAltText: ZI18nString.optional(),
   videoUrl: ZStorageUrl.optional(),
   // Absent means "show it": the checkmark predates this field, so every survey written before it has to
   // keep rendering the icon.
@@ -228,6 +241,26 @@ export const ZSurveyVariable = z
   });
 export const ZSurveyVariables = z.array(ZSurveyVariable);
 
+/**
+ * The variables array as a **stored** survey must satisfy it: ids unique, names unique.
+ *
+ * Separate from `ZSurveyVariables`, which is deliberately unrefined because partial payloads and
+ * derived fragments parse against it. Exported so the write path can check the same rule `ZSurvey`
+ * will apply on the next read — a guard that parsed the bare array would accept a survey it could
+ * never load again, which is the one failure it exists to prevent.
+ */
+export const ZStoredSurveyVariables = ZSurveyVariables.superRefine((variables, ctx) => {
+  const variableIds = variables.map((v) => v.id);
+  if (new Set(variableIds).size !== variableIds.length) {
+    ctx.addIssue({ code: "custom", message: "Variable IDs must be unique", path: ["variables"] });
+  }
+
+  const variableNames = variables.map((v) => v.name);
+  if (new Set(variableNames).size !== variableNames.length) {
+    ctx.addIssue({ code: "custom", message: "Variable names must be unique", path: ["variables"] });
+  }
+});
+
 export type TSurveyVariable = z.infer<typeof ZSurveyVariable>;
 export type TSurveyVariables = z.infer<typeof ZSurveyVariables>;
 
@@ -243,6 +276,9 @@ export const ZSurveyWorkspaceOverwrites = z.object({
   placement: ZPlacement.nullish(),
   clickOutsideClose: z.boolean().nullish(),
   overlay: ZOverlay.nullish(),
+  // Only read when `overlay` is set here too (see resolveOverlayAppearance).
+  overlayColor: ZOverlayColor.nullish(),
+  overlayOpacity: ZOverlayOpacity.nullish(),
 });
 
 export type TSurveyWorkspaceOverwrites = z.infer<typeof ZSurveyWorkspaceOverwrites>;
@@ -447,7 +483,7 @@ export const ZSurveyOpenTextQuestion = ZSurveyQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.OpenText),
   placeholder: ZI18nString.optional(),
   longAnswer: z.boolean().optional(),
-  inputType: ZSurveyOpenTextQuestionInputType.optional().prefault("text"),
+  inputType: ZSurveyOpenTextQuestionInputType.prefault("text"),
   insightsEnabled: z.boolean().prefault(false).optional(),
   charLimit: z
     .object({
@@ -541,7 +577,7 @@ export const ZSurveyNPSQuestion = ZSurveyQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.NPS),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 /**
@@ -573,7 +609,7 @@ export const ZSurveyRatingQuestion = ZSurveyQuestionBase.extend({
   range: z.union([z.literal(5), z.literal(3), z.literal(4), z.literal(6), z.literal(7), z.literal(10)]),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 /**
@@ -600,7 +636,7 @@ export type TSurveyRatingQuestion = z.infer<typeof ZSurveyRatingQuestion>;
  */
 export const ZSurveyPictureSelectionQuestion = ZSurveyQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.PictureSelection),
-  allowMulti: z.boolean().optional().prefault(false),
+  allowMulti: z.boolean().prefault(false),
   choices: z.array(ZSurveyPictureChoice).min(2, {
     error: "Picture Selection question must have atleast 2 choices",
   }),
@@ -656,7 +692,7 @@ export const ZSurveyMatrixQuestion = ZSurveyQuestionBase.extend({
   type: z.literal(TSurveyQuestionTypeEnum.Matrix),
   rows: z.array(ZSurveyMatrixQuestionChoice),
   columns: z.array(ZSurveyMatrixQuestionChoice),
-  shuffleOption: ZShuffleOption.optional().prefault("none"),
+  shuffleOption: ZShuffleOption.prefault("none"),
 });
 
 /**
@@ -738,7 +774,7 @@ export const ZSurveyCsatQuestion = ZSurveyQuestionBase.extend({
   range: z.literal(5),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 /**
@@ -755,7 +791,7 @@ export const ZSurveyCesQuestion = ZSurveyQuestionBase.extend({
   range: z.union([z.literal(5), z.literal(7)]),
   lowerLabel: ZI18nString.optional(),
   upperLabel: ZI18nString.optional(),
-  isColorCodingEnabled: z.boolean().optional().prefault(false),
+  isColorCodingEnabled: z.boolean().prefault(false),
 });
 
 /**
@@ -866,6 +902,12 @@ export const ZSurveyStatus = z.enum(["draft", "inProgress", "paused", "completed
 
 export type TSurveyStatus = z.infer<typeof ZSurveyStatus>;
 
+// ENG-3282: who may read a survey. `workspace` is everyone with workspace access; `restricted` is the
+// owner and the organization's owners and managers only.
+export const ZSurveyVisibility = z.enum(["restricted", "workspace"]);
+
+export type TSurveyVisibility = z.infer<typeof ZSurveyVisibility>;
+
 export const ZSurveyInlineTriggers = z.object({
   codeConfig: z.object({ identifier: z.string() }).optional(),
   noCodeConfig: ZActionClassNoCodeConfig.optional(),
@@ -881,6 +923,15 @@ export const ZSurveyBase = z.object({
   type: ZSurveyType,
   workspaceId: z.cuid2(),
   createdBy: z.string().nullable(),
+  // ENG-3282 authorization facts. Server-owned: omitted from every create/update input below, set only
+  // by the creation-facts resolver and the visibility endpoint. `visibility` is the stored flag, not
+  // the effective one — see `getEffectiveVisibility`.
+  visibility: ZSurveyVisibility,
+  ownerId: z.string().nullable(),
+  visibilityVersion: z.number().int(),
+  visibilityProjectedVersion: z.number().int(),
+  visibilityChangedAt: z.date().nullable(),
+  visibilityChangedById: z.string().nullable(),
   status: ZSurveyStatus,
   displayOption: ZSurveyDisplayOption,
   autoClose: z.number().nullable(),
@@ -928,38 +979,23 @@ export const ZSurveyBase = z.object({
   /**
    * The survey's Embedded Data definitions, joined from `EmbeddedData` / `SurveyEmbeddedData` and
    * inlined when the survey is loaded (ENG-1837). This is the **read** source of truth for every
-   * reader — reach it through `getSurveyEmbeddedFields`, never directly, so surveys read through a
-   * select that omits the join still fall back to the legacy columns below.
+   * reader — reach it through `getSurveyEmbeddedFields`, never directly. `variables` / `hiddenFields`
+   * above and below are a read-only projection derived from it at load (ENG-2404), kept for the
+   * payloads deployed SDK bundles and API consumers still read.
    *
-   * Read-only and optional. Optional because every survey literal, fixture and create payload in the
-   * codebase predates it; read-only because `variables` / `hiddenFields` remain the written columns
-   * until the legacy JSON is dropped — the write paths that spread a survey object into Prisma strip
-   * this key explicitly, and both create-input schemas omit it.
+   * Since ENG-3228 it is also **accepted input** on `updateSurvey` and `createSurvey`: one shape for
+   * read and write, so the editor sends back the pairs it was loaded with, carrying the `dataType`,
+   * `defaultValue`, `locked` and shared-library link the legacy shape has no word for. Present in
+   * a payload, it is the complete desired set for both sources and `variables` / `hiddenFields` are
+   * ignored; absent, those two legacy keys run the write exactly as before.
+   *
+   * Still optional — every survey literal, fixture and create payload in the codebase predates it —
+   * and still never spread into Prisma: `Survey` owns relations named `embeddedData` /
+   * `embeddedDataLinks`, so each write seam destructures this key out and lets
+   * `reconcileEmbeddedData` do the writing.
    */
   embeddedFields: z.array(ZLinkedEmbeddedField).optional(),
-  variables: ZSurveyVariables.superRefine((variables, ctx) => {
-    // variable ids must be unique
-    const variableIds = variables.map((v) => v.id);
-    const uniqueVariableIds = new Set(variableIds);
-    if (uniqueVariableIds.size !== variableIds.length) {
-      ctx.addIssue({
-        code: "custom",
-        message: "Variable IDs must be unique",
-        path: ["variables"],
-      });
-    }
-
-    // variable names must be unique
-    const variableNames = variables.map((v) => v.name);
-    const uniqueVariableNames = new Set(variableNames);
-    if (uniqueVariableNames.size !== variableNames.length) {
-      ctx.addIssue({
-        code: "custom",
-        message: "Variable names must be unique",
-        path: ["variables"],
-      });
-    }
-  }),
+  variables: ZStoredSurveyVariables,
   followUps: z.array(
     ZSurveyFollowUp.extend({
       deleted: z.boolean().optional(),
@@ -987,13 +1023,16 @@ export const ZSurveyBase = z.object({
   workspaceOverwrites: ZSurveyWorkspaceOverwrites.nullable(),
   styling: ZSurveyStyling.nullable(),
   showLanguageSwitch: z.boolean().nullable(),
+  // Optional so survey literals and API payloads that predate the setting keep validating; null and
+  // undefined both read as "off".
+  autoSelectLanguage: z.boolean().nullish(),
   surveyClosedMessage: ZSurveyClosedMessage.nullable(),
   segment: ZSegment.nullable(),
   singleUse: ZSurveySingleUse.nullable(),
   isVerifyEmailEnabled: z.boolean(),
   recaptcha: ZSurveyRecaptcha.nullable(),
   isBackButtonHidden: z.boolean(),
-  isAutoProgressingEnabled: z.boolean().optional().prefault(false),
+  isAutoProgressingEnabled: z.boolean().prefault(false),
   isCaptureIpEnabled: z.boolean(),
   /**
    * "Anonymize responses". Suppresses the privacy-sensitive reserved fields **at ingest**, so the
@@ -1015,10 +1054,57 @@ export const ZSurveyBase = z.object({
   slug: ZSurveySlug.nullable(),
   customHeadScripts: z.string().nullish(),
   customHeadScriptsMode: z.enum(["add", "replace"]).nullish(),
+  /**
+   * Survey custom CSS as stored (ENG-2949): source plus trusted compiled output. Nullish so survey
+   * objects built without it still type-check. Only the shared custom CSS save service writes it, and
+   * it reads nothing but `source` from a payload — `compiled` and `processorVersion` sent by a caller
+   * are ignored and recomputed.
+   */
+  customCss: ZCustomCssStored.nullish(),
 });
 
-export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.RefinementCtx): void => {
+/**
+ * The survey this refinement resolves logic operands and follow-up recipients against.
+ *
+ * Identical to the input except for `variables` / `hiddenFields`, which are re-derived when the
+ * payload declares its Embedded Data as rows — the same derivation the read seam runs over the
+ * stored rows (`toLegacyEmbeddedFields`), so what this validates against is what the survey will
+ * read back as once the write lands rather than what the legacy keys happen to say on the way in.
+ *
+ * That distinction only exists because of the editor (ENG-2628): its working copy is rows-native,
+ * so the two legacy keys it forwards are whatever it was loaded with at mount, and a variable or
+ * hidden field added since then lives only in `embeddedFields`. Without this, using a freshly added
+ * field in logic — or as a follow-up recipient — would fail `ZSurvey` on publish, both in the
+ * editor's own pre-flight and again as the server action's input schema.
+ *
+ * A payload with no `embeddedFields` is untouched, so every legacy caller (the v1 management PUT,
+ * whose schema omits the key outright) validates exactly as before.
+ */
+const withDerivedLegacyColumns = <T extends z.infer<typeof ZSurveyBase>>(survey: T): T => {
+  if (survey.embeddedFields === undefined) return survey;
+
+  const derived = toLegacyEmbeddedFields(linkedToDesiredEmbeddedFields(survey.embeddedFields));
+  return { ...survey, variables: derived.variables, hiddenFields: derived.hiddenFields };
+};
+
+export const surveyRefinement = (rawSurvey: z.infer<typeof ZSurveyBase>, ctx: z.RefinementCtx): void => {
+  const survey = withDerivedLegacyColumns(rawSurvey);
   const { questions, blocks, languages, welcomeCard, endings, isBackButtonHidden } = survey;
+
+  // `ZSurveyBase` already ran this over the *incoming* `variables`, which the derivation above has
+  // just replaced — so on a rows-native payload nothing has checked what the survey will actually
+  // read back as. Two computed fields can derive one legacy name (a local `score` alongside a library
+  // field keyed `score`), and that survey would parse here and then fail its next save. `updateSurvey`
+  // refuses it before it writes; running the same schema here is what stops the editor's pre-flight
+  // and the server action's input schema disagreeing with the write path about the same payload.
+  if (survey.embeddedFields !== undefined) {
+    const derived = ZStoredSurveyVariables.safeParse(survey.variables);
+    if (!derived.success) {
+      for (const issue of derived.error.issues) {
+        ctx.addIssue({ code: "custom", message: issue.message, path: ["embeddedFields"] });
+      }
+    }
+  }
 
   // Validate: must have questions OR blocks with elements, not both
   const hasQuestions = questions.length > 0;
@@ -1475,6 +1561,48 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
           }
         }
 
+        // Validate image alt text if present. An empty default is a decorative image and needs no translations.
+        if (element.imageAltText?.[defaultLanguageCode].trim()) {
+          elementMultiLangIssue = validateElementLabels(
+            "imageAltText",
+            element.imageAltText,
+            languages,
+            blockIndex,
+            elementIndex
+          );
+          if (elementMultiLangIssue) {
+            ctx.addIssue(elementMultiLangIssue);
+          }
+        }
+
+        if (element.type === TSurveyElementTypeEnum.PictureSelection) {
+          element.choices.forEach((choice, choiceIndex) => {
+            if (!choice.imageAltText?.[defaultLanguageCode]?.trim()) return;
+            const choiceAltIssue = validateElementLabels(
+              `Image alt text of choice ${String(choiceIndex + 1)}`,
+              choice.imageAltText,
+              languages,
+              blockIndex,
+              elementIndex,
+              true
+            );
+            if (choiceAltIssue) {
+              ctx.addIssue({
+                ...choiceAltIssue,
+                path: [
+                  "blocks",
+                  blockIndex,
+                  "elements",
+                  elementIndex,
+                  "choices",
+                  choiceIndex,
+                  "imageAltText",
+                ],
+              });
+            }
+          });
+        }
+
         // Type-specific validation
         if (element.type === TSurveyElementTypeEnum.OpenText) {
           if (
@@ -1838,6 +1966,20 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
         }
       }
 
+      if (ending.imageAltText?.default.trim()) {
+        const multiLangIssueInImageAltText = validateCardFieldsForAllLanguages(
+          "imageAltText",
+          ending.imageAltText,
+          languages,
+          "end",
+          index
+        );
+
+        if (multiLangIssueInImageAltText) {
+          ctx.addIssue(multiLangIssueInImageAltText);
+        }
+      }
+
       if (ending.buttonLabel !== undefined || ending.buttonLink !== undefined) {
         if (!ending.buttonLabel) {
           ctx.addIssue({
@@ -1865,7 +2007,7 @@ export const surveyRefinement = (survey: z.infer<typeof ZSurveyBase>, ctx: z.Ref
             path: ["endings", index, "buttonLink"],
           });
         } else {
-          const parsedButtonLink = ZEndingCardUrl.safeParse(ending.buttonLink);
+          const parsedButtonLink = ZEndingCardButtonLink.safeParse(ending.buttonLink);
           if (!parsedButtonLink.success) {
             const errorMessage = parsedButtonLink.error.issues[0].message;
             ctx.addIssue({
@@ -3669,6 +3811,10 @@ const validateBlockConditions = (
   return issues;
 };
 
+/** How a logic error names a block: its editable title, or its position when the title is blank. */
+const getBlockLabel = (block: TSurveyBlock, blockIndex: number): string =>
+  block.name.trim() || `Block ${String(blockIndex + 1)}`;
+
 const validateBlockActions = (
   survey: TSurvey,
   blockIndex: number,
@@ -3793,10 +3939,13 @@ const validateBlockActions = (
       const possibleTargets = [...blockIds, ...endingIds];
 
       if (!possibleTargets.includes(targetBlockId)) {
+        // Named by the owning block's title, never the missing target's id: the id is internal and
+        // the block it pointed at no longer exists to be named.
         return {
           code: "custom",
-          message: `Conditional Logic: Block ID ${targetBlockId} does not exist in logic no: ${String(logicIndex + 1)} of block ${String(blockIndex + 1)}`,
+          message: `Conditional Logic: Jump destination in rule ${String(logicIndex + 1)} of "${getBlockLabel(currentBlock, blockIndex)}" no longer exists. Choose a valid destination.`,
           path: ["blocks", blockIndex, "logic", logicIndex],
+          params: { missingLogicDestination: "jump" },
         };
       }
 
@@ -3867,8 +4016,9 @@ const validateBlockLogicFallback = (
     return [
       {
         code: "custom",
-        message: `Conditional Logic: Fallback block ID ${block.logicFallback} does not exist in block ${String(blockIndex + 1)}`,
+        message: `Conditional Logic: Fallback destination of "${getBlockLabel(block, blockIndex)}" no longer exists. Choose a valid destination.`,
         path: ["blocks", blockIndex],
+        params: { missingLogicDestination: "fallback" },
       },
     ];
   }
@@ -3901,13 +4051,21 @@ export const ZSurveyUpdateInput = ZSurveyBase.omit({
   createdAt: true,
   updatedAt: true,
   followUps: true,
-  // Read-only projection of the EmbeddedData tables (ENG-1837), omitted for the same reason as on
-  // both create inputs: nothing may reach a Prisma write through this schema. Omitting STRIPS rather
-  // than rejects, so the v1 PUT round-trip — which re-parses the loaded survey merged with the patch
-  // — is unaffected; `updateSurveyInternal` still destructures the key out, because callers that hand
-  // it a raw `TSurvey` (the editor's save actions, the summary's single-use toggle) never go through
-  // this schema at all.
+  // Omitted deliberately, and it stays omitted after ENG-3228 made `embeddedFields` accepted input
+  // elsewhere: this schema is the v1 `PUT /api/v1/management/surveys/{id}` boundary, which re-parses
+  // the loaded survey merged with the caller's patch. Admitting the key would hand `updateSurvey` the
+  // survey's OWN inlined rows as a desired set on every legacy PUT, turning what the columns say into
+  // a no-op. Omitting STRIPS rather than rejects, so a caller that sends it simply takes the legacy
+  // path. Callers that hand `updateSurvey` a raw `TSurvey` (the editor's save actions) never go
+  // through this schema and keep the V2 carrier.
   embeddedFields: true,
+  // ENG-2949: stripped, like `embeddedFields`. This is the legacy v1 PUT boundary, which ignores a
+  // `customCss` key like any other unknown one; omitting it here means the merged round-trip never hands
+  // the stored value to `updateSurvey`, which then leaves the survey's CSS untouched.
+  customCss: true,
+  // The ENG-3282 authorization facts (`visibility`, `ownerId`, the versions) are deliberately NOT
+  // omitted: the v1 PUT round-trip re-parses the loaded survey, which carries them.
+  // `updateSurveyInternal` strips them before the write instead, so none is writable through here.
 })
   .extend({
     followUps: z
@@ -3949,11 +4107,16 @@ export const ZSurveyCreateInput = makeSchemaOptional(ZSurveyBase)
     // archivedAt is owned exclusively by the archive/restore flows; a create must never set it,
     // otherwise a caller could POST an already-archived, purge-eligible survey.
     archivedAt: true,
-    // Read-only projection of the EmbeddedData tables (ENG-1837). `createSurvey` spreads the parsed
-    // body straight into `Prisma.SurveyCreateInput`, and `Survey` owns relations named
-    // `embeddedData` / `embeddedDataLinks`, so admitting this key would turn a read projection into
-    // a nested relation write. The rows are written by `reconcileEmbeddedData` instead.
-    embeddedFields: true,
+    // Server-owned authorization facts (ENG-3282): never writable through a survey payload.
+    visibility: true,
+    ownerId: true,
+    visibilityVersion: true,
+    visibilityProjectedVersion: true,
+    visibilityChangedAt: true,
+    visibilityChangedById: true,
+    // ENG-2949: custom CSS is stripped from generic create payloads. Only callers that ran the shared
+    // custom CSS save service may set it, through `createSurvey`'s options.
+    customCss: true,
   })
   .extend({
     name: z.string(), // Keep name required
@@ -4005,11 +4168,16 @@ export const ZSurveyCreateInputWithWorkspaceId = makeSchemaOptional(ZSurveyBase)
     // archivedAt is owned exclusively by the archive/restore flows; a create must never set it,
     // otherwise a caller could POST an already-archived, purge-eligible survey.
     archivedAt: true,
-    // Read-only projection of the EmbeddedData tables (ENG-1837). `createSurvey` spreads the parsed
-    // body straight into `Prisma.SurveyCreateInput`, and `Survey` owns relations named
-    // `embeddedData` / `embeddedDataLinks`, so admitting this key would turn a read projection into
-    // a nested relation write. The rows are written by `reconcileEmbeddedData` instead.
-    embeddedFields: true,
+    // Server-owned authorization facts (ENG-3282): never writable through a survey payload.
+    visibility: true,
+    ownerId: true,
+    visibilityVersion: true,
+    visibilityProjectedVersion: true,
+    visibilityChangedAt: true,
+    visibilityChangedById: true,
+    // ENG-2949: custom CSS is stripped from generic create payloads. Only callers that ran the shared
+    // custom CSS save service may set it, through `createSurvey`'s options.
+    customCss: true,
   })
   .extend({
     name: z.string(), // Keep name required
@@ -4338,7 +4506,10 @@ export type TSurveyElementSummaryMatrix = z.infer<typeof ZSurveyElementSummaryMa
 
 export const ZSurveyElementSummaryHiddenFields = z.object({
   type: z.literal("hiddenField"),
+  /** The storage key the samples were read from. Unique per survey; not shown. */
   id: z.string(),
+  /** What the card is titled: the field's name, disambiguated on collision (ENG-3233). */
+  label: z.string(),
   responseCount: z.number(),
   samples: z.array(
     z.object({

@@ -1,19 +1,22 @@
 import "server-only";
 import { z } from "zod";
 import { type TChartQuery } from "@formbricks/types/analysis";
+import { InvalidInputError } from "@formbricks/types/errors";
+import { redactAIError } from "@/lib/ai/loggable-error";
 import { generateOrganizationAIObject } from "@/lib/ai/service";
+import { DATE_RANGE_PRESETS } from "@/lib/date-ranges";
 import { AI_TRACING_FEATURE } from "@/lib/posthog/ai-tracing-feature";
 import { formatDataProfile } from "@/modules/ee/analysis/lib/ai-data-profile";
 import { getAIDataProfile } from "@/modules/ee/analysis/lib/ai-data-profile.server";
 import { generateSchemaContext } from "@/modules/ee/analysis/lib/ai-schema-context";
 import {
-  DATE_PRESETS,
   FEEDBACK_DIMENSION_IDS,
   FEEDBACK_MEASURE_IDS,
   FEEDBACK_TIME_DIMENSION_IDS,
 } from "@/modules/ee/analysis/lib/schema-definition";
 import { type TChartType, ZChartType } from "@/modules/ee/analysis/types/analysis";
 import { resolveAIDateRange } from "./ai-chart-date-range";
+import { AI_CHART_PROMPT_ERROR_CODE } from "./ai-chart-errors";
 import { getAIChartPromptError } from "./ai-chart-errors.server";
 import { prepareQueryForChartType } from "./big-number";
 
@@ -43,7 +46,7 @@ const toEnumTuple = (values: readonly string[]): [string, ...string[]] => {
 const ZMeasureId = z.enum(toEnumTuple(FEEDBACK_MEASURE_IDS));
 const ZDimensionId = z.enum(toEnumTuple(FEEDBACK_DIMENSION_IDS));
 const ZTimeDimensionId = z.enum(toEnumTuple(FEEDBACK_TIME_DIMENSION_IDS));
-const ZDatePreset = z.enum(toEnumTuple(DATE_PRESETS.map((preset) => preset.value)));
+const ZDatePreset = z.enum(toEnumTuple(DATE_RANGE_PRESETS));
 const ZFilterMemberId = z.enum(toEnumTuple([...FEEDBACK_MEASURE_IDS, ...FEEDBACK_DIMENSION_IDS]));
 const ZFilterOperator = z.enum([
   "equals",
@@ -88,6 +91,14 @@ const ZFilter = z
   });
 
 export const ZAIQueryResponse = z.object({
+  // First on purpose: the model writes fields in schema order, so it commits to "can this be charted
+  // at all" before it has filled in a query, rather than justifying one it already wrote. Without it
+  // gibberish came back as the default count measure — a real-looking chart for a request nobody made.
+  answerable: z
+    .boolean()
+    .describe(
+      "False only when the request is gibberish or asks for something the feedback data cannot answer (weather, jokes, general knowledge). Vague but on-topic requests are answerable. When false, still fill every other field with placeholders (null, an empty measures array, any chartType); they are ignored."
+    ),
   name: z
     .string()
     .nullable()
@@ -150,8 +161,8 @@ type GenerateAIChartQueryInput = {
 /**
  * Translate a natural-language prompt into a normalized Cube.js chart query.
  * Throws an InvalidInputError carrying a stable AI chart error code when
- * structured output cannot be generated; provider/config/network failures
- * stay on the existing error path.
+ * structured output cannot be generated or the model flags the prompt as
+ * unanswerable; provider/config/network failures stay on the existing error path.
  */
 export const generateAIChartQuery = async ({
   organizationId,
@@ -194,7 +205,14 @@ export const generateAIChartQuery = async ({
       throw promptError;
     }
 
-    throw error;
+    // Logged by the AI service already. From here it reaches the server action client, which logs and
+    // reports a thrown error whole — and an AI SDK error carries the user's question and the directory's
+    // profile.
+    throw redactAIError(error);
+  }
+
+  if (!output.answerable) {
+    throw new InvalidInputError(AI_CHART_PROMPT_ERROR_CODE);
   }
 
   return normalizeChartQuery(output);

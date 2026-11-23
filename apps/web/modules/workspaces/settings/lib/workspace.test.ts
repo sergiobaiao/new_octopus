@@ -7,12 +7,14 @@ import {
   DatabaseError,
   InvalidInputError,
   OperationNotAllowedError,
+  ResourceNotFoundError,
   ValidationError,
 } from "@formbricks/types/errors";
 import { TWorkspace } from "@formbricks/types/workspace";
 import { reconcileFeedbackDirectoryRelationships } from "@/lib/authzed/feedback-directory";
 import { reconcileTeamWorkspaceRelationships } from "@/lib/authzed/team-workspace";
-import { deleteFilesByWorkspaceId } from "@/modules/storage/service";
+import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
+import { deleteFile, deleteWorkspaceFilesBestEffort } from "@/modules/storage/service";
 import { createWorkspace, deleteWorkspace, deleteWorkspaceIfNotLast, updateWorkspace } from "./workspace";
 
 vi.mock("server-only", () => ({}));
@@ -35,10 +37,14 @@ const baseWorkspace = {
   placement: "bottomRight",
   clickOutsideClose: false,
   overlay: "none",
+  overlayColor: null,
+  overlayOpacity: null,
   styling: { allowStyleOverwrite: true },
   logo: null,
   customHeadScripts: null,
-} satisfies TWorkspace;
+  customCss: null,
+  customCssPrevious: null,
+} satisfies TWorkspace & { customCss: null; customCssPrevious: null };
 
 vi.mock("@formbricks/database", () => ({
   prisma: {
@@ -47,13 +53,18 @@ vi.mock("@formbricks/database", () => ({
     workspace: {
       update: vi.fn(),
       create: vi.fn(),
+      count: vi.fn(),
       delete: vi.fn(),
+      findUnique: vi.fn(),
     },
     workspaceTeam: {
       createMany: vi.fn(),
     },
     team: {
       findMany: vi.fn(),
+    },
+    organization: {
+      findUnique: vi.fn(),
     },
     feedbackDirectory: {
       upsert: vi.fn(),
@@ -99,8 +110,16 @@ vi.mock("@/lib/utils/validate", () => ({
 }));
 
 vi.mock("@/modules/storage/service", () => ({
-  deleteFilesByWorkspaceId: vi.fn(),
+  deleteWorkspaceFilesBestEffort: vi.fn(),
+  deleteFile: vi.fn(),
 }));
+
+vi.mock("@/lib/workspace/service", () => ({
+  getWorkspaceLegacyStoragePrefixes: vi.fn(),
+}));
+
+// Existing cases exercise everything but the cap; it has its own describe below (ENG-3921).
+const NEW_ORGANIZATION = { workspaceLimit: null };
 
 describe("workspace lib", () => {
   beforeEach(() => {
@@ -109,6 +128,286 @@ describe("workspace lib", () => {
     // the same prisma mock so assertions stay on `prisma.*` and a rollback surfaces as a throw.
     vi.mocked(prisma.$transaction).mockImplementation(async (callback: any) => callback(prisma));
     vi.mocked(prisma.feedbackDirectoryWorkspace.findMany).mockResolvedValue([]);
+  });
+
+  // ENG-2418: removing or replacing a logo was a database-only write, so the old object stayed in the
+  // bucket forever. Every upload gets a unique `--fid--{uuid}` key, so exactly one row referenced it.
+  describe("updateWorkspace logo cleanup", () => {
+    const LOGO_PREFIX = "/storage/p1/public";
+    const oldUrl = `${LOGO_PREFIX}/old--fid--111.png`;
+    const newUrl = `${LOGO_PREFIX}/new--fid--222.png`;
+
+    const loadedAt = new Date("2026-09-23T10:00:00.000Z");
+
+    // updateWorkspace reads the stored logo through a locked `SELECT … FOR UPDATE`, so the fixture
+    // models that row rather than a whole workspace — same reasoning as mockOrgTeams above.
+    const withStoredLogo = (url: string | null, updatedAt: Date = loadedAt) => {
+      vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([{ logo: url ? { url } : null, updatedAt }]);
+    };
+    const resolvesTo = (workspace: Partial<TWorkspace> & { logo?: { url: string } | null }) => {
+      vi.mocked(prisma.workspace.update).mockResolvedValueOnce({
+        ...baseWorkspace,
+        ...workspace,
+      } as unknown as Awaited<ReturnType<typeof prisma.workspace.update>>);
+    };
+
+    // The organization's whitelabel decides whether an object under this workspace's prefix is
+    // actually an organization asset; by default the org claims nothing.
+    const orgClaims = (whitelabel: { logoUrl?: string | null; faviconUrl?: string | null } | null) => {
+      vi.mocked(prisma.organization.findUnique).mockResolvedValue({ whitelabel } as unknown as Awaited<
+        ReturnType<typeof prisma.organization.findUnique>
+      >);
+    };
+
+    beforeEach(() => {
+      vi.mocked(getWorkspaceLegacyStoragePrefixes).mockResolvedValue(["p1"]);
+      vi.mocked(deleteFile).mockResolvedValue({ ok: true, data: undefined });
+      orgClaims(null);
+    });
+
+    test("deletes the old object when the logo is removed", async () => {
+      withStoredLogo(oldUrl);
+      resolvesTo({ logo: null });
+
+      await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).toHaveBeenCalledWith("p1", "public", "old--fid--111.png");
+    });
+
+    test("deletes only the old object when the logo is replaced", async () => {
+      withStoredLogo(oldUrl);
+      resolvesTo({ logo: { url: newUrl } });
+
+      await updateWorkspace("p1", { logo: { url: newUrl }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).toHaveBeenCalledTimes(1);
+      expect(deleteFile).toHaveBeenCalledWith("p1", "public", "old--fid--111.png");
+    });
+
+    test("deletes nothing when the logo url is unchanged", async () => {
+      withStoredLogo(oldUrl);
+      resolvesTo({ logo: { url: oldUrl } });
+
+      await updateWorkspace("p1", { logo: { url: oldUrl, bgColor: "#fff" }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).not.toHaveBeenCalled();
+    });
+
+    // The same object can be named by an absolute and a relative url, and with the file name
+    // percent-encoded or not. A raw string compare reads that as a change and deletes the object
+    // the row still points at.
+    test("deletes nothing when the url is re-spelled but resolves to the same object", async () => {
+      withStoredLogo(`${LOGO_PREFIX}/my%20logo--fid--1.png`);
+      resolvesTo({ logo: { url: "https://app.formbricks.com/storage/p1/public/my logo--fid--1.png" } });
+
+      await updateWorkspace("p1", {
+        logo: { url: "https://app.formbricks.com/storage/p1/public/my logo--fid--1.png" },
+        expectedUpdatedAt: loadedAt,
+      });
+
+      expect(deleteFile).not.toHaveBeenCalled();
+    });
+
+    // The comparison runs after the write has committed, so a url whose percent escapes cannot be
+    // decoded must not throw — that would report a save that actually succeeded as failed.
+    test("resolves the update when the stored url has a malformed percent escape", async () => {
+      withStoredLogo(`${LOGO_PREFIX}/bad%zz.png`);
+      resolvesTo({ logo: null });
+
+      await expect(
+        updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt })
+      ).resolves.toBeDefined();
+
+      expect(deleteFile).not.toHaveBeenCalled();
+    });
+
+    test("does not read or delete anything when the update carries no logo", async () => {
+      resolvesTo({ name: "renamed" });
+
+      await updateWorkspace("p1", { name: "renamed" });
+
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+      expect(deleteFile).not.toHaveBeenCalled();
+    });
+
+    // Prisma treats `logo: undefined` as "leave the field alone". Trusting the input instead of what
+    // was persisted would delete the object while the row still points at it.
+    test("deletes nothing when Prisma ignores an undefined logo", async () => {
+      withStoredLogo(oldUrl);
+      resolvesTo({ logo: { url: oldUrl } });
+
+      await updateWorkspace("p1", { logo: undefined, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).not.toHaveBeenCalled();
+    });
+
+    // ENG-2258 / ENG-1981: logo.url is caller-supplied and parseStorageFileUrl does not check the
+    // origin, so an unguarded delete is a cross-tenant delete primitive.
+    test("refuses to delete an object under a prefix the workspace does not own", async () => {
+      withStoredLogo("/storage/other-workspace/public/victim--fid--999.png");
+      resolvesTo({ logo: null });
+
+      await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).not.toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalled();
+    });
+
+    // Owning the prefix does not make the object a logo. Response attachments live under `private/`,
+    // so the cleanup refuses anything that is not a public key.
+    test("refuses to delete a private object even inside the workspace", async () => {
+      withStoredLogo("/storage/p1/private/response-attachment--fid--888.pdf");
+      resolvesTo({ logo: null });
+
+      await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).not.toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalled();
+    });
+
+    // Organization favicons and email logos upload to the same `{workspaceId}/public/` prefix, but
+    // changing them needs `organization.manage` while this path needs only `workspace.manage`.
+    test.each([
+      ["email logo", "logoUrl"],
+      ["favicon", "faviconUrl"],
+    ])("refuses to delete the organization's %s", async (_label, field) => {
+      const orgAssetUrl = `${LOGO_PREFIX}/org-asset--fid--777.png`;
+      orgClaims({ [field]: orgAssetUrl });
+      withStoredLogo(orgAssetUrl);
+      resolvesTo({ logo: null });
+
+      await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).not.toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalled();
+    });
+
+    // The organization stores an absolute url while the workspace logo holds the relative one; both
+    // resolve to the same object, so a raw string compare would miss it.
+    test("matches an organization asset across url forms", async () => {
+      orgClaims({ logoUrl: "https://app.formbricks.com/storage/p1/public/shared%20asset--fid--888.png" });
+      withStoredLogo(`${LOGO_PREFIX}/shared asset--fid--888.png`);
+      resolvesTo({ logo: null });
+
+      await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).not.toHaveBeenCalled();
+    });
+
+    // Two saves that both loaded logo A: the replace writes C and deletes A, then the stale save
+    // restores A. Without a baseline the row ends up pointing at an object that no longer exists.
+    describe("stale-save guard", () => {
+      const changedAt = new Date("2026-09-23T10:05:00.000Z");
+
+      test("rejects a save whose baseline is older than the stored row", async () => {
+        withStoredLogo(newUrl, changedAt);
+
+        await expect(
+          updateWorkspace("p1", { logo: { url: oldUrl }, expectedUpdatedAt: loadedAt })
+        ).rejects.toThrow(OperationNotAllowedError);
+
+        expect(prisma.workspace.update).not.toHaveBeenCalled();
+        expect(deleteFile).not.toHaveBeenCalled();
+      });
+
+      test("accepts a save whose baseline matches", async () => {
+        withStoredLogo(oldUrl);
+        resolvesTo({ logo: { url: newUrl } });
+
+        await updateWorkspace("p1", { logo: { url: newUrl }, expectedUpdatedAt: loadedAt });
+
+        expect(deleteFile).toHaveBeenCalledWith("p1", "public", "old--fid--111.png");
+      });
+
+      // An opt-in guard protects nobody who forgets it, so a logo-bearing update without a baseline
+      // is refused outright rather than silently skipping the version check.
+      test("refuses a logo update that carries no baseline", async () => {
+        await expect(updateWorkspace("p1", { logo: { url: undefined } })).rejects.toThrow(ValidationError);
+
+        expect(prisma.workspace.update).not.toHaveBeenCalled();
+        expect(deleteFile).not.toHaveBeenCalled();
+      });
+
+      test("leaves updates without a logo free of the baseline requirement", async () => {
+        resolvesTo({ name: "renamed" });
+
+        await expect(updateWorkspace("p1", { name: "renamed" })).resolves.toBeDefined();
+      });
+
+      // createWorkspace shares the same input schema and spreads it into prisma.create, so the
+      // baseline has to be stripped there too or it reaches Prisma as an unknown column.
+      test("is stripped by createWorkspace too", async () => {
+        vi.mocked(prisma.workspace.create).mockResolvedValueOnce(baseWorkspace);
+
+        await createWorkspace("org1", { name: "New", expectedUpdatedAt: loadedAt }, NEW_ORGANIZATION);
+
+        expect(prisma.workspace.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.not.objectContaining({ expectedUpdatedAt: expect.anything() }),
+          })
+        );
+      });
+
+      test("never writes the baseline as a column", async () => {
+        withStoredLogo(oldUrl);
+        resolvesTo({ logo: null });
+
+        await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+        expect(prisma.workspace.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.not.objectContaining({ expectedUpdatedAt: expect.anything() }),
+          })
+        );
+      });
+    });
+
+    test("deletes an object under the workspace's legacy environment prefix", async () => {
+      vi.mocked(getWorkspaceLegacyStoragePrefixes).mockResolvedValue(["p1", "env-legacy"]);
+      withStoredLogo("/storage/env-legacy/public/legacy--fid--333.png");
+      resolvesTo({ logo: null });
+
+      await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).toHaveBeenCalledWith("env-legacy", "public", "legacy--fid--333.png");
+    });
+
+    test("leaves an external logo url alone", async () => {
+      withStoredLogo("https://cdn.example.com/logo.png");
+      resolvesTo({ logo: null });
+
+      await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).not.toHaveBeenCalled();
+    });
+
+    // The url carries the percent-encoded name; the object is stored under the decoded one.
+    test("decodes the file name before deleting", async () => {
+      withStoredLogo(`${LOGO_PREFIX}/my%20logo--fid--444.png`);
+      resolvesTo({ logo: null });
+
+      await updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt });
+
+      expect(deleteFile).toHaveBeenCalledWith("p1", "public", "my logo--fid--444.png");
+    });
+
+    test.each([
+      [
+        "returns an error",
+        () =>
+          vi.mocked(deleteFile).mockResolvedValue({ ok: false, error: { code: StorageErrorCode.Unknown } }),
+      ],
+      ["rejects", () => vi.mocked(deleteFile).mockRejectedValue(new Error("bucket down"))],
+    ])("still resolves the update when deleteFile %s", async (_label, arrange) => {
+      arrange();
+      withStoredLogo(oldUrl);
+      resolvesTo({ logo: null });
+
+      await expect(
+        updateWorkspace("p1", { logo: { url: undefined }, expectedUpdatedAt: loadedAt })
+      ).resolves.toBeDefined();
+      expect(logger.error).toHaveBeenCalled();
+    });
   });
 
   describe("updateWorkspace", () => {
@@ -120,6 +419,23 @@ describe("workspace lib", () => {
       expect(result).toEqual(baseWorkspace);
       expect(prisma.workspace.update).toHaveBeenCalled();
       expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({ workspaceIds: ["p1"] });
+    });
+
+    test("never writes custom CSS through a general workspace update (ENG-2949)", async () => {
+      vi.mocked(prisma.workspace.update).mockResolvedValueOnce(baseWorkspace);
+
+      await updateWorkspace("p1", {
+        name: "Workspace 1",
+        customCss: {
+          light: { source: "a{}", compiled: "#fbjs{position:fixed}" },
+          dark: null,
+          processorVersion: 1,
+        },
+        customCssPrevious: null,
+      } as never);
+
+      const { data } = vi.mocked(prisma.workspace.update).mock.calls[0][0];
+      expect(data).toEqual({ name: "Workspace 1" });
     });
 
     test("throws DatabaseError on Prisma error", async () => {
@@ -170,7 +486,11 @@ describe("workspace lib", () => {
       vi.mocked(prisma.workspace.create).mockResolvedValueOnce(createdWorkspace as any);
       vi.mocked(prisma.workspaceTeam.createMany).mockResolvedValueOnce({} as any);
 
-      const result = await createWorkspace("org1", { name: "Workspace 1", teamIds: ["t1"] });
+      const result = await createWorkspace(
+        "org1",
+        { name: "Workspace 1", teamIds: ["t1"] },
+        NEW_ORGANIZATION
+      );
 
       expect(result).toEqual(createdWorkspace);
       // ENG-1922: teamIds must be validated against the target org before linking.
@@ -192,7 +512,7 @@ describe("workspace lib", () => {
       vi.mocked(prisma.team.findMany).mockResolvedValueOnce(mockOrgTeams());
 
       await expect(
-        createWorkspace("org1", { name: "Workspace 1", teamIds: ["foreign-team"] })
+        createWorkspace("org1", { name: "Workspace 1", teamIds: ["foreign-team"] }, NEW_ORGANIZATION)
       ).rejects.toThrow(ValidationError);
 
       // The membership check must run org-scoped...
@@ -215,7 +535,7 @@ describe("workspace lib", () => {
       vi.mocked(prisma.workspace.create).mockResolvedValueOnce({ ...baseWorkspace, id: "p3" } as any);
       vi.mocked(prisma.workspaceTeam.createMany).mockResolvedValueOnce({} as any);
 
-      await createWorkspace("org1", { name: "Workspace 1", teamIds: ["t1"] });
+      await createWorkspace("org1", { name: "Workspace 1", teamIds: ["t1"] }, NEW_ORGANIZATION);
 
       expect(logger.warn).not.toHaveBeenCalled();
     });
@@ -227,7 +547,7 @@ describe("workspace lib", () => {
       vi.mocked(prisma.team.findMany).mockResolvedValueOnce(mockOrgTeams("t1"));
 
       await expect(
-        createWorkspace("org1", { name: "Workspace 1", teamIds: ["t1", "foreign-team"] })
+        createWorkspace("org1", { name: "Workspace 1", teamIds: ["t1", "foreign-team"] }, NEW_ORGANIZATION)
       ).rejects.toThrow(ValidationError);
 
       expect(prisma.team.findMany).toHaveBeenCalledWith(
@@ -238,9 +558,9 @@ describe("workspace lib", () => {
     });
 
     test("rejects duplicate teamIds", async () => {
-      await expect(createWorkspace("org1", { name: "Workspace 1", teamIds: ["t1", "t1"] })).rejects.toThrow(
-        ValidationError
-      );
+      await expect(
+        createWorkspace("org1", { name: "Workspace 1", teamIds: ["t1", "t1"] }, NEW_ORGANIZATION)
+      ).rejects.toThrow(ValidationError);
 
       // Rejected before any lookup or write.
       expect(prisma.team.findMany).not.toHaveBeenCalled();
@@ -252,7 +572,7 @@ describe("workspace lib", () => {
       const createdWorkspace = { ...baseWorkspace, id: "p-language" };
       vi.mocked(prisma.workspace.create).mockResolvedValueOnce(createdWorkspace as any);
 
-      await createWorkspace("org1", { name: "Workspace language" });
+      await createWorkspace("org1", { name: "Workspace language" }, NEW_ORGANIZATION);
 
       const createArgs = vi.mocked(prisma.workspace.create).mock.calls[0][0];
       expect((createArgs.data as any).languages.create).toEqual([{ code: "en-US", alias: null }]);
@@ -262,7 +582,7 @@ describe("workspace lib", () => {
       const createdWorkspace = { ...baseWorkspace, id: "p-defaults" };
       vi.mocked(prisma.workspace.create).mockResolvedValueOnce(createdWorkspace as any);
 
-      await createWorkspace("org1", { name: "Workspace defaults" });
+      await createWorkspace("org1", { name: "Workspace defaults" }, NEW_ORGANIZATION);
 
       const createArgs = vi.mocked(prisma.workspace.create).mock.calls[0][0];
       const attributeCreate = (createArgs.data as any).contactAttributeKeys.create as Array<{
@@ -282,7 +602,7 @@ describe("workspace lib", () => {
       const createdWorkspace = { ...baseWorkspace, id: "p3" };
       vi.mocked(prisma.workspace.create).mockResolvedValueOnce(createdWorkspace as any);
 
-      const result = await createWorkspace("org1", { name: "Workspace No Teams" });
+      const result = await createWorkspace("org1", { name: "Workspace No Teams" }, NEW_ORGANIZATION);
 
       expect(result).toEqual(createdWorkspace);
       expect(prisma.workspaceTeam.createMany).not.toHaveBeenCalled();
@@ -293,14 +613,14 @@ describe("workspace lib", () => {
       const createdWorkspace = { ...baseWorkspace, id: "p4" };
       vi.mocked(prisma.workspace.create).mockResolvedValueOnce(createdWorkspace as any);
 
-      await createWorkspace("org1", { name: "Second Workspace" });
+      await createWorkspace("org1", { name: "Second Workspace" }, NEW_ORGANIZATION);
 
       expect(prisma.feedbackDirectory.upsert).not.toHaveBeenCalled();
       expect(prisma.feedbackDirectoryWorkspace.create).not.toHaveBeenCalled();
     });
 
     test("throws ValidationError if name is missing", async () => {
-      await expect(createWorkspace("org1", {})).rejects.toThrow(ValidationError);
+      await expect(createWorkspace("org1", {}, NEW_ORGANIZATION)).rejects.toThrow(ValidationError);
     });
 
     test("throws InvalidInputError on unique constraint", async () => {
@@ -309,7 +629,9 @@ describe("workspace lib", () => {
         clientVersion: "5.0.0",
       });
       vi.mocked(prisma.workspace.create).mockRejectedValueOnce(prismaError);
-      await expect(createWorkspace("org1", { name: "Workspace 1" })).rejects.toThrow(InvalidInputError);
+      await expect(createWorkspace("org1", { name: "Workspace 1" }, NEW_ORGANIZATION)).rejects.toThrow(
+        InvalidInputError
+      );
     });
 
     test("throws DatabaseError on Prisma error", async () => {
@@ -318,12 +640,90 @@ describe("workspace lib", () => {
         clientVersion: "5.0.0",
       });
       vi.mocked(prisma.workspace.create).mockRejectedValueOnce(prismaError);
-      await expect(createWorkspace("org1", { name: "Workspace 1" })).rejects.toThrow(DatabaseError);
+      await expect(createWorkspace("org1", { name: "Workspace 1" }, NEW_ORGANIZATION)).rejects.toThrow(
+        DatabaseError
+      );
     });
 
     test("throws unknown error", async () => {
       vi.mocked(prisma.workspace.create).mockRejectedValueOnce(new Error("fail"));
-      await expect(createWorkspace("org1", { name: "Workspace 1" })).rejects.toThrow("fail");
+      await expect(createWorkspace("org1", { name: "Workspace 1" }, NEW_ORGANIZATION)).rejects.toThrow(
+        "fail"
+      );
+    });
+  });
+
+  // ENG-3921: the cap used to be a count compared in the action, outside the transaction, so a burst of
+  // concurrent creates all passed it. The race itself is proven against real Postgres in
+  // integration/workspace-limit-race.integration.test.ts; these pin the shape that makes it safe.
+  describe("createWorkspace workspace limit", () => {
+    const lockQuery = () => {
+      const [strings, ...values] = vi.mocked(prisma.$queryRaw).mock.calls[0] as unknown as [
+        TemplateStringsArray,
+        ...unknown[],
+      ];
+      return { sql: strings.join("?"), values };
+    };
+
+    test("locks the organization, then counts, then creates — all inside the transaction", async () => {
+      vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([{ id: "org1" }]);
+      vi.mocked(prisma.workspace.count).mockResolvedValueOnce(2);
+      vi.mocked(prisma.workspace.create).mockResolvedValueOnce(baseWorkspace);
+
+      await expect(createWorkspace("org1", { name: "Workspace 3" }, { workspaceLimit: 3 })).resolves.toEqual(
+        baseWorkspace
+      );
+
+      const { sql, values } = lockQuery();
+      expect(sql).toMatch(/FROM "Organization"\s+WHERE "id" = \?\s+FOR NO KEY UPDATE/);
+      expect(values).toEqual(["org1"]);
+      expect(prisma.workspace.count).toHaveBeenCalledWith({ where: { organizationId: "org1" } });
+
+      const [lockOrder] = vi.mocked(prisma.$queryRaw).mock.invocationCallOrder;
+      const [countOrder] = vi.mocked(prisma.workspace.count).mock.invocationCallOrder;
+      const [createOrder] = vi.mocked(prisma.workspace.create).mock.invocationCallOrder;
+      const [transactionOrder] = vi.mocked(prisma.$transaction).mock.invocationCallOrder;
+      expect(transactionOrder).toBeLessThan(lockOrder);
+      expect(lockOrder).toBeLessThan(countOrder);
+      expect(countOrder).toBeLessThan(createOrder);
+    });
+
+    test("rejects at the limit without writing anything", async () => {
+      vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([{ id: "org1" }]);
+      vi.mocked(prisma.workspace.count).mockResolvedValueOnce(3);
+
+      await expect(
+        createWorkspace("org1", { name: "Workspace 4", teamIds: ["t1"] }, { workspaceLimit: 3 })
+      ).rejects.toThrow(new OperationNotAllowedError("Organization workspace limit reached"));
+
+      expect(prisma.team.findMany).not.toHaveBeenCalled();
+      expect(prisma.workspace.create).not.toHaveBeenCalled();
+      expect(prisma.workspaceTeam.createMany).not.toHaveBeenCalled();
+      expect(reconcileTeamWorkspaceRelationships).not.toHaveBeenCalled();
+    });
+
+    test("rejects an organization that no longer exists before counting", async () => {
+      vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([]);
+
+      await expect(createWorkspace("org1", { name: "Workspace" }, { workspaceLimit: 3 })).rejects.toThrow(
+        ResourceNotFoundError
+      );
+
+      expect(prisma.workspace.count).not.toHaveBeenCalled();
+      expect(prisma.workspace.create).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ["an unlimited plan", Infinity],
+      ["a just-created organization", null],
+    ])("takes no lock for %s", async (_label, workspaceLimit) => {
+      vi.mocked(prisma.workspace.create).mockResolvedValueOnce(baseWorkspace);
+
+      await createWorkspace("org1", { name: "Workspace" }, { workspaceLimit });
+
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+      expect(prisma.workspace.count).not.toHaveBeenCalled();
+      expect(prisma.workspace.create).toHaveBeenCalled();
     });
   });
 
@@ -336,27 +736,38 @@ describe("workspace lib", () => {
       vi.mocked(prisma.feedbackDirectoryWorkspace.findMany).mockResolvedValueOnce([
         feedbackDirectoryAssignment,
       ] as any);
-      vi.mocked(prisma.workspace.delete).mockResolvedValueOnce(baseWorkspace as any);
+      vi.mocked(prisma.workspace.delete).mockResolvedValueOnce(baseWorkspace);
 
-      vi.mocked(deleteFilesByWorkspaceId).mockResolvedValue({ ok: true, data: undefined });
       const result = await deleteWorkspace("p1");
       expect(result).toEqual(baseWorkspace);
       expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({ workspaceIds: ["p1"] });
       expect(reconcileFeedbackDirectoryRelationships).toHaveBeenCalledWith({
         assignments: [feedbackDirectoryAssignment],
       });
-      expect(deleteFilesByWorkspaceId).toHaveBeenCalledWith("p1", []);
+      expect(deleteWorkspaceFilesBestEffort).toHaveBeenCalledWith(baseWorkspace);
     });
 
-    test("logs error if file deletion fails", async () => {
-      vi.mocked(prisma.workspace.delete).mockResolvedValueOnce(baseWorkspace as any);
-      vi.mocked(deleteFilesByWorkspaceId).mockResolvedValue({
-        ok: false,
-        error: { code: StorageErrorCode.Unknown },
-      } as any);
-      vi.mocked(logger.error).mockImplementation(() => {});
+    // ENG-3197: this used to pass a hardcoded [] for the legacy prefixes, so files uploaded before
+    // the workspace was migrated off its environment id survived the delete.
+    test("passes the workspace's legacy environment prefix to storage cleanup", async () => {
+      const migratedWorkspace = { ...baseWorkspace, legacyEnvironmentId: "env-1" };
+      vi.mocked(prisma.workspace.delete).mockResolvedValueOnce(migratedWorkspace as any);
+
       await deleteWorkspace("p1");
-      expect(logger.error).toHaveBeenCalled();
+
+      expect(deleteWorkspaceFilesBestEffort).toHaveBeenCalledWith(migratedWorkspace);
+    });
+
+    test("selects legacyEnvironmentId off the deleted row", async () => {
+      vi.mocked(prisma.workspace.delete).mockResolvedValueOnce(baseWorkspace);
+
+      await deleteWorkspace("p1");
+
+      expect(prisma.workspace.delete).toHaveBeenCalledWith(
+        expect.objectContaining({
+          select: expect.objectContaining({ legacyEnvironmentId: true }),
+        })
+      );
     });
 
     test("throws DatabaseError on Prisma error", async () => {
@@ -375,8 +786,7 @@ describe("workspace lib", () => {
 
     test("deletes a workspace while another workspace remains", async () => {
       vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([{ id: "p1" }, { id: "p2" }]);
-      vi.mocked(prisma.workspace.delete).mockResolvedValueOnce(baseWorkspace as any);
-      vi.mocked(deleteFilesByWorkspaceId).mockResolvedValue({ ok: true, data: undefined });
+      vi.mocked(prisma.workspace.delete).mockResolvedValueOnce(baseWorkspace);
 
       await expect(deleteWorkspaceIfNotLast("p1", "org1")).resolves.toEqual(baseWorkspace);
     });

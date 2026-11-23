@@ -1,11 +1,14 @@
 import { type JobHandlerOverrides, type JobsRuntimeHandle, startJobsRuntime } from "@formbricks/jobs";
 import { logger } from "@formbricks/logger";
+import { startAuthzedOutboxSafetyNet, stopAuthzedOutboxSafetyNet } from "@/lib/authzed/outbox-safety-net";
 import { getJobsQueueingConfig, getJobsWorkerBootstrapConfig } from "@/lib/jobs/config";
 import { RECURRING_JOB_REGISTRATIONS, getJobHandlerOverrides } from "@/lib/jobs/recurring-registrations";
+import { isNewReleaseWorkEnabled } from "@/lib/upgrade/compatibility";
 
 const WORKER_STARTUP_RETRY_DELAY_MS = 30_000;
 
 type TJobsRuntimeGlobal = typeof globalThis & {
+  formbricksServerLifecycle?: { draining: boolean };
   formbricksJobsRecurringRegistration: Promise<void> | undefined;
   formbricksJobsRecurringRegistered: boolean | undefined;
   formbricksJobsRecurringRetryTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -25,7 +28,7 @@ const globalForJobsRuntime = globalThis as TJobsRuntimeGlobal;
  * with no schedule, which a crash between the two calls makes permanent until the next boot.
  *
  * The remove-first this replaces was a reasonable workaround for bullmq#3378 — upsert not updating an
- * existing scheduler — which affected v5.56.9 and earlier. We are on 5.61.0, past that fix.
+ * existing scheduler — which affected v5.56.9 and earlier. We are on 5.81.5, past that fix.
  *
  * Known trade-off, verified against a real Redis: upsert updates the scheduler's repeat options but
  * leaves the run it has already queued alone, so a changed cron pattern or time zone takes effect from
@@ -34,10 +37,13 @@ const globalForJobsRuntime = globalThis as TJobsRuntimeGlobal;
  * without a queued run, and it is the right way round: a config change landing one cycle late is
  * recoverable, a schedule that silently stops firing is not.
  */
-const registerRecurringJobSchedules = async (): Promise<void> => {
+const registerRecurringJobSchedules = async (): Promise<boolean> => {
+  const activated = await isNewReleaseWorkEnabled();
   for (const registration of RECURRING_JOB_REGISTRATIONS) {
+    if (registration.requiresReleaseActivation && !activated) continue;
     await registration.job.upsert(registration.schedule);
   }
+  return activated;
 };
 
 const clearRecurringJobsRetryTimeout = (): void => {
@@ -92,6 +98,7 @@ const scheduleJobsWorkerRetry = (): void => {
 };
 
 export const registerRecurringJobs = async (): Promise<void> => {
+  if (globalForJobsRuntime.formbricksServerLifecycle?.draining) return;
   const jobsQueueingConfig = getJobsQueueingConfig();
 
   if (!jobsQueueingConfig.enabled || !jobsQueueingConfig.redisUrl) {
@@ -109,10 +116,11 @@ export const registerRecurringJobs = async (): Promise<void> => {
   }
 
   globalForJobsRuntime.formbricksJobsRecurringRegistration = (async () => {
-    await registerRecurringJobSchedules();
+    const activated = await registerRecurringJobSchedules();
     clearRecurringJobsRetryTimeout();
-    globalForJobsRuntime.formbricksJobsRecurringRegistered = true;
+    globalForJobsRuntime.formbricksJobsRecurringRegistered = activated;
     globalForJobsRuntime.formbricksJobsRecurringRegistration = undefined;
+    if (!activated) scheduleRecurringJobsRetry();
   })();
 
   try {
@@ -126,6 +134,7 @@ export const registerRecurringJobs = async (): Promise<void> => {
 };
 
 export const registerJobsWorker = async (): Promise<JobsRuntimeHandle | null> => {
+  if (globalForJobsRuntime.formbricksServerLifecycle?.draining) return null;
   const jobsWorkerBootstrapConfig = getJobsWorkerBootstrapConfig();
 
   if (!jobsWorkerBootstrapConfig.enabled || !jobsWorkerBootstrapConfig.runtimeOptions) {
@@ -133,6 +142,10 @@ export const registerJobsWorker = async (): Promise<JobsRuntimeHandle | null> =>
     logger.debug("BullMQ worker startup skipped");
     return null;
   }
+
+  // Before the runtime starts, and whether or not it does: it reads PostgreSQL, not Redis. The safety
+  // net is what delivers the outbox when the runtime is up but its delivery job is not running.
+  startAuthzedOutboxSafetyNet(() => !globalForJobsRuntime.formbricksServerLifecycle?.draining);
 
   if (globalForJobsRuntime.formbricksJobsRuntime) {
     return globalForJobsRuntime.formbricksJobsRuntime;
@@ -153,6 +166,7 @@ export const registerJobsWorker = async (): Promise<JobsRuntimeHandle | null> =>
     const runtime = await startJobsRuntime({
       ...runtimeOptions,
       jobHandlerOverrides,
+      manageSignals: !globalForJobsRuntime.formbricksServerLifecycle,
     });
 
     clearJobsWorkerRetryTimeout();
@@ -176,6 +190,7 @@ export const resetJobsWorkerRegistrationForTests = async (): Promise<void> => {
   const initializing = globalForJobsRuntime.formbricksJobsRuntimeInitializing;
   clearRecurringJobsRetryTimeout();
   clearJobsWorkerRetryTimeout();
+  await stopAuthzedOutboxSafetyNet();
   globalForJobsRuntime.formbricksJobsRecurringRegistered = undefined;
   globalForJobsRuntime.formbricksJobsRecurringRegistration = undefined;
   globalForJobsRuntime.formbricksJobsRuntime = undefined;

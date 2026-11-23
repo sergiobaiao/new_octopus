@@ -10,12 +10,15 @@ import {
   applyRateLimit,
   assertRateLimitAvailable,
   getClientIdentifier,
+  reserveRateLimitUsage,
+  settleRateLimitUsage,
 } from "./helpers";
-import { checkRateLimit, peekRateLimit } from "./rate-limit";
+import { checkRateLimit, peekRateLimit, reserveRateLimit, settleRateLimit } from "./rate-limit";
 import { rateLimitConfigs } from "./rate-limit-configs";
 
 // Mock all dependencies
 vi.mock("@/lib/utils/client-ip", () => ({
+  UNTRUSTED_CLIENT_IP: "untrusted-client-ip",
   getClientIpFromHeaders: vi.fn(),
 }));
 
@@ -26,6 +29,8 @@ vi.mock("@/lib/hash-string", () => ({
 vi.mock("./rate-limit", () => ({
   checkRateLimit: vi.fn(),
   peekRateLimit: vi.fn(),
+  reserveRateLimit: vi.fn(),
+  settleRateLimit: vi.fn(),
 }));
 
 vi.mock("@formbricks/logger", () => ({
@@ -189,6 +194,46 @@ describe("helpers", () => {
     });
   });
 
+  describe("rate limit reservations", () => {
+    const mockConfig = {
+      interval: 300,
+      allowedPerInterval: 5,
+      namespace: "test",
+    };
+    const reservation = {
+      identifier: "test-identifier",
+      key: "rate-limit-key",
+      namespace: "test",
+      requested: 5,
+      settled: false,
+    };
+
+    test("returns a receipt for an allowed reservation", async () => {
+      vi.mocked(reserveRateLimit).mockResolvedValue(
+        ok({ allowed: true, retryAfter: undefined, reservation })
+      );
+
+      await expect(reserveRateLimitUsage(mockConfig, "test-identifier", 5)).resolves.toBe(reservation);
+      expect(reserveRateLimit).toHaveBeenCalledWith(mockConfig, "test-identifier", 5);
+    });
+
+    test("rejects a reservation when capacity is exhausted", async () => {
+      vi.mocked(reserveRateLimit).mockResolvedValue(ok({ allowed: false, retryAfter: 60 }));
+
+      await expect(reserveRateLimitUsage(mockConfig, "test-identifier", 5)).rejects.toThrow(
+        "Maximum number of requests reached. Please try again later."
+      );
+    });
+
+    test("settles an existing receipt and ignores a fail-open reservation", async () => {
+      await settleRateLimitUsage(reservation, 2);
+      await settleRateLimitUsage(undefined, 0);
+
+      expect(settleRateLimit).toHaveBeenCalledOnce();
+      expect(settleRateLimit).toHaveBeenCalledWith(reservation, 2);
+    });
+  });
+
   describe("applyIPRateLimit", () => {
     test("should be a convenience function that gets IP and applies rate limit", async () => {
       // This is an integration test - the function calls getClientIdentifier internally
@@ -237,6 +282,34 @@ describe("helpers", () => {
       await expect(applyIPRateLimit(mockConfig)).rejects.toThrow(
         "Maximum number of requests reached. Please try again later."
       );
+    });
+
+    test("skips the shared untrusted identity only when asked, without counting it", async () => {
+      const mockConfig = { interval: 60, allowedPerInterval: 120, namespace: "auth:saml-callback" };
+      (getClientIpFromHeaders as any).mockResolvedValue("untrusted-client-ip");
+      (hashString as any).mockReturnValue("hashed-untrusted");
+      (checkRateLimit as any).mockResolvedValue(ok({ allowed: true }));
+
+      await expect(applyIPRateLimit(mockConfig, { skipUntrustedClient: true })).resolves.toEqual({
+        allowed: true,
+      });
+      expect(checkRateLimit).not.toHaveBeenCalled();
+      expect(getClientIpFromHeaders).toHaveBeenCalledTimes(1);
+
+      // Without the option the shared identity is counted like any other.
+      await applyIPRateLimit(mockConfig);
+      expect(checkRateLimit).toHaveBeenCalledWith(mockConfig, "hashed-untrusted");
+    });
+
+    test("still counts a trusted client when asked to skip untrusted ones", async () => {
+      const mockConfig = { interval: 60, allowedPerInterval: 120, namespace: "auth:saml-callback" };
+      (getClientIpFromHeaders as any).mockResolvedValue("203.0.113.7");
+      (hashString as any).mockReturnValue("hashed-trusted");
+      (checkRateLimit as any).mockResolvedValue(ok({ allowed: true }));
+
+      await applyIPRateLimit(mockConfig, { skipUntrustedClient: true });
+
+      expect(checkRateLimit).toHaveBeenCalledWith(mockConfig, "hashed-trusted");
     });
   });
 

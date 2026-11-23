@@ -4,15 +4,22 @@ import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { TSurvey } from "@formbricks/types/surveys/types";
-import { selectSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
+import { selectPublicSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
 import { getOrganizationBillingWithReadThroughSync } from "@/modules/ee/billing/lib/organization-billing";
 import { transformPrismaSurvey } from "@/modules/survey/lib/utils";
+
+/**
+ * A link-page survey with `archivedAt` always loaded. `TSurvey` types the field as optional, so a survey from
+ * a loader that doesn't select it would read as "not archived"; requiring it here makes the public-access
+ * gate (`lib/public-access.ts`) refuse such a survey at compile time instead (ENG-4032).
+ */
+export type TLinkSurvey = TSurvey & { archivedAt: Date | null };
 
 /**
  * Comprehensive survey data fetcher for link surveys
  * Combines all necessary data in a single optimized query
  */
-export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
+export const getSurveyWithMetadata = reactCache(async (surveyId: string): Promise<TLinkSurvey> => {
   try {
     const survey = await prisma.survey.findUnique({
       where: { id: surveyId },
@@ -33,8 +40,6 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
         questions: true,
         blocks: true,
         endings: true,
-        hiddenFields: true,
-        variables: true,
         displayOption: true,
         recontactDays: true,
         displayLimit: true,
@@ -60,12 +65,18 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
         styling: true,
         surveyClosedMessage: true,
         showLanguageSwitch: true,
+        autoSelectLanguage: true,
         recaptcha: true,
         metadata: true,
 
         // Custom scripts (self-hosted only)
         customHeadScripts: true,
         customHeadScriptsMode: true,
+
+        // Stored custom CSS (ENG-3552), source included. Server-side input to the compiled CSS the page
+        // delivers; every path that hands this survey to the browser removes it first
+        // (`omitCustomCssSource` in survey-renderer.tsx and validateSurveyPinAction).
+        customCss: true,
 
         // Related data
         languages: {
@@ -120,8 +131,9 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
         },
         followUps: true,
 
-        // ENG-1837: the definitions the renderer's recall and logic engines resolve through.
-        embeddedDataLinks: selectSurveyEmbeddedDataLinks,
+        // ENG-1837: the definitions the renderer's recall and logic engines resolve through, and
+        // (ENG-2404) what the legacy `variables` / `hiddenFields` keys are derived from.
+        embeddedDataLinks: selectPublicSurveyEmbeddedDataLinks,
       },
     });
 
@@ -138,6 +150,7 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
     // above only because `TSurvey` requires the keys, so blank them out before they leave the server.
     return {
       ...transformedSurvey,
+      archivedAt: survey.archivedAt,
       followUps: [],
       ...(transformedSurvey.segment
         ? { segment: { ...transformedSurvey.segment, filters: [], description: null } }
@@ -183,9 +196,6 @@ export const getResponseBySingleUseId = reactCache((surveyId: string, singleUseI
       select: {
         id: true,
         finished: true,
-        // Include additional fields that might be useful
-        createdAt: true,
-        data: true,
       },
     });
 
@@ -204,10 +214,16 @@ export const getResponseBySingleUseId = reactCache((surveyId: string, singleUseI
  */
 export const getExistingContactResponse = reactCache((surveyId: string, contactId: string) => async () => {
   try {
+    // A contact can hold a finished response and an unfinished attempt at once, so the unordered pick could
+    // return the unfinished one and hide the finished one. Prefer the finished row: the contact page gates
+    // "already answered" on it, and only an unfinished row is left to resume.
     const response = await prisma.response.findFirst({
       where: {
         surveyId,
         contactId,
+      },
+      orderBy: {
+        finished: "desc",
       },
       select: {
         id: true,

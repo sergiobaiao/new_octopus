@@ -33,7 +33,13 @@ export const exampleData = {
   ssoRecoveryFactorsRemovedEmail: {
     passwordRemoved: true,
     twoFactorRemoved: true,
+    apiKeysRemoved: true,
     securitySettingsLink: "https://app.formbricks.com/account/settings/profile",
+  },
+
+  ssoSignInHintEmail: {
+    providerNames: ["Microsoft"],
+    loginLink: "https://app.formbricks.com/auth/login",
   },
 
   inviteEmail: {
@@ -174,7 +180,8 @@ export const exampleData = {
     ],
     hiddenFields: [
       {
-        id: "userId",
+        id: "user_id",
+        name: "User ID",
         value: "user-abc-123",
       },
     ],

@@ -4,6 +4,7 @@ import { env } from "@/lib/env";
 import { type TAuthzedConsistency, isAuthzedEnabled } from "./config";
 import {
   AUTHZED_BULK_REQUEST_TIMEOUT_MS,
+  AUTHZED_MAX_BULK_CHECK_ITEMS,
   AUTHZED_MAX_RELATIONSHIP_READS,
   AUTHZED_MAX_RELATIONSHIP_UPDATES,
   AUTHZED_MAX_RESOURCE_LOOKUP_RESULTS,
@@ -45,6 +46,14 @@ export type TAuthzedResourceLookup = Readonly<{
 
 export type TAuthzedResourceLookupResult = Readonly<{
   resourceIds: ReadonlyArray<string>;
+}>;
+
+/** One permission on many resources of one type, for one subject (ENG-3282). */
+export type TAuthzedBulkPermissionCheck = Readonly<{
+  permission: string;
+  resourceIds: ReadonlyArray<string>;
+  resourceType: string;
+  subject: TAuthzedObjectReference;
 }>;
 
 export type TAuthzedSubjectReference = TAuthzedObjectReference &
@@ -171,6 +180,9 @@ export type TAuthzedClient = Readonly<{
 /** Direct-path authorization infrastructure only; intentionally absent from the public barrel. */
 export type TAuthzedResourceLookupClient = TAuthzedClient &
   Readonly<{
+    /** The subset of `resourceIds` the subject holds `permission` on. Fails whole on any item error. */
+    checkBulkPermissions: (check: TAuthzedBulkPermissionCheck) => Promise<ReadonlySet<string>>;
+    checkPermissionBatch: (checks: ReadonlyArray<TAuthzedPermissionCheck>) => Promise<ReadonlyArray<boolean>>;
     lookupResources: (lookup: TAuthzedResourceLookup) => Promise<TAuthzedResourceLookupResult>;
   }>;
 
@@ -279,6 +291,24 @@ const validateResourceLookup = (lookup: TAuthzedResourceLookup): void => {
       attempts: 0,
       code: AUTHZED_ERROR_CODES.INVALID_REQUEST,
       operation: "lookup_resources",
+      retryable: false,
+    });
+  }
+};
+
+const validateBulkPermissionCheck = (check: TAuthzedBulkPermissionCheck): void => {
+  if (
+    !isNonEmpty(check.permission) ||
+    !isNonEmpty(check.resourceType) ||
+    !isNonEmpty(check.subject.objectId) ||
+    !isNonEmpty(check.subject.objectType) ||
+    check.resourceIds.length > AUTHZED_MAX_BULK_CHECK_ITEMS ||
+    !check.resourceIds.every(isNonEmpty)
+  ) {
+    throw new AuthzedError({
+      attempts: 0,
+      code: AUTHZED_ERROR_CODES.INVALID_REQUEST,
+      operation: "check_bulk_permissions",
       retryable: false,
     });
   }
@@ -455,6 +485,66 @@ const createAuthzedClient = (requestTimeoutMs: number): TAuthzedClientSingleton 
     interceptors: [deadlineInterceptor(requestTimeoutMs)],
   });
 
+  const checkPermissionBatch = async (
+    checks: ReadonlyArray<TAuthzedPermissionCheck>
+  ): Promise<ReadonlyArray<boolean>> => {
+    if (checks.length > AUTHZED_MAX_BULK_CHECK_ITEMS) {
+      throw new AuthzedError({
+        attempts: 0,
+        code: AUTHZED_ERROR_CODES.INVALID_REQUEST,
+        operation: "check_bulk_permissions",
+        retryable: false,
+      });
+    }
+    checks.forEach(validatePermissionCheck);
+    if (checks.length === 0) return [];
+    return executeAuthzedOperation("check_bulk_permissions", async () => {
+      const items = checks.map((check) => ({
+        context: undefined,
+        permission: check.permission,
+        resource: check.resource,
+        subject: { object: check.subject, optionalRelation: "" },
+      }));
+      const response = await sdkClient.promises.checkBulkPermissions({
+        consistency: getAuthorizationConsistency(),
+        items,
+        withTracing: false,
+      });
+      const invalidResponse = () =>
+        new AuthzedError({
+          attempts: 1,
+          code: AUTHZED_ERROR_CODES.INTERNAL,
+          operation: "check_bulk_permissions",
+          retryable: true,
+        });
+      if (response.pairs.length !== checks.length) throw invalidResponse();
+      return response.pairs.map((pair, index) => {
+        const expected = items[index];
+        const echoed = pair.request;
+        // Never associate an allow with a different recipient or permission, including reordered pairs.
+        if (
+          pair.response.oneofKind !== "item" ||
+          echoed?.permission !== expected.permission ||
+          echoed.resource?.objectId !== expected.resource.objectId ||
+          echoed.resource?.objectType !== expected.resource.objectType ||
+          echoed.subject?.object?.objectId !== expected.subject.object.objectId ||
+          echoed.subject?.object?.objectType !== expected.subject.object.objectType ||
+          echoed.subject?.optionalRelation
+        )
+          throw invalidResponse();
+        const { permissionship } = pair.response.item;
+        if (permissionship === v1.CheckPermissionResponse_Permissionship.HAS_PERMISSION) return true;
+        if (permissionship === v1.CheckPermissionResponse_Permissionship.NO_PERMISSION) return false;
+        throw new AuthzedError({
+          attempts: 1,
+          code: AUTHZED_ERROR_CODES.UNSUPPORTED,
+          operation: "check_bulk_permissions",
+          retryable: false,
+        });
+      });
+    });
+  };
+
   const facade = Object.freeze<TAuthzedResourceLookupClient>({
     checkPermission: async (check) => {
       validatePermissionCheck(check);
@@ -493,6 +583,18 @@ const createAuthzedClient = (requestTimeoutMs: number): TAuthzedClientSingleton 
           retryable: false,
         });
       });
+    },
+    checkPermissionBatch,
+    checkBulkPermissions: async (check) => {
+      validateBulkPermissionCheck(check);
+      const decisions = await checkPermissionBatch(
+        check.resourceIds.map((objectId) => ({
+          permission: check.permission,
+          resource: { objectId, objectType: check.resourceType },
+          subject: check.subject,
+        }))
+      );
+      return new Set(check.resourceIds.filter((_, index) => decisions[index]));
     },
     consistency: "fully_consistent",
     deleteRelationships: async (filter) => {

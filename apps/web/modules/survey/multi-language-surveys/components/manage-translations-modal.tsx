@@ -9,7 +9,7 @@ import { getTextContent } from "@formbricks/types/surveys/validation";
 import { getAIUnavailableMessage, getAIUnavailableMessageForErrorCode } from "@/lib/ai/availability";
 import type { TAIUnavailableReason } from "@/lib/ai/service";
 import { cn } from "@/lib/cn";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getFormattedErrorMessage } from "@/lib/utils/error-message";
 import { translateSurveyFieldsAction } from "@/modules/ee/ai-translation/lib/actions";
 import { Button } from "@/modules/ui/components/button";
 import {
@@ -151,6 +151,10 @@ export const ManageTranslationsModal = ({
 
       if (errorCode === "ai_quota_exceeded") {
         return t("workspace.surveys.edit.ai_translation_quota_exceeded");
+      }
+
+      if (errorCode === "ai_output_too_long") {
+        return t("workspace.surveys.edit.ai_translation_output_too_long");
       }
 
       // Fall back to the generic failure message rather than leaking a raw error code to the user.

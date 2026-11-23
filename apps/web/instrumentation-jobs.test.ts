@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+const online = vi.hoisted(() => ({ enabled: true }));
+vi.mock("@/lib/upgrade/compatibility", () => ({ isNewReleaseWorkEnabled: async () => online.enabled }));
+
 const mockStartJobsRuntime = vi.fn();
 const mockRemoveSurveyScheduling = vi.fn();
 const mockUpsertSurveyScheduling = vi.fn();
@@ -38,6 +41,7 @@ const slowTest = (name: string, fn: () => Promise<void>): void => {
 vi.mock("@formbricks/jobs", () => ({
   ONE_SHOT_JOB_NAMES: {
     responsePipeline: "response-pipeline.process",
+    webhookDelivery: "webhook-delivery.process",
     workflowRun: "workflow-run.process",
   },
   recurringJobs: {
@@ -52,6 +56,12 @@ vi.mock("@formbricks/jobs", () => ({
       scheduleId: "authzed-reconciliation-audit",
       scope: "global",
       upsert: mockUpsertAuthzedReconciliationAudit,
+    },
+    authzedSurveyAudit: {
+      name: "authzed-survey.audit",
+      scheduleId: "daily-authzed-survey-audit",
+      scope: "global",
+      upsert: vi.fn(),
     },
     surveyArchivePurge: {
       name: "survey-archive-purge.process",
@@ -138,14 +148,21 @@ vi.mock("@/lib/authzed/outbox-processor", () => ({
   processAuthzedProjectionDeliveryJob: mockProcessAuthzedProjectionDeliveryJob,
 }));
 
+vi.mock("@/lib/authzed/outbox-safety-net", () => ({
+  startAuthzedOutboxSafetyNet: vi.fn(),
+  stopAuthzedOutboxSafetyNet: vi.fn(),
+}));
+
 vi.mock("@/lib/authzed/scheduled-reconciliation", () => ({
   processAuthzedScheduledReconciliationJob: mockProcessAuthzedScheduledReconciliationJob,
+  processAuthzedSurveyAuditJob: vi.fn(),
 }));
 
 describe("instrumentation-jobs", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    online.enabled = true;
     vi.useFakeTimers();
     mockRemoveSurveyScheduling.mockResolvedValue(true);
     mockRemoveSurveyArchivePurge.mockResolvedValue(true);
@@ -238,13 +255,16 @@ describe("instrumentation-jobs", () => {
     expect(second).toBe(mockRuntime);
     expect(mockStartJobsRuntime).toHaveBeenCalledTimes(1);
     expect(mockStartJobsRuntime).toHaveBeenCalledWith({
+      manageSignals: true,
       concurrency: 4,
       jobHandlerOverrides: {
         "authzed-projection.deliver": expect.any(Function),
         "authzed-reconciliation.audit": expect.any(Function),
+        "authzed-survey.audit": expect.any(Function),
         "response-pipeline.process": expect.any(Function),
         "survey-scheduling.reconcile": expect.any(Function),
         "survey-archive-purge.process": expect.any(Function),
+        "webhook-delivery.process": expect.any(Function),
         "workflow-run.process": expect.any(Function),
         "test-log.process": mockExistingOverride,
         "usage-telemetry.process": expect.any(Function),
@@ -468,6 +488,21 @@ describe("instrumentation-jobs", () => {
 
     expect(mockStartJobsRuntime).toHaveBeenCalledTimes(2);
     await expect(registerJobsWorker()).resolves.toBe(recoveredRuntime);
+  });
+
+  test("keeps the survey audit scheduler inactive until durable activation is observed", async () => {
+    online.enabled = false;
+    mockGetJobsQueueingConfig.mockReturnValue({ enabled: true, redisUrl: "redis://localhost:6379" });
+    const { registerRecurringJobs } = await import("./instrumentation-jobs");
+    const { RECURRING_JOB_REGISTRATIONS_BY_KEY } = await import("@/lib/jobs/recurring-registrations");
+    const audit = RECURRING_JOB_REGISTRATIONS_BY_KEY.authzedSurveyAudit.job.upsert;
+    await registerRecurringJobs();
+    expect(audit).not.toHaveBeenCalled();
+    online.enabled = true;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(audit).toHaveBeenCalledOnce();
+    await registerRecurringJobs();
+    expect(audit).toHaveBeenCalledOnce();
   });
 
   slowTest(

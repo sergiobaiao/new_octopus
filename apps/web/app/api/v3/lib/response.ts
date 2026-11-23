@@ -59,27 +59,36 @@ export const V3_PROBLEM_CODES = [
   "ai_generated_payload_invalid",
   "ai_instance_not_configured",
   "ai_output_too_long",
+  "ai_provider_auth_failed",
   "ai_smart_tools_disabled",
   "bad_gateway",
   "bad_request",
   "conflict",
+  "custom_css_plan_required",
   "forbidden",
   "internal_server_error",
   "invalid_workflow_state",
   "not_authenticated",
   "not_found",
   "payload_too_large",
+  "projection_pending",
   "service_unavailable",
+  "stored_survey_invalid",
+  "survey_not_workspace_visible",
   "too_many_requests",
   "unprocessable_content",
+  "visibility_blocked_by_connections",
+  "visibility_change_not_allowed",
+  "visibility_not_enabled",
   "workflow_not_executable",
+  "workspace_survey_limit_reached",
 ] as const;
 
 export type V3ProblemCode = (typeof V3_PROBLEM_CODES)[number];
 
 /**
- * Codes emitted only by routes under `app/api/(internal)`, which reuse these RFC 9457 helpers but are
- * session-only and carry no published contract.
+ * Codes emitted only by internal routes (`app/api/internal` and the older `app/api/(internal)` group),
+ * which reuse these RFC 9457 helpers but are session-only and carry no published contract.
  *
  * Kept apart from `V3_PROBLEM_CODES` rather than folded into it, because that list is held to
  * `Problem.yml` by exact equality in both directions: adding an internal code there would publish, to
@@ -87,7 +96,12 @@ export type V3ProblemCode = (typeof V3_PROBLEM_CODES)[number];
  * as an undocumented code, pointing the other way. `problem-codes.test.ts` asserts the two sets stay
  * disjoint and that none of these reaches the spec.
  */
-export const INTERNAL_PROBLEM_CODES = ["attachment_export_empty", "attachment_export_too_large"] as const;
+export const INTERNAL_PROBLEM_CODES = [
+  "attachment_export_empty",
+  "attachment_export_too_large",
+  "capacity_reached",
+  "concurrency_limit_reached",
+] as const;
 
 export type InternalProblemCode = (typeof INTERNAL_PROBLEM_CODES)[number];
 
@@ -111,8 +125,12 @@ export const INVALID_PARAM_CODES = [
   "immutable_identifier",
   "invalid_locale",
   "invalid_reference",
+  "misordered_reference",
   "missing_required_field",
   "missing_translation",
+  "qsf_limit_exceeded",
+  "qsf_not_recognized",
+  "read_only_field",
   "unsupported_field",
   "unsupported_locale",
 ] as const;
@@ -278,16 +296,139 @@ export function problemUnprocessableContent(
   });
 }
 
-export function problemConflict(requestId: string, detail: string, instance?: string): Response {
-  return problemResponse(409, "Conflict", detail, requestId, {
-    code: "conflict",
+/**
+ * ENG-2949: adding or editing custom CSS needs the Scale plan on Formbricks Cloud. Independent of the
+ * resource, so it reveals nothing about it; removing CSS never answers this.
+ */
+export function problemCustomCssPlanRequired(requestId: string, detail: string, instance?: string): Response {
+  return problemResponse(403, "Forbidden", detail, requestId, {
+    code: "custom_css_plan_required",
     instance,
   });
 }
 
-export function problemBadGateway(requestId: string, detail: string, instance?: string): Response {
+/**
+ * ENG-3641: custom CSS that the processor rejected (syntax, size or complexity limits, processing
+ * failure). A 422 like any other semantic document failure; `details.errors` carries the processor's
+ * located errors (code, scope, appearance, line, column, reason), `invalid_params` the same as fields.
+ */
+export function problemCustomCssInvalid(
+  requestId: string,
+  options: { invalid_params: InvalidParam[]; errors: unknown[]; instance?: string }
+): Response {
+  return problemResponse(422, "Unprocessable Content", "Custom CSS failed validation", requestId, {
+    code: "unprocessable_content",
+    instance: options.instance,
+    invalid_params: options.invalid_params,
+    details: { errors: options.errors },
+  });
+}
+
+/**
+ * ENG-3282: survey visibility is not available here — the organization lacks the entitlement or the
+ * deployment's readiness marker is unset (contract §5). Independent of the survey, so it reveals
+ * nothing about it.
+ */
+export function problemVisibilityNotEnabled(requestId: string, instance?: string): Response {
+  return problemResponse(
+    403,
+    "Forbidden",
+    "Survey visibility is not enabled for this organization",
+    requestId,
+    {
+      code: "visibility_not_enabled",
+      instance,
+    }
+  );
+}
+
+/** ENG-3282: `restricted` refused while outbound connections depend on the survey; lists them. */
+export function problemVisibilityBlocked(
+  requestId: string,
+  blockers: ReadonlyArray<Readonly<{ id: string; name: string; type: string }>>,
+  instance?: string
+): Response {
+  return problemResponse(
+    409,
+    "Conflict",
+    "Remove the connections that use this survey before restricting it",
+    requestId,
+    { code: "visibility_blocked_by_connections", details: { blockers }, instance }
+  );
+}
+
+/** ENG-3282: `restricted` refused because the survey has no owner (Decision log #3). */
+export function problemVisibilityChangeNotAllowed(requestId: string, instance?: string): Response {
+  return problemResponse(
+    422,
+    "Unprocessable Content",
+    "A survey without an author can't be restricted. Duplicate it to get a restricted copy you own.",
+    requestId,
+    { code: "visibility_change_not_allowed", instance }
+  );
+}
+
+/**
+ * ENG-3282: a grant was stored but the graph did not acknowledge it in-request. The survey stays
+ * restricted until the outbox delivers it; retrying is safe.
+ */
+export function problemProjectionPending(requestId: string, instance?: string): Response {
+  return problemResponse(
+    503,
+    "Service Unavailable",
+    "The change is stored and will take effect shortly; the survey stays restricted until it does",
+    requestId,
+    { code: "projection_pending", headers: { "Retry-After": "5" }, instance }
+  );
+}
+
+/**
+ * ENG-3282: the workspace already holds `SURVEY_WORKSPACE_LIMIT` surveys. `details` carries the limit
+ * and the current count so a client can say how many to archive or delete without a second call.
+ */
+export function problemWorkspaceSurveyLimit(
+  requestId: string,
+  limit: number,
+  count: number,
+  instance?: string
+): Response {
+  return problemResponse(
+    422,
+    "Unprocessable Content",
+    "This workspace has reached its survey limit",
+    requestId,
+    {
+      code: "workspace_survey_limit_reached",
+      details: { count, limit },
+      instance,
+    }
+  );
+}
+
+export function problemConflict(
+  requestId: string,
+  detail: string,
+  instance?: string,
+  // ENG-3069: `details` carries the machine-readable half of an optimistic-concurrency failure
+  // (`expectedUpdatedAt` / `currentUpdatedAt`). Without it a client can only re-read and guess,
+  // and the human `detail` string is the wrong place for a value a retry has to compare.
+  options?: { details?: Record<string, unknown> }
+): Response {
+  return problemResponse(409, "Conflict", detail, requestId, {
+    code: "conflict",
+    instance,
+    ...(options?.details && { details: options.details }),
+  });
+}
+
+export function problemBadGateway(
+  requestId: string,
+  detail: string,
+  instance?: string,
+  code: V3ProblemCode = "bad_gateway"
+): Response {
   return problemResponse(502, "Bad Gateway", detail, requestId, {
-    code: "bad_gateway",
+    code,
     instance,
   });
 }
@@ -301,6 +442,49 @@ export function problemServiceUnavailable(requestId: string, detail: string, ins
     code: "service_unavailable",
     instance,
   });
+}
+
+/**
+ * 503 for a route that is at its concurrency limit on this server (`concurrency` in
+ * `withV3ApiWrapper`). Unlike `problemServiceUnavailable`, the capability is enabled and the caller
+ * did nothing wrong: the same request succeeds once a slot frees up, and `Retry-After` says when to try.
+ *
+ * `capacity_reached` is an internal code. A public route that adopts the limit has to publish it in
+ * `Problem.yml` first (`problem-codes.test.ts` keeps the two vocabularies apart).
+ */
+export function problemCapacityReached(
+  requestId: string,
+  retryAfterSeconds: number,
+  instance?: string
+): Response {
+  return problemResponse(
+    503,
+    "Service Unavailable",
+    `This server is busy with other requests like this one. Try again in ${retryAfterSeconds} seconds.`,
+    requestId,
+    { code: "capacity_reached", instance, headers: { "Retry-After": String(retryAfterSeconds) } }
+  );
+}
+
+/**
+ * 429 for a caller that already runs as many requests on a route as it may at once (`maxPerKey` in
+ * `withV3ApiWrapper`'s `concurrency`). Its own code, not the rate limit's `too_many_requests`: the fix is
+ * to wait for the caller's own request to finish, not to slow down, and a client says so.
+ *
+ * `concurrency_limit_reached` is an internal code, published the same way as `capacity_reached`.
+ */
+export function problemConcurrencyLimitReached(
+  requestId: string,
+  retryAfterSeconds: number,
+  instance?: string
+): Response {
+  return problemResponse(
+    429,
+    "Too Many Requests",
+    "You already have as many of these requests running as this route allows. Wait for one to finish.",
+    requestId,
+    { code: "concurrency_limit_reached", instance, headers: { "Retry-After": String(retryAfterSeconds) } }
+  );
 }
 
 /**
@@ -364,9 +548,16 @@ export function successListResponse<T, TMeta extends Record<string, unknown>>(
   return Response.json({ data, meta }, { status: 200, headers });
 }
 
+/**
+ * Top-level members a success body may carry beside `data` — additive, never a replacement for it. The
+ * custom CSS writes use it for `warnings` (ENG-3641), which describe the request rather than the
+ * resource, so they stay out of `data` and a PATCH that round-trips `data` never sends them back.
+ */
+type TSuccessExtensions = { warnings?: unknown[] };
+
 export function successResponse<T>(
   data: T,
-  options?: { requestId?: string; cache?: string; status?: number }
+  options?: { requestId?: string; cache?: string; status?: number; extensions?: TSuccessExtensions }
 ): Response {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -380,6 +571,7 @@ export function successResponse<T>(
   return Response.json(
     {
       data,
+      ...options?.extensions,
     },
     {
       status: options?.status ?? 200,
@@ -390,7 +582,7 @@ export function successResponse<T>(
 
 export function createdResponse<T>(
   data: T,
-  options: { location: string; requestId?: string; cache?: string }
+  options: { location: string; requestId?: string; cache?: string; extensions?: TSuccessExtensions }
 ): Response {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -405,6 +597,7 @@ export function createdResponse<T>(
   return Response.json(
     {
       data,
+      ...options.extensions,
     },
     {
       status: 201,

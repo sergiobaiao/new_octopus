@@ -2,6 +2,38 @@ import { z } from "zod";
 
 export const INVALID_PASSWORD_RESET_TOKEN_ERROR_CODE = "ERR_INVALID_PASSWORD_RESET_TOKEN";
 
+/**
+ * Stable, locale-independent marker used when an SSO-recovery resend is asked for after the stored
+ * intent is gone — expired, or already consumed.
+ *
+ * It exists because the server cannot tell those apart from a state id someone made up: all three are
+ * "recovery-shaped callback URL, nothing in the store". Reporting success for that case told a user
+ * whose link had aged out that a mail was on its way when none was sent, and left restarting SSO
+ * sign-in — the only way out — undiscoverable. A made-up state getting the same message costs nothing,
+ * since whoever supplied it already knows what they sent.
+ */
+export const SSO_RECOVERY_LINK_EXPIRED_ERROR_CODE = "ERR_SSO_RECOVERY_LINK_EXPIRED";
+
+/**
+ * `?error=` code the SSO-recovery link lands on `/auth/login` with when the account's second factor
+ * cannot be produced there: a verified email with 2FA, on an instance that has credential sign-in
+ * switched off (`EMAIL_AUTH_DISABLED=1`).
+ *
+ * The recovery link proves mailbox access only and must not stand in for the factor (ENG-7266), so
+ * this configuration leaves the login page with nothing that can produce it: no credential form, and
+ * the identity that started recovery is unlinked by definition. A provider already linked to the
+ * account is the one way through, which the login copy names before pointing at an administrator.
+ */
+export const SSO_RECOVERY_SECOND_FACTOR_UNAVAILABLE_ERROR_CODE = "sso_recovery_second_factor_unavailable";
+
+/**
+ * The login `?error=` code for a recovery completion reached by a browser that never opened the emailed
+ * recovery link (ENG-7310). Only the browser that opened the link can finish recovery, so the copy points
+ * at the email. It also says to ignore the email when the reader did not start a sign-in, because the
+ * same redirect is where an attacker's link lands the account holder.
+ */
+export const SSO_RECOVERY_LINK_NOT_OPENED_ERROR_CODE = "sso_recovery_link_not_opened";
+
 class ResourceNotFoundError extends Error {
   statusCode = 404;
   resourceId: string | null;

@@ -11,6 +11,7 @@ import { UNKNOWN_DATA } from "@/modules/ee/audit-logs/types/audit-log";
 import type { AuthHookContext } from "@/modules/ee/sso/lib/better-auth-hooks";
 import { getBetterAuthRequestContext } from "./better-auth-request-context";
 import { finalizeSuccessfulSignIn } from "./sign-in-tracking";
+import { SSO_PROVISIONING_REJECT_REASONS } from "./sso-provisioning-reject-reasons";
 import { logAuthAttempt, shouldLogAuthFailure } from "./utils";
 
 /**
@@ -202,10 +203,12 @@ const getSafeWarningErrorContext = (cause: Error): { errorType: string; errorCod
  *
  * `state_security_mismatch` carries the load this gate deliberately does not take on, and it is mixed:
  *
- * - The state cookie's `maxAge` is 300s while the verification record lives 10 minutes, so a user who
- *   spends 5–10 minutes at the identity provider loses the cookie first and lands here. Benign, and
- *   probably common — **so this change likely leaves residual noise behind**; it closes the reported
- *   `verification not found` shape (FORMBRICKS-16G), not the whole class.
+ * - A second sign-in started in the same browser while the first is still at the identity provider (a
+ *   second tab, a stale authorize URL): the state cookie is a single slot, so the newer flow overwrites
+ *   it and the older callback finds the wrong value. Benign, and the residual noise this code still
+ *   carries. Until ENG-3314 a user who spent 5–10 minutes at the IdP landed here too, because the
+ *   cookie expired at 300s against a 10-minute state; `auth.ts` now gives it the state's full lifetime,
+ *   so a slow sign-in that runs out of time expires with the state, on `state_mismatch`.
  * - It is also where a `BETTER_AUTH_SECRET` divergence across replicas surfaces, because the signed
  *   cookie cannot be verified with a different secret. That is a genuine outage and must keep paging.
  * - And it is the shape a forged or mixed-up callback takes.
@@ -570,7 +573,21 @@ const SSO_CALLBACK_REASONS = new Set([
   "OAuthAccountNotLinked",
   "account_not_linked",
   "invalid_scope",
+  // The code Better Auth redirected with while the provisioning gate rejected by returning `false`
+  // (ENG-2537). Kept because 5.4.x still emits it, and a self-hoster's logs outlive the upgrade.
   "unable_to_create_user",
+  // Every reason the SSO provisioning gate refuses a sign-up with (ENG-2882). Spread rather than
+  // re-listed so this cannot drift from the gate again — the last copy did, and the whole class
+  // logged as `other`, which is what made "are these rejections correct?" unanswerable.
+  //
+  // These stay on the FAILURE side deliberately. A rejection is a correct decision per sign-up, so
+  // the temptation is to score it as neither — but the operator-misconfiguration reasons in that set
+  // (`missing_default_team_id`, `no_organization_found`) are exactly how a deploy that locks every
+  // new user out presents, and ENG-2089 was that incident. Excluding them would blind the ratio
+  // alert to the outage class it exists for. What was missing was never the severity; it was the
+  // label that separates a policy working as intended from a gate that has started refusing
+  // everyone.
+  ...SSO_PROVISIONING_REJECT_REASONS,
 ]);
 
 /**

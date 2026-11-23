@@ -42,11 +42,13 @@
   "dependencies": {
     "@formbricks/logger": "workspace:*",
     "redis": "catalog:",
-    "zod": "catalog:"
+    "zod": "catalog:",
+    "@formbricks/redis-config": "workspace:*"
   },
   "devDependencies": {
     "@formbricks/config-eslint": "workspace:*",
     "@formbricks/config-typescript": "workspace:*",
+    "@formbricks/vite-plugins": "workspace:*",
     "@vitest/coverage-v8": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",

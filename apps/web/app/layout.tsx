@@ -5,6 +5,7 @@ import { DEFAULT_LOCALE } from "@/lib/constants";
 import { SentryClientConfigScript } from "@/lib/sentry/SentryClientConfigScript";
 import { I18nProvider } from "@/lingodotdev/client";
 import { getLocale } from "@/lingodotdev/language";
+import { ServerActionNotices } from "@/modules/ui/components/server-action-notices";
 import "../modules/ui/globals.css";
 
 export const metadata: Metadata = {
@@ -26,6 +27,8 @@ const RootLayout = async ({ children }: { children: React.ReactNode }) => {
         <NoScriptWarning locale={locale} />
         <I18nProvider language={locale} defaultLanguage={DEFAULT_LOCALE}>
           {children}
+          {/* After the page, so keyboard users reach the notices by tabbing on from its content. */}
+          <ServerActionNotices />
         </I18nProvider>
       </body>
     </html>

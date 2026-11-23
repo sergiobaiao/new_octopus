@@ -1,5 +1,4 @@
-"use server";
-
+import "server-only";
 import type { IConnectionAPIController, IOAuthController, JacksonOption } from "@boxyhq/saml-jackson";
 import { SAML_AUDIENCE, SAML_DATABASE_URL, SAML_PATH, WEBAPP_URL } from "@/lib/constants";
 import { preloadConnection } from "@/modules/ee/auth/saml/lib/preload-connection";
@@ -26,6 +25,11 @@ export default async function init() {
         type: "postgres",
         url: SAML_DATABASE_URL,
       },
+      // jackson otherwise saves every failed callback, the whole decoded SAMLResponse included, for 7 days
+      // (ENG-3976). The callback is anonymous, so that let anyone write ~200 KiB per request to this database,
+      // and a real failed login kept the user's assertion. Nothing in Formbricks reads traces, and jackson's
+      // errors still reach the log.
+      ssoTraces: { disable: true },
     };
 
     const ret = await (await import("@boxyhq/saml-jackson")).controllers(opts);

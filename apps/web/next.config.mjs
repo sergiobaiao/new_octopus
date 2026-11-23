@@ -48,6 +48,7 @@ const getUniqueValues = (values) => [...new Set(values.filter(Boolean))];
 /** @type {import('next').NextConfig} */
 
 const nextConfig = {
+  deploymentId: process.env.FORMBRICKS_DEPLOYMENT_ID || undefined,
   assetPrefix: process.env.ASSET_PREFIX_URL || undefined,
   allowedDevOrigins: process.env.NODE_ENV === "production" ? undefined : LOOPBACK_HOSTS,
   basePath: process.env.BASE_PATH || undefined,
@@ -73,11 +74,19 @@ const nextConfig = {
     "@prisma/instrumentation",
     "bullmq",
     "ioredis",
+    // Custom CSS processor (modules/custom-css/processor): loads a native binary per platform.
+    "lightningcss",
     "pino",
     "pino-pretty",
     "pino-opentelemetry-transport",
     "posthog-node",
+    "typeorm",
   ],
+  // Jackson is configured exclusively with PostgreSQL (modules/ee/auth/saml/lib/jackson.ts).
+  // TypeORM's lazy SQL Server driver traces unused mssql/tedious code and vulnerable sprintf-js.
+  outputFileTracingExcludes: {
+    "/*": ["../../**/node_modules/{mssql,tedious,sprintf-js}/**/*"],
+  },
   outputFileTracingIncludes: {
     "/api/auth/**/*": ["../../node_modules/jose/**/*"],
     // pino loads transport code in worker threads via dynamic require() — the file tracer
@@ -89,10 +98,20 @@ const nextConfig = {
       "../../node_modules/pino-opentelemetry-transport/**/*",
       "../../node_modules/pino-abstract-transport/**/*",
       "../../node_modules/otlp-logger/**/*",
+      // lightningcss picks its native package at runtime (require of "lightningcss-<platform>"),
+      // which the tracer cannot follow; only the package matching the build's platform/libc is
+      // installed (musl in the Alpine image), so the wildcard copies exactly that one.
+      "../../node_modules/lightningcss/**/*",
+      "../../node_modules/lightningcss-*/**/*",
+      "../../node_modules/detect-libc/**/*",
     ],
   },
   turbopack: {},
   experimental: {
+    // With patches/next@16.4.5.patch applied, Next clones no request body for proxy.ts or for an external
+    // rewrite such as the PostHog /ingest proxy (ENG-3972), so this only bounds the body Next hands an
+    // edge-runtime function, and this app has none. Kept as the fallback for a Next without the patch, which
+    // would clone again and cut bodies off at this size, so the import routes keep their limits below it.
     proxyClientMaxBodySize: "16mb",
   },
   transpilePackages: ["@formbricks/database", "@formbricks/workflows"],
@@ -185,13 +204,27 @@ const nextConfig = {
       ? getUniqueValues([
           ...LOOPBACK_WILDCARD_ORIGINS,
           ...getLoopbackOriginVariants(process.env.WEBAPP_URL),
+          ...getLoopbackOriginVariants(process.env.BETTER_AUTH_URL),
           ...getLoopbackOriginVariants(process.env.NEXTAUTH_URL),
           ...getLoopbackOriginVariants(process.env.S3_ENDPOINT_URL),
         ])
       : [];
     const devLoopbackSourceList = devLoopbackSources.length > 0 ? ` ${devLoopbackSources.join(" ")}` : "";
 
-    const cspBase = `default-src 'self'; script-src 'self' 'unsafe-inline'${scriptSrcUnsafeEval} https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' blob: data:${devLoopbackSourceList} https:; font-src 'self' data: https:; connect-src 'self'${devLoopbackSourceList} https: wss:; frame-src 'self' https://app.cal.com https:; media-src 'self' https:; object-src 'self' data: https:; base-uri 'self'; form-action 'self'`;
+    // Upload extensions whose browser viewer needs `sandbox` off (see the `/storage` rules below). The
+    // media list must match the audio/video types in `mimeTypes` (packages/types/storage.ts), which
+    // lib/next-config-csp.test.ts checks. Header matching ignores case unless
+    // `experimental.caseSensitiveRoutes` is on; each letter matches either case so the rules hold both
+    // ways.
+    const anyCase = (extension) =>
+      extension.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+    const UPLOADED_MEDIA_EXTENSIONS = ["mp4", "mov", "avi", "mkv", "webm", "mp3"].map(anyCase).join("|");
+    const UPLOADED_PDF_EXTENSION = anyCase("pdf");
+    const UPLOADED_FILE_UNSANDBOXED_EXTENSIONS = `${UPLOADED_PDF_EXTENSION}|${UPLOADED_MEDIA_EXTENSIONS}`;
+
+    // `worker-src` must stay explicit: without it browsers fall back to `script-src`, which has no
+    // `blob:`, and blocks the `blob:` worker Sentry Session Replay compresses recordings in (ENG-3194).
+    const cspBase = `default-src 'self'; script-src 'self' 'unsafe-inline'${scriptSrcUnsafeEval} https:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https:; img-src 'self' blob: data:${devLoopbackSourceList} https:; font-src 'self' data: https:; connect-src 'self'${devLoopbackSourceList} https: wss:; frame-src 'self' https://app.cal.com https:; media-src 'self' https:; object-src 'self' data: https:; base-uri 'self'; form-action 'self'`;
 
     return [
       {
@@ -220,24 +253,62 @@ const nextConfig = {
         ],
       },
       {
-        // matching all API routes
-        source: "/api/(v1|v2)/client/:path*",
+        // The SSO recovery confirmation (ENG-7395) is a one-click account change, so it may not be framed
+        // at all, same origin included: a page on this origin that framed it could steer the click.
+        // After the catch-all above, so these values replace its SAMEORIGIN and `frame-ancestors 'self'`.
+        source: "/sso-recovery/:path*",
         headers: [
-          { key: "Access-Control-Allow-Credentials", value: "true" },
-          { key: "Access-Control-Allow-Origin", value: "*" },
-          { key: "Access-Control-Allow-Methods", value: "GET,OPTIONS,PATCH,DELETE,POST,PUT" },
           {
-            key: "Access-Control-Allow-Headers",
-            value:
-              "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Cache-Control",
+            key: "X-Frame-Options",
+            value: "DENY",
+          },
+          {
+            key: "Content-Security-Policy",
+            value: `${cspBase}; frame-ancestors 'none'`,
           },
         ],
       },
       {
-        // matching all API routes
-        source: "/api/capture/:path*",
+        // Uploaded files (ENG-7108). A stored file must never act as a page of the app: should one be
+        // rendered as a document anyway, `sandbox` gives it an opaque origin and no scripts. These rules
+        // have to come after the one above, because a route handler cannot set this header itself: the
+        // config's CSP replaces it. Two kinds are left out of `sandbox`, as it can stop the browser's own
+        // viewer for them; both are served with their real type and `nosniff`, so never parsed as HTML:
+        // audio/video (Chromium's media viewer runs script) and PDFs (`sandbox` without `allow-plugins`
+        // may block a plugin-based viewer such as Safari's). Both still get `default-src 'none'`, which
+        // blocks every script.
+        source: String.raw`/storage/:path((?!.*\.(?:${UPLOADED_FILE_UNSANDBOXED_EXTENSIONS})$).*)`,
         headers: [
-          { key: "Access-Control-Allow-Credentials", value: "true" },
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; frame-ancestors 'self'; sandbox",
+          },
+        ],
+      },
+      {
+        source: String.raw`/storage/:path(.*\.(?:${UPLOADED_MEDIA_EXTENSIONS})$)`,
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; media-src 'self'; frame-ancestors 'self'",
+          },
+        ],
+      },
+      {
+        source: String.raw`/storage/:path(.*\.(?:${UPLOADED_PDF_EXTENSION})$)`,
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; object-src 'self'; frame-ancestors 'self'",
+          },
+        ],
+      },
+      {
+        // Public client API (JS SDK, surveys): any origin, deliberately without
+        // Access-Control-Allow-Credentials — these routes read no session, and browsers
+        // reject credentials paired with a wildcard origin anyway (ENG-2784).
+        source: "/api/(v1|v2)/client/:path*",
+        headers: [
           { key: "Access-Control-Allow-Origin", value: "*" },
           { key: "Access-Control-Allow-Methods", value: "GET,OPTIONS,PATCH,DELETE,POST,PUT" },
           {
@@ -269,7 +340,9 @@ const nextConfig = {
         ],
       },
       {
-        source: "/js/(.*)",
+        // Everything under /js EXCEPT the survey locale bundles, which are JSON and get their own rule
+        // below. One rule has to win outright: both would otherwise set Content-Type on the same path.
+        source: "/js/((?!locales/).*)",
         headers: [
           {
             key: "Cache-Control",
@@ -279,6 +352,31 @@ const nextConfig = {
           {
             key: "Content-Type",
             value: "application/javascript; charset=UTF-8",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+          {
+            key: "Vary",
+            value: "Accept-Encoding",
+          },
+        ],
+      },
+      {
+        // Survey locale bundles, fetched on demand by the survey runtime instead of being compiled into
+        // the widget. Cached as long as the bundle itself: each request carries a `?v=` content hash of
+        // the locale sources, so a translation change lands on a new URL rather than waiting out the CDN.
+        source: "/js/locales/(.*)",
+        headers: [
+          {
+            key: "Cache-Control",
+            value:
+              "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=3600, stale-if-error=86400",
+          },
+          {
+            key: "Content-Type",
+            value: "application/json; charset=UTF-8",
           },
           {
             key: "Access-Control-Allow-Origin",

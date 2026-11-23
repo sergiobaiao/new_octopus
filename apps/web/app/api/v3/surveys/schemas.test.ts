@@ -2,8 +2,19 @@ import { describe, expect, test } from "vitest";
 import { z } from "zod";
 import { validateElementLabels } from "@formbricks/types/surveys/elements-validation";
 import {
+  V3_SURVEY_BLOCK_OPS_MAX,
+  V3_SURVEY_BLOCK_ORDER_MAX,
+  V3_SURVEY_MAX_BLOCKS,
+  V3_SURVEY_MAX_ENDINGS,
+  V3_SURVEY_MAX_HIDDEN_FIELDS,
+  V3_SURVEY_MAX_LANGUAGES,
+  V3_SURVEY_MAX_TRIGGERS,
+  V3_SURVEY_MAX_VARIABLES,
   ZV3CreateSurveyBody,
+  ZV3CreateSurveyQuery,
+  ZV3EditSurveyBlocksBody,
   ZV3PatchSurveyBody,
+  ZV3SetSurveyBlockOrderBody,
   createZV3PatchSurveyBodySchema,
   formatV3ZodInvalidParams,
 } from "./schemas";
@@ -39,6 +50,8 @@ describe("ZV3CreateSurveyBody", () => {
       metadata: {},
       defaultLanguage: "en-US",
       languages: [],
+      showLanguageSwitch: null,
+      autoSelectLanguage: null,
       welcomeCard: { enabled: false },
       endings: [],
       hiddenFields: { enabled: false },
@@ -153,6 +166,17 @@ describe("ZV3CreateSurveyBody", () => {
         ])
       );
     }
+  });
+
+  test("accepts the language settings on create", () => {
+    const parsed = ZV3CreateSurveyBody.parse({
+      ...validCreateBody,
+      showLanguageSwitch: true,
+      autoSelectLanguage: true,
+    });
+
+    expect(parsed).toMatchObject({ showLanguageSwitch: true, autoSelectLanguage: true });
+    expect(ZV3CreateSurveyBody.safeParse({ ...validCreateBody, autoSelectLanguage: 1 }).success).toBe(false);
   });
 
   test("rejects unsupported top-level fields instead of silently ignoring them", () => {
@@ -611,6 +635,87 @@ describe("ZV3CreateSurveyBody", () => {
     }
   });
 
+  describe("image alt text", () => {
+    const pictureElement = {
+      id: "favourite",
+      type: "pictureSelection",
+      headline: { "en-US": "Pick one" },
+      required: true,
+      allowMulti: false,
+      imageUrl: "https://example.com/hero.jpg",
+      imageAltText: { "en-US": "Product hero shot" },
+      choices: [
+        { id: "a", imageUrl: "https://example.com/a.jpg", imageAltText: { "en-US": "Blue mug" } },
+        { id: "b", imageUrl: "https://example.com/b.jpg" },
+      ],
+    };
+    const endingWithImage = {
+      id: "clend123456789012345678901",
+      type: "endScreen",
+      headline: { "en-US": "Thanks!" },
+      imageUrl: "https://example.com/thanks.jpg",
+      imageAltText: { "en-US": "Team waving" },
+    };
+    const bodyWith = (element: object, ending: object) => ({
+      ...validCreateBody,
+      blocks: [{ ...validCreateBody.blocks[0], elements: [element] }],
+      endings: [ending],
+    });
+
+    test("accepts it on elements, picture choices and end screens, keyed to the default language", () => {
+      const result = ZV3CreateSurveyBody.safeParse(bodyWith(pictureElement, endingWithImage));
+
+      expect(result.error).toBeUndefined();
+      const element = result.data?.blocks[0].elements[0];
+      expect(element).toMatchObject({ imageAltText: { default: "Product hero shot" } });
+      expect(element).toMatchObject({
+        choices: [{ imageAltText: { default: "Blue mug" } }, { id: "b" }],
+      });
+      expect(result.data?.endings?.[0]).toMatchObject({ imageAltText: { default: "Team waving" } });
+    });
+
+    test("rejects the internal default key in a picture choice's alt text", () => {
+      const result = ZV3CreateSurveyBody.safeParse(
+        bodyWith(
+          {
+            ...pictureElement,
+            choices: [
+              { ...pictureElement.choices[0], imageAltText: { default: "Blue mug" } },
+              pictureElement.choices[1],
+            ],
+          },
+          endingWithImage
+        )
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map((issue) => issue.path.join("."))).toContain(
+        "blocks.0.elements.0.choices.0.imageAltText.default"
+      );
+    });
+
+    test("accepts an empty alt text with no translations as a decorative image", () => {
+      const result = ZV3CreateSurveyBody.safeParse({
+        ...bodyWith(
+          {
+            ...pictureElement,
+            headline: { "en-US": "Pick one", "de-DE": "Wähle eins" },
+            imageAltText: { "en-US": "" },
+            choices: pictureElement.choices.map((choice) => ({ ...choice, imageAltText: { "en-US": "" } })),
+          },
+          {
+            ...endingWithImage,
+            headline: { "en-US": "Thanks!", "de-DE": "Danke!" },
+            imageAltText: { "en-US": "" },
+          }
+        ),
+        languages: [{ code: "de-DE" }],
+      });
+
+      expect(result.error).toBeUndefined();
+    });
+  });
+
   test("reports missing required ending fields before shared ending union errors", () => {
     const result = ZV3CreateSurveyBody.safeParse({
       ...validCreateBody,
@@ -713,6 +818,15 @@ describe("ZV3PatchSurveyBody", () => {
     });
 
     expect(parsed).toEqual({ name: "Updated survey" });
+  });
+
+  test("accepts the language settings, with null clearing and omission leaving them unchanged", () => {
+    expect(ZV3PatchSurveyBody.parse({ showLanguageSwitch: true, autoSelectLanguage: false })).toEqual({
+      showLanguageSwitch: true,
+      autoSelectLanguage: false,
+    });
+    expect(ZV3PatchSurveyBody.parse({ autoSelectLanguage: null })).toEqual({ autoSelectLanguage: null });
+    expect(ZV3PatchSurveyBody.safeParse({ autoSelectLanguage: "yes" }).success).toBe(false);
   });
 
   test("rejects an empty patch body", () => {
@@ -970,4 +1084,251 @@ describe("formatV3ZodInvalidParams", () => {
     },
     2_000
   );
+});
+
+describe("block operation bodies are bounded (ENG-1652)", () => {
+  // The response-side diagnostics cap has its own tests; these pin the *input* bounds, which carry
+  // the abuse-cost argument — an unbounded op list is quadratic in `applySurveyBlockOperations`, an
+  // unbounded id is echoed into `invalid_params[].reason`, and an unbounded order is the amplification
+  // fixed on this branch. Delete any of the `.max()` calls and the matching case here goes red.
+  const removeOps = (count: number, id = "blk_a") =>
+    Array.from({ length: count }, () => ({ op: "remove", id }));
+
+  test("accepts exactly the op-list cap and refuses one more", () => {
+    expect(ZV3EditSurveyBlocksBody.safeParse({ ops: removeOps(V3_SURVEY_BLOCK_OPS_MAX) }).success).toBe(true);
+    expect(ZV3EditSurveyBlocksBody.safeParse({ ops: removeOps(V3_SURVEY_BLOCK_OPS_MAX + 1) }).success).toBe(
+      false
+    );
+  });
+
+  test("bounds every block reference at 128 characters, trimmed, non-empty", () => {
+    const ok = "a".repeat(128);
+    const long = "a".repeat(129);
+
+    expect(ZV3EditSurveyBlocksBody.safeParse({ ops: removeOps(1, ok) }).success).toBe(true);
+    expect(ZV3EditSurveyBlocksBody.safeParse({ ops: removeOps(1, long) }).success).toBe(false);
+    expect(ZV3SetSurveyBlockOrderBody.safeParse({ order: [long] }).success).toBe(false);
+    // Whitespace-only is empty after trim, which is what the contract's `minLength: 1` documents.
+    expect(ZV3SetSurveyBlockOrderBody.safeParse({ order: ["   "] }).success).toBe(false);
+    expect(ZV3SetSurveyBlockOrderBody.safeParse({ order: [" blk_a "] })).toMatchObject({
+      success: true,
+      data: { order: ["blk_a"] },
+    });
+  });
+
+  test("accepts exactly the order cap and refuses one more", () => {
+    const ids = (count: number) => Array.from({ length: count }, (_unused, index) => `blk_${index}`);
+
+    expect(ZV3SetSurveyBlockOrderBody.safeParse({ order: ids(V3_SURVEY_BLOCK_ORDER_MAX) }).success).toBe(
+      true
+    );
+    expect(ZV3SetSurveyBlockOrderBody.safeParse({ order: ids(V3_SURVEY_BLOCK_ORDER_MAX + 1) }).success).toBe(
+      false
+    );
+  });
+
+  test("an oversized array costs one issue, not one per element — on REST and through the MCP SDK's validate", async () => {
+    // Zod parses every element before `.max()` fires: 200k junk entries measured at ~500 MB of heap and
+    // a multi-megabyte error body. `lengthBoundedArray` checks the length first. `~standard.validate`
+    // is the entry point @modelcontextprotocol/server uses for tool arguments, ahead of the scope gate,
+    // so it has to be bounded by the schema itself rather than by a check in the REST operation.
+    const junk = Array.from({ length: 5000 }, () => 0);
+
+    const order = ZV3SetSurveyBlockOrderBody.safeParse({ order: junk });
+    expect(order.success).toBe(false);
+    if (!order.success) {
+      expect(order.error.issues).toHaveLength(1);
+      expect(formatV3ZodInvalidParams(order.error, "body")).toEqual([
+        expect.objectContaining({
+          name: "order",
+          reason: `Too big: expected array to have <=${V3_SURVEY_BLOCK_ORDER_MAX} items`,
+        }),
+      ]);
+    }
+
+    const ops = ZV3EditSurveyBlocksBody.safeParse({ ops: junk });
+    expect(ops.success).toBe(false);
+    if (!ops.success) {
+      expect(ops.error.issues).toHaveLength(1);
+    }
+
+    const viaStandard = await ZV3SetSurveyBlockOrderBody["~standard"].validate({ order: junk });
+    expect(viaStandard.issues).toHaveLength(1);
+  });
+
+  test("still advertises the item shape and both bounds in the JSON schema the MCP tools publish", () => {
+    // A `.pipe()` around the field would turn the advertised `items` into `{}` under `io: "input"`; the
+    // field-level preprocess must not.
+    const json = z.toJSONSchema(ZV3EditSurveyBlocksBody, { io: "input", unrepresentable: "any" }) as {
+      properties: Record<string, Record<string, unknown>>;
+    };
+
+    expect(json.properties.ops).toMatchObject({
+      type: "array",
+      minItems: 1,
+      maxItems: V3_SURVEY_BLOCK_OPS_MAX,
+    });
+    expect(JSON.stringify(json.properties.ops.items)).toContain('"remove"');
+  });
+});
+
+// ENG-3282 (contract §2): visibility is decided by the principal on create and changed only through
+// `POST …/visibility`, so both write bodies refuse it — and the owner — as an unsupported field.
+describe("survey visibility is not writable through the survey document", () => {
+  test.each(["visibility", "ownerId", "owner"])("create refuses `%s` with unsupported_field", (field) => {
+    const result = ZV3CreateSurveyBody.safeParse({ ...validCreateBody, [field]: "restricted" });
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(formatV3ZodInvalidParams(result.error, "body")).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: field, code: "unsupported_field" })])
+    );
+  });
+
+  test.each(["visibility", "ownerId", "owner"])("PATCH refuses `%s` with unsupported_field", (field) => {
+    const result = ZV3PatchSurveyBody.safeParse({ name: "Renamed", [field]: "restricted" });
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(formatV3ZodInvalidParams(result.error, "body")).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: field, code: "unsupported_field" })])
+    );
+  });
+});
+
+/**
+ * The top-level arrays of a survey document had no ceiling, and Zod parses every element before an
+ * array-level `.max()` would run — so a 2 MB body of junk entries cost one issue per entry on
+ * `POST /api/v3/surveys` before workspace authorization (ENG-3384). Each is now length-bounded ahead of
+ * its elements, on create, on patch and through the MCP SDK's `~standard.validate`.
+ */
+describe("top-level array bounds (ENG-3384)", () => {
+  const repeat = <T>(value: T, count: number): T[] => Array.from({ length: count }, () => value);
+  const ending = { id: "clend123456789012345678901", type: "endScreen", headline: { "en-US": "Thanks" } };
+  const variable = { id: "clvar123456789012345678901", name: "score", type: "number", value: 0 };
+  const trigger = { actionClassId: "clact123456789012345678901" };
+  const fieldIds = (count: number) => Array.from({ length: count }, (_unused, index) => `field_${index}`);
+
+  const cases: [string, string[], Record<string, unknown>, Record<string, unknown>][] = [
+    [
+      "languages",
+      ["languages"],
+      { languages: repeat({ code: "de-DE" }, V3_SURVEY_MAX_LANGUAGES + 1) },
+      { languages: repeat({ code: "de-DE" }, V3_SURVEY_MAX_LANGUAGES + 1) },
+    ],
+    [
+      "blocks",
+      ["blocks"],
+      { blocks: repeat(validCreateBody.blocks[0], V3_SURVEY_MAX_BLOCKS + 1) },
+      { blocks: repeat(validCreateBody.blocks[0], V3_SURVEY_MAX_BLOCKS + 1) },
+    ],
+    [
+      "endings",
+      ["endings"],
+      { endings: repeat(ending, V3_SURVEY_MAX_ENDINGS + 1) },
+      { endings: repeat(ending, V3_SURVEY_MAX_ENDINGS + 1) },
+    ],
+    [
+      "variables",
+      ["variables"],
+      { variables: repeat(variable, V3_SURVEY_MAX_VARIABLES + 1) },
+      { variables: repeat(variable, V3_SURVEY_MAX_VARIABLES + 1) },
+    ],
+    [
+      "hiddenFields.fieldIds",
+      ["hiddenFields", "fieldIds"],
+      { hiddenFields: { enabled: true, fieldIds: fieldIds(V3_SURVEY_MAX_HIDDEN_FIELDS + 1) } },
+      { hiddenFields: { enabled: true, fieldIds: fieldIds(V3_SURVEY_MAX_HIDDEN_FIELDS + 1) } },
+    ],
+    [
+      "distribution.triggers",
+      ["distribution", "triggers"],
+      { type: "app", distribution: { triggers: repeat(trigger, V3_SURVEY_MAX_TRIGGERS + 1) } },
+      { distribution: { triggers: repeat(trigger, V3_SURVEY_MAX_TRIGGERS + 1) } },
+    ],
+  ];
+
+  test.each(cases)(
+    "%s over its cap costs one issue on create, on patch and via ~standard.validate",
+    async (_name, path, createExtra, patchExtra) => {
+      const create = ZV3CreateSurveyBody.safeParse({ ...validCreateBody, ...createExtra });
+      expect(create.success).toBe(false);
+      if (!create.success) {
+        expect(create.error.issues).toHaveLength(1);
+        expect(create.error.issues[0]).toMatchObject({
+          path,
+          message: expect.stringMatching(/^Too big: expected array to have <=\d+ items$/),
+        });
+      }
+
+      const patch = ZV3PatchSurveyBody.safeParse(patchExtra);
+      expect(patch.success).toBe(false);
+      if (!patch.success) {
+        expect(patch.error.issues).toHaveLength(1);
+        expect(patch.error.issues[0]).toMatchObject({ path });
+      }
+
+      const viaStandard = await ZV3CreateSurveyBody["~standard"].validate({
+        ...validCreateBody,
+        ...createExtra,
+      });
+      expect(viaStandard.issues).toHaveLength(1);
+    }
+  );
+
+  test("accepts exactly the hidden-field cap and keeps the minimum-blocks message", () => {
+    const atCap = ZV3CreateSurveyBody.safeParse({
+      ...validCreateBody,
+      hiddenFields: { enabled: true, fieldIds: fieldIds(V3_SURVEY_MAX_HIDDEN_FIELDS) },
+    });
+    expect(atCap.success).toBe(true);
+
+    const noBlocks = ZV3CreateSurveyBody.safeParse({ ...validCreateBody, blocks: [] });
+    expect(noBlocks.success).toBe(false);
+    if (!noBlocks.success) {
+      expect(noBlocks.error.issues[0]).toMatchObject({
+        path: ["blocks"],
+        message: "At least one block is required",
+      });
+    }
+  });
+
+  test("advertises every bound as maxItems in the JSON schema", () => {
+    // `io: "output"` because the body is `z.unknown().pipe(...)`, whose input side is `unknown`; the
+    // MCP tool schemas (advertised as input) are covered in `modules/mcp/tools/schemas.test.ts`.
+    const json = z.toJSONSchema(ZV3CreateSurveyBody, { io: "output", unrepresentable: "any" }) as {
+      properties: Record<string, Record<string, unknown>>;
+    };
+
+    expect(json.properties.blocks).toMatchObject({
+      type: "array",
+      minItems: 1,
+      maxItems: V3_SURVEY_MAX_BLOCKS,
+    });
+    expect(json.properties.endings).toMatchObject({ maxItems: V3_SURVEY_MAX_ENDINGS });
+    expect(json.properties.variables).toMatchObject({ maxItems: V3_SURVEY_MAX_VARIABLES });
+    expect(json.properties.languages).toMatchObject({ maxItems: V3_SURVEY_MAX_LANGUAGES });
+    expect(json.properties.hiddenFields).toMatchObject({
+      properties: { fieldIds: expect.objectContaining({ maxItems: V3_SURVEY_MAX_HIDDEN_FIELDS }) },
+    });
+    expect(json.properties.distribution).toMatchObject({
+      properties: { triggers: expect.objectContaining({ maxItems: V3_SURVEY_MAX_TRIGGERS }) },
+    });
+  });
+});
+
+describe("ZV3CreateSurveyQuery", () => {
+  // Spelled out rather than read from the schema's own list, so dropping a value the dashboard sends —
+  // `import` comes from the Qualtrics import dialog (ENG-3653) — fails here.
+  test.each(["blank", "template", "xm-template", "ai", "import"])("accepts createdFrom=%s", (createdFrom) => {
+    expect(ZV3CreateSurveyQuery.safeParse({ createdFrom }).success).toBe(true);
+  });
+
+  test("accepts a create with no createdFrom", () => {
+    expect(ZV3CreateSurveyQuery.safeParse({}).success).toBe(true);
+  });
+
+  test("rejects an unknown createdFrom, so analytics never records an invented source", () => {
+    expect(ZV3CreateSurveyQuery.safeParse({ createdFrom: "qualtrics" }).success).toBe(false);
+  });
 });

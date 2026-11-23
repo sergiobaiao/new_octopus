@@ -39,6 +39,8 @@ const {
   mockCapturePostHogEvent: vi.fn(),
 }));
 
+// Survey visibility (ENG-3282) is not enforced here: the readiness marker is off, not read from a database.
+vi.mock("@/lib/authzed/scope-readiness", () => ({ isSurveyVisibilityReady: vi.fn(async () => false) }));
 vi.mock("@formbricks/database", () => ({
   prisma: {
     workflowRun: {
@@ -197,6 +199,9 @@ const mockResponse = {
 };
 
 const mockSurvey = {
+  visibility: "workspace",
+  visibilityVersion: 0,
+  visibilityProjectedVersion: 0,
   id: "cm9zr4mps000008l8btfy1vtz",
   workspaceId: "cm9zr4wsp000508l8y6nh9r2v",
   blocks: [],
@@ -299,6 +304,7 @@ describe("processWorkflowRunJob", () => {
     // HTML-only send (no `text`), resolved recipient, sanitized subject, stable Message-ID.
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
     const sendArgs = mockSendEmail.mock.calls[0][0];
+    expect(sendArgs.emailType).toBe("workflow_email");
     expect(sendArgs).toMatchObject({
       to: "jane@example.com",
       replyTo: "support@example.com",

@@ -10,6 +10,7 @@ import {
   getWebAppLocale,
   isRTL,
   isRTLLanguage,
+  resolveLinkSurveyLanguage,
   resolveWebAppLocale,
 } from "./utils";
 
@@ -23,6 +24,12 @@ const createMockSurvey = (languages: TSurvey["languages"] = []): TSurvey =>
     workspaceId: "ws-1",
     createdBy: null,
     status: "draft",
+    visibility: "workspace",
+    ownerId: null,
+    visibilityVersion: 0,
+    visibilityProjectedVersion: 0,
+    visibilityChangedAt: null,
+    visibilityChangedById: null,
     displayOption: "displayOnce",
     autoClose: null,
     publishOn: null,
@@ -142,6 +149,13 @@ describe("resolveWebAppLocale", () => {
     expect(resolveWebAppLocale("zh", createMockSurvey())).toBe("zh-Hans-CN");
   });
 
+  test("falls back to the script before the base language for a regional code", () => {
+    // "zh-Hant-HK" names no locale and no alias, but Hong Kong writes Traditional Chinese — dropping
+    // straight to "zh" would hand a Traditional survey Simplified chrome.
+    expect(resolveWebAppLocale("zh-Hant-HK", createMockSurvey())).toBe("zh-Hant-TW");
+    expect(resolveWebAppLocale("zh-CN", createMockSurvey())).toBe("zh-Hans-CN");
+  });
+
   test("matches survey language codes regardless of case", () => {
     expect(resolveWebAppLocale("DE-de", createMockSurvey())).toBe("de-DE");
     expect(resolveWebAppLocale("zh-hant-tw", createMockSurvey())).toBe("zh-Hant-TW");
@@ -149,6 +163,38 @@ describe("resolveWebAppLocale", () => {
 
   test("resolves 'default' through the survey's default language", () => {
     expect(resolveWebAppLocale("default", createMockSurvey([createLanguage("de", true)]))).toBe("de-DE");
+  });
+});
+
+describe("resolveLinkSurveyLanguage", () => {
+  const languages = [createLanguage("en-US", true), createLanguage("de-DE")];
+  const optedIn = { ...createMockSurvey(languages), autoSelectLanguage: true };
+
+  test("prefers an explicit ?lang= over the browser languages", () => {
+    expect(
+      resolveLinkSurveyLanguage({ survey: optedIn, lang: "en-US", acceptedLanguages: ["de-DE"] })
+    ).toEqual({ langParam: "en-US", languageCode: "default" });
+  });
+
+  test("falls through an unmatched ?lang= to the browser languages", () => {
+    expect(resolveLinkSurveyLanguage({ survey: optedIn, lang: "xx", acceptedLanguages: ["de-DE"] })).toEqual({
+      langParam: "xx",
+      languageCode: "de-DE",
+    });
+  });
+
+  test("ignores the browser languages when the survey did not opt in", () => {
+    const survey = { ...createMockSurvey(languages), autoSelectLanguage: false };
+    expect(resolveLinkSurveyLanguage({ survey, lang: undefined, acceptedLanguages: ["de-DE"] })).toEqual({
+      langParam: undefined,
+      languageCode: "default",
+    });
+  });
+
+  test("treats a repeated ?lang= as no explicit language", () => {
+    expect(
+      resolveLinkSurveyLanguage({ survey: optedIn, lang: ["en-US", "de-DE"], acceptedLanguages: ["de-DE"] })
+    ).toEqual({ langParam: undefined, languageCode: "de-DE" });
   });
 });
 
@@ -168,6 +214,12 @@ describe("getGateLocale", () => {
     // An empty `?lang=` is no request either.
     expect(getGateLocale({ langParam: "", languageCode: "default", survey, fallbackLocale: "fr-FR" })).toBe(
       "fr-FR"
+    );
+  });
+
+  test("follows a language picked from the browser languages, with no `?lang=`", () => {
+    expect(getGateLocale({ langParam: undefined, languageCode: "de", survey, fallbackLocale: "fr-FR" })).toBe(
+      "de-DE"
     );
   });
 

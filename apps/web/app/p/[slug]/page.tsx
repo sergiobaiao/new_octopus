@@ -2,6 +2,7 @@ import { Metadata } from "next";
 import { notFound, redirect } from "next/navigation";
 import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
 import { getSurveyBySlug } from "@/modules/survey/lib/slug";
+import { isLinkSurveyServable } from "@/modules/survey/link/lib/public-access";
 import { getMetadataForLinkSurvey } from "@/modules/survey/link/metadata";
 
 interface PrettyUrlPageProps {
@@ -11,7 +12,7 @@ interface PrettyUrlPageProps {
 
 // Without this, link-preview crawlers (WhatsApp, Slack, etc.) that don't follow the redirect
 // below to /s/[surveyId] fall through to the root layout's generic title/description instead of
-// the survey's own branding (org whitelabel favicon, custom OG image, link metadata).
+// the survey's own branding (org whitelabel logo/favicon, custom OG image, link metadata).
 export const generateMetadata = async (props: PrettyUrlPageProps): Promise<Metadata> => {
   const { slug } = await props.params;
   const searchParams = await props.searchParams;
@@ -21,7 +22,7 @@ export const generateMetadata = async (props: PrettyUrlPageProps): Promise<Metad
   }
 
   const survey = await getSurveyBySlug(slug);
-  if (!survey) {
+  if (!survey || !isLinkSurveyServable(survey)) {
     notFound();
   }
 
@@ -38,7 +39,9 @@ export default async function PrettyUrlPage(props: PrettyUrlPageProps) {
   }
 
   const survey = await getSurveyBySlug(slug);
-  if (!survey) {
+  // A survey /s/<id> would 404 (draft, archived, non-link) 404s here too, so the slug doesn't give away its
+  // id (ENG-4032).
+  if (!survey || !isLinkSurveyServable(survey)) {
     return notFound();
   }
 

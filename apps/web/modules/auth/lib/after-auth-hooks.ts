@@ -7,6 +7,10 @@ import {
 import { auditFailedAuthAfter } from "./better-auth-observability";
 import { twoFactorBackfillAfterHandler } from "./better-auth-two-factor-backfill";
 import { verificationAutoSignInAfterHandler } from "./better-auth-verification-autosignin";
+import {
+  requireOAuthConsentOnRefreshAfterHandler,
+  revokeTokensBeyondConsentAfterHandler,
+} from "./oauth-grant-revocation";
 
 /**
  * Composed Better Auth `hooks.after` chain. Ordering rationale: `auditFailedAuthAfter` runs before
@@ -28,5 +32,11 @@ export const runAfterAuthHooks = async (ctx: AuthHookContext): Promise<void> => 
   // `/verify-email`, so it is order-independent with respect to the SSO redirects above — placed last
   // because it is the only handler here that adds a session rather than inspecting one.
   await verificationAutoSignInAfterHandler(ctx);
+  // ENG-2499 / ENG-3529: a refresh whose consent was revoked, or narrowed below the token's scopes, is
+  // refused and the tokens beyond the consent revoked; narrowing a consent revokes them right away. Only
+  // touch `/oauth2/token`, `/oauth2/consent` and `/oauth2/update-consent`, so they are order-independent
+  // with respect to the SSO redirect below.
+  await requireOAuthConsentOnRefreshAfterHandler(ctx);
+  await revokeTokensBeyondConsentAfterHandler(ctx);
   await blockedSignupDomainRedirectAfterHandler(ctx);
 };

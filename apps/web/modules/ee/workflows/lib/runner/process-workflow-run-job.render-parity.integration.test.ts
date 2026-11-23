@@ -219,6 +219,9 @@ const makeRun = (definition = makeDefinition(), overrides: Record<string, unknow
 
 // Real survey shape consumed by getElementResponseMapping (blocks -> elements) with localized headlines.
 const survey = {
+  visibility: "workspace",
+  visibilityVersion: 0,
+  visibilityProjectedVersion: 0,
   id: SURVEY_ID,
   workspaceId: WORKSPACE_ID,
   languages: [],

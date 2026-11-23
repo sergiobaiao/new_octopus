@@ -68,14 +68,22 @@ describe("rateLimitConfigs", () => {
         "login",
         "signup",
         "forgotPassword",
+        "forgotPasswordPerAccount",
         "resetPassword",
         "verifyEmail",
         "emailToken",
+        "samlCallback",
       ]);
       expect(rateLimitConfigs.auth.resetPassword).toEqual({
         interval: 3600,
         allowedPerInterval: 5,
         namespace: "auth:reset-password",
+      });
+      // Per-account cap on forgot-password mail (ENG-3640): loosening it re-opens inbox flooding.
+      expect(rateLimitConfigs.auth.forgotPasswordPerAccount).toEqual({
+        interval: 3600,
+        allowedPerInterval: 3,
+        namespace: "auth:forgot:account",
       });
       // The values, not just the key: emailToken throttles an unauthenticated endpoint that also
       // reveals whether an address is registered, so a loosened quota is a security regression.
@@ -83,6 +91,12 @@ describe("rateLimitConfigs", () => {
         interval: 3600,
         allowedPerInterval: 10,
         namespace: "auth:email-token",
+      });
+      // How often one IP can make the SAML callback parse an anonymous XML document (ENG-3973).
+      expect(rateLimitConfigs.auth.samlCallback).toEqual({
+        interval: 60,
+        allowedPerInterval: 120,
+        namespace: "auth:saml-callback",
       });
     });
 
@@ -94,6 +108,8 @@ describe("rateLimitConfigs", () => {
         "v3",
         "mcpAuth",
         "v3SurveyGenerate",
+        "v3SurveyVisibility",
+        "v3CustomCss",
         "internalDatasetPurge",
         "client",
         "clientEnvironment",
@@ -111,7 +127,10 @@ describe("rateLimitConfigs", () => {
         "licenseRecheck",
         "unsplash",
         "inviteMember",
+        "inviteMemberPerUser",
+        "createOrganization",
         "generateExampleResponses",
+        "aiChartGeneration",
         "integrationMutation",
         "feedbackSourceMutation",
         "historicalResponseImport",
@@ -133,6 +152,21 @@ describe("rateLimitConfigs", () => {
         interval: 3600 * 24,
         allowedPerInterval: 50,
         namespace: "action:invite-member",
+      });
+      expect(rateLimitConfigs.actions.inviteMemberPerUser).toEqual({
+        interval: 3600 * 24,
+        allowedPerInterval: 50,
+        namespace: "action:invite-member:user",
+      });
+      expect(rateLimitConfigs.actions.createOrganization).toEqual({
+        interval: 3600 * 24,
+        allowedPerInterval: 5,
+        namespace: "action:create-organization",
+      });
+      expect(rateLimitConfigs.actions.aiChartGeneration).toEqual({
+        interval: 60,
+        allowedPerInterval: 1,
+        namespace: "action:ai-chart-generation",
       });
       expect(rateLimitConfigs.actions.historicalResponseImport).toEqual({
         interval: 3600,

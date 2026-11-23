@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
+import { AUTH_SECRET } from "@/lib/constants";
 import { constantTimeEqual } from "@/lib/crypto";
-import { env } from "@/lib/env";
 
 /**
  * Better Auth session cookie names — `cookiePrefix: "formbricks"` + `useSecureCookies: true`
@@ -35,10 +35,10 @@ const decode = (value: string): string | null => {
  * Fails closed: a missing secret or an invalid signature returns `null`.
  */
 const verifyAndExtractSessionToken = (signedValue: string | null): string | null => {
-  // Must match auth.ts's secret resolution (BETTER_AUTH_SECRET, else NEXTAUTH_SECRET) so this verifies
-  // the cookies Better Auth actually signs — a mismatch rejects every session and loops the user
-  // between / and /auth/login. Fails closed when neither secret is set.
-  const secret = env.BETTER_AUTH_SECRET ?? env.NEXTAUTH_SECRET;
+  // The same resolved secret auth.ts hands Better Auth, so this verifies the cookies BA actually
+  // signs — a mismatch rejects every session and loops the user between / and /auth/login. Fails
+  // closed when no secret is set.
+  const secret = AUTH_SECRET;
   if (!signedValue || !secret) {
     return null;
   }
@@ -61,7 +61,8 @@ const verifyAndExtractSessionToken = (signedValue: string | null): string | null
   return token;
 };
 
-const getSignedCookieValueFromHeader = (cookieHeader: string, cookieName: string): string | null => {
+/** One cookie's decoded value from a raw `Cookie` header, or null when it is absent or empty. */
+export const getCookieValueFromHeader = (cookieHeader: string, cookieName: string): string | null => {
   const cookies = cookieHeader.split(";").map((cookie) => cookie.trim());
 
   for (const cookie of cookies) {
@@ -98,7 +99,7 @@ export const getSessionTokenFromCookieHeader = (cookieHeader: string | null): st
   }
 
   for (const cookieName of BETTER_AUTH_SESSION_COOKIE_NAMES) {
-    const signedValue = getSignedCookieValueFromHeader(cookieHeader, cookieName);
+    const signedValue = getCookieValueFromHeader(cookieHeader, cookieName);
     if (!signedValue) continue;
     const token = verifyAndExtractSessionToken(signedValue);
     if (token) return token;

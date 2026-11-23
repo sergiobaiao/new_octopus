@@ -9,11 +9,14 @@ import { getTranslate } from "@/lingodotdev/server";
 import { executeTenantScopedQuery } from "@/modules/ee/analysis/api/lib/cube-client";
 import { prepareQueryForChartType } from "@/modules/ee/analysis/charts/lib/big-number";
 import { resolveChartType } from "@/modules/ee/analysis/charts/lib/chart-utils";
-import { dropEmptyMeasureRows } from "@/modules/ee/analysis/charts/lib/empty-measure-rows";
-import { pruneOptionLabels, resolveOptionGrouping } from "@/modules/ee/analysis/charts/lib/option-grouping";
+import {
+  dropEmptyMeasureRows,
+  withOptionIdFilter,
+} from "@/modules/ee/analysis/charts/lib/empty-measure-rows";
+import { pruneChartLabels, resolveOptionGrouping } from "@/modules/ee/analysis/charts/lib/option-grouping";
 import { AnalysisPageLayout } from "@/modules/ee/analysis/components/analysis-page-layout";
 import { checkFeedbackDirectoryAccess } from "@/modules/ee/analysis/lib/access";
-import type { TChartDataRow } from "@/modules/ee/analysis/types/analysis";
+import type { TChartDataRow, TChartLabelMaps } from "@/modules/ee/analysis/types/analysis";
 import { getIsDashboardsEnabled } from "@/modules/ee/license-check/lib/utils";
 import { getAuthorizedWorkspaceFeedbackDirectories } from "@/modules/ee/unify-feedback/lib/access";
 import { UpgradePrompt } from "@/modules/ui/components/upgrade-prompt";
@@ -32,10 +35,9 @@ type TDashboardDetail = Awaited<ReturnType<typeof getDashboard>>;
 type TDashboardWidget = TDashboardDetail["widgets"][number];
 type TDashboardWidgetWithChart = TDashboardWidget & { chart: NonNullable<TDashboardWidget["chart"]> };
 
-interface WidgetQueryResult {
+interface WidgetQueryResult extends TChartLabelMaps {
   data: TChartDataRow[];
   query: TChartQuery;
-  optionLabels?: Record<string, string>;
 }
 
 async function executeWidgetQuery(
@@ -56,10 +58,11 @@ async function executeWidgetQuery(
 
     // Mirror the chart builder (executeQueryAction): resolve option labels so value_id slices
     // display human-readable option names. Without this the dashboard renders raw value_ids.
-    const { rewrittenQuery, optionLabels } = await resolveOptionGrouping(query, workspaceId);
+    const grouping = await resolveOptionGrouping(query, workspaceId, tenant.feedbackDirectoryId);
+    const { rewrittenQuery } = grouping;
 
     const data = await executeTenantScopedQuery({
-      query: rewrittenQuery,
+      query: withOptionIdFilter(rewrittenQuery),
       feedbackDirectoryId: tenant.feedbackDirectoryId,
       workspaceId,
       organizationId,
@@ -70,13 +73,7 @@ async function executeWidgetQuery(
     // Mirror the chart builder again: groups that no selected measure can answer for are dropped
     // rather than rendered as blank bars and empty Chart Data rows (ENG-3150).
     const rows = dropEmptyMeasureRows(Array.isArray(data) ? data : [], rewrittenQuery);
-    const usedLabels = pruneOptionLabels(rewrittenQuery, rows, optionLabels);
-
-    return {
-      data: rows,
-      query: rewrittenQuery,
-      ...(usedLabels ? { optionLabels: usedLabels } : {}),
-    };
+    return { data: rows, query: rewrittenQuery, ...pruneChartLabels(grouping, rows) };
   } catch (error) {
     logger.error(error, "Failed to load dashboard widget data");
     return { error: DASHBOARD_WIDGET_LOAD_ERROR };

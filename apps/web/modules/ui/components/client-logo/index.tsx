@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useTranslation } from "react-i18next";
 import { Workspace } from "@formbricks/database/prisma-browser";
 import { TLogo } from "@formbricks/types/styling";
+import { isSafeThemeColor } from "@formbricks/types/styling-values";
 import { cn } from "@/lib/cn";
 import { isExternalImageSrc } from "@/lib/image-hosts";
 
@@ -52,12 +53,15 @@ export const ClientLogo = ({
         position === "overlay" ? "absolute z-0" : "relative",
         "group rounded-lg"
       )}
-      style={{ backgroundColor: logoToUse?.bgColor }}>
+      // Server-rendered into a style attribute, so a stored value that is not a color (legacy rows
+      // predate the write-side check) is dropped rather than able to add declarations (ENG-2950).
+      style={{ backgroundColor: isSafeThemeColor(logoToUse?.bgColor) ? logoToUse?.bgColor : undefined }}>
       {previewSurvey && !disableLinks && (
         <Link
           href={lookSettingsHref}
           className="group/link absolute h-full w-full hover:cursor-pointer"
-          target="_blank">
+          target="_blank"
+          aria-label={t("workspace.surveys.edit.logo_settings")}>
           <ArrowUpRight
             size={24}
             className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 transform rounded-md bg-white/80 p-0.5 text-slate-700 opacity-0 transition-all duration-200 ease-in-out group-hover/link:opacity-100"

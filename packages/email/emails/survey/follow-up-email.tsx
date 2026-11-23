@@ -1,4 +1,4 @@
-import { Column, Hr, Row, Text } from "@react-email/components";
+import { Column, Hr, Row, Text } from "react-email";
 import { EmailTemplate } from "../../src/components/email-template";
 import { renderEmailResponseValue } from "../../src/lib/email-utils";
 import { exampleData } from "../../src/lib/example-data";
@@ -69,7 +69,7 @@ export function FollowUpEmail({
           <Row key={hiddenField.id}>
             <Column className="w-full">
               <Text className="mb-2 text-sm font-semibold text-slate-900" dir="auto">
-                {t("emails.hidden_field")}: {hiddenField.id}
+                {t("emails.hidden_field")}: {hiddenField.name}
               </Text>
               <Text className="mt-0 text-sm break-words whitespace-pre-wrap text-slate-700" dir="auto">
                 {hiddenField.value}

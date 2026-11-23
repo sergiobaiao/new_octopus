@@ -5,9 +5,11 @@ import {
   BlocksIcon,
   BrushIcon,
   Building2Icon,
+  ChartColumnIcon,
   ChevronDownIcon,
   CodeXmlIcon,
   CreditCardIcon,
+  DatabaseIcon,
   FoldersIcon,
   GlobeIcon,
   KeyIcon,
@@ -317,6 +319,15 @@ export const SettingsSidebarContent = ({
       icon: <LanguagesIcon className={iconClassName} />,
       disabled: isBilling,
     },
+    // Directly below Survey Languages: both are things a survey is composed from rather than things
+    // the workspace is connected to, and an author reaches for them at the same point.
+    {
+      id: "embedded-data",
+      label: t("common.embedded_data"),
+      href: workspaceSettingsPath(workspaceId, "embedded-data"),
+      icon: <DatabaseIcon className={iconClassName} />,
+      disabled: isBilling,
+    },
     {
       id: "app-connection",
       label: t("common.web_and_mobile_sdk"),
@@ -405,6 +416,13 @@ export const SettingsSidebarContent = ({
       icon: <ShieldIcon className={iconClassName} />,
       hidden: isFormbricksCloud,
       disabled: isMember || isBilling,
+    },
+    {
+      id: "org-usage",
+      label: t("workspace.settings.usage.nav_label"),
+      href: organizationSettingsPath(organizationId, "usage"),
+      icon: <ChartColumnIcon className={iconClassName} />,
+      hidden: !isOwnerOrManager || isFormbricksCloud,
     },
   ];
 

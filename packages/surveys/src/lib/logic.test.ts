@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import { deriveLegacyEmbeddedData } from "@formbricks/types/embedded-data-resolver";
+import { embeddedFieldsFromLegacyInput } from "@formbricks/types/embedded-data-mapping";
 import { type TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import { type TResponseData, type TResponseVariables } from "@formbricks/types/responses";
 import { type TSurveyBlockLogicAction } from "@formbricks/types/surveys/blocks";
@@ -132,7 +132,7 @@ describe("Survey Logic", () => {
     // ENG-2412: the rows are the only thing the resolver reads now, and a survey reaching the
     // renderer always carries them inlined from the payload. A fixture with the legacy columns
     // alone describes a survey nothing would resolve fields for.
-    embeddedFields: deriveLegacyEmbeddedData({
+    embeddedFields: embeddedFieldsFromLegacyInput({
       variables: mockVariables,
       hiddenFields: { enabled: true, fieldIds: ["fieldId1"] },
     }),
@@ -881,6 +881,34 @@ describe("Survey Logic", () => {
       expect(
         evaluateLogic(mockSurvey, mockData, mockVariablesData, doesNotIncludeOneOfCondition, "default")
       ).toBe(true);
+    });
+
+    test("evaluates doesNotIncludeAllOf as the inverse of includesAllOf", () => {
+      const condition = (
+        operator: "includesAllOf" | "doesNotIncludeAllOf" | "doesNotIncludeOneOf",
+        right: string[]
+      ): TConditionGroup => ({
+        id: "group1",
+        connector: "and",
+        conditions: [
+          {
+            id: "condition1",
+            operator,
+            leftOperand: { type: "element", value: "q4" },
+            rightOperand: { type: "static", value: right },
+          },
+        ],
+      });
+      const evaluate = (group: TConditionGroup) =>
+        evaluateLogic(mockSurvey, mockData, mockVariablesData, group, "default");
+
+      // q4 holds Option 1 and Option 2: opt3 is missing, so not all of them are included — but one is.
+      expect(evaluate(condition("includesAllOf", ["opt1", "opt3"]))).toBe(false);
+      expect(evaluate(condition("doesNotIncludeAllOf", ["opt1", "opt3"]))).toBe(true);
+      expect(evaluate(condition("doesNotIncludeOneOf", ["opt1", "opt3"]))).toBe(false);
+      // Every selected option is present.
+      expect(evaluate(condition("includesAllOf", ["opt1", "opt2"]))).toBe(true);
+      expect(evaluate(condition("doesNotIncludeAllOf", ["opt1", "opt2"]))).toBe(false);
     });
 
     test("evaluates special state operators", () => {
@@ -1659,7 +1687,7 @@ describe("computed fields resolve through the inlined EmbeddedData rows", () => 
 
   const computedRow = (dataType: "number" | "string", defaultValue: number | string) => [
     {
-      field: { name: "score", source: "computed" as const, dataType, defaultValue, locked: false },
+      field: { name: "score", key: null, source: "computed" as const, dataType, defaultValue, locked: false },
       link: { storageKey: STORAGE_KEY },
     },
   ];

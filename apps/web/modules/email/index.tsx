@@ -1,5 +1,3 @@
-import { createTransport } from "nodemailer";
-import type SMTPTransport from "nodemailer/lib/smtp-transport";
 import {
   renderAccountDeletionEmail,
   renderEmailCustomizationPreviewEmail,
@@ -12,34 +10,18 @@ import {
   renderPasswordResetNotifyEmail,
   renderResponseFinishedEmail,
   renderSsoRecoveryFactorsRemovedEmail,
+  renderSsoSignInHintEmail,
   renderVerificationEmail,
 } from "@formbricks/email";
 import { TEmailTemplateLegalProps } from "@formbricks/email/src/types/email";
 import { logger } from "@formbricks/logger";
 import type { TLinkSurveyEmailData } from "@formbricks/types/email";
-import { InvalidInputError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { ResourceNotFoundError } from "@formbricks/types/errors";
 import type { TResponse } from "@formbricks/types/responses";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import type { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserEmail, TUserLocale } from "@formbricks/types/user";
-import {
-  DEBUG,
-  IMPRINT_ADDRESS,
-  IMPRINT_URL,
-  IS_SMTP_CONFIGURED,
-  MAIL_FROM,
-  MAIL_FROM_NAME,
-  PRIVACY_URL,
-  SMTP_AUTHENTICATED,
-  SMTP_HOST,
-  SMTP_PASSWORD,
-  SMTP_PORT,
-  SMTP_REJECT_UNAUTHORIZED_TLS,
-  SMTP_SECURE_ENABLED,
-  SMTP_USER,
-  TERMS_URL,
-  WEBAPP_URL,
-} from "@/lib/constants";
+import { IMPRINT_ADDRESS, IMPRINT_URL, MAIL_FROM, PRIVACY_URL, TERMS_URL, WEBAPP_URL } from "@/lib/constants";
 import { getPublicDomain } from "@/lib/getPublicUrl";
 import {
   createEmailChangeToken,
@@ -51,11 +33,18 @@ import {
 import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
 import { TElementResponseMappingSurvey, getElementResponseMapping } from "@/lib/responses";
 import { getTranslate } from "@/lingodotdev/server";
-import { TVerificationRequestPurpose, buildVerificationLinks } from "@/modules/auth/lib/verification-links";
+import {
+  TVerificationRequestPurpose,
+  VERIFICATION_LINK_TTL_SECONDS,
+  buildVerificationLinks,
+} from "@/modules/auth/lib/verification-links";
+import { toInviteDisplayName } from "@/modules/email/lib/invite-display-name";
+import { sendEmail } from "@/modules/email/lib/send-email";
 import { buildVerifiedLinkSurveyUrl } from "@/modules/email/lib/verified-link-survey-url";
 import { resolveStorageUrl } from "@/modules/storage/utils";
 
-export { IS_SMTP_CONFIGURED };
+export { IS_SMTP_CONFIGURED } from "@/lib/constants";
+export { sendEmail } from "@/modules/email/lib/send-email";
 
 const legalProps: TEmailTemplateLegalProps = {
   privacyUrl: PRIVACY_URL || undefined,
@@ -64,63 +53,10 @@ const legalProps: TEmailTemplateLegalProps = {
   imprintAddress: IMPRINT_ADDRESS || undefined,
 };
 
-interface SendEmailDataProps {
-  to: string;
-  from?: string;
-  replyTo?: string;
-  subject: string;
-  text?: string;
-  html: string;
-  /** Optional RFC 5322 Message-ID; nodemailer emits it as the `Message-ID` header. */
-  messageId?: string;
-}
-
 export type TResponseFinishedEmailSurvey = TElementResponseMappingSurvey &
   // `variables` / `hiddenFields` are the resolver's fallback; `embeddedFields` carries the joined
   // EmbeddedData rows the template resolves definitions through (ENG-1837).
   Pick<TSurvey, "id" | "name" | "variables" | "hiddenFields" | "embeddedFields">;
-
-export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean> => {
-  if (!IS_SMTP_CONFIGURED) {
-    logger.info("SMTP is not configured, skipping email sending");
-    return false;
-  }
-  try {
-    const transporter = createTransport({
-      host: SMTP_HOST,
-      port: SMTP_PORT,
-      secure: SMTP_SECURE_ENABLED, // true for 465, false for other ports
-      ...(SMTP_AUTHENTICATED
-        ? {
-            auth: {
-              type: "LOGIN",
-              user: SMTP_USER,
-              pass: SMTP_PASSWORD,
-            },
-          }
-        : {}),
-      tls: {
-        rejectUnauthorized: SMTP_REJECT_UNAUTHORIZED_TLS,
-      },
-      logger: DEBUG,
-      debug: DEBUG,
-    } as SMTPTransport.Options);
-
-    const emailDefaults = {
-      from: `${MAIL_FROM_NAME ?? "Formbricks"} <${MAIL_FROM ?? "noreply@formbricks.com"}>`,
-    };
-    await transporter.sendMail({
-      ...emailDefaults,
-      ...emailData,
-      from: emailData.from ?? emailDefaults.from,
-    });
-
-    return true;
-  } catch (error) {
-    logger.error(error, "Error in sendEmail");
-    throw new InvalidInputError("Incorrect SMTP credentials");
-  }
-};
 
 export const sendVerificationNewEmail = async (
   id: string,
@@ -135,6 +71,7 @@ export const sendVerificationNewEmail = async (
     const html = await renderNewEmailVerification({ verifyLink, t, ...legalProps });
 
     return await sendEmail({
+      emailType: "email_change_verification",
       to: email,
       subject: t("emails.verification_new_email_subject"),
       html,
@@ -151,18 +88,28 @@ export const sendVerificationEmail = async ({
   locale,
   callbackUrl,
   purpose = "email_verification",
+  linkTtlSeconds = VERIFICATION_LINK_TTL_SECONDS,
+  ssoRecoveryStateId,
 }: {
   id: string;
   email: TUserEmail;
   locale: TUserLocale;
   callbackUrl?: string;
   purpose?: TVerificationRequestPurpose;
+  /**
+   * Overridden only by an SSO-recovery resend, which has to mint a link no longer-lived than the intent
+   * it points at — see `getSsoRecoveryPairedTtlSeconds`. Everything else gets the full window.
+   */
+  linkTtlSeconds?: number;
+  /** The SSO recovery the link is for, signed into its token so it cannot be pointed at another (ENG-7310). */
+  ssoRecoveryStateId?: string;
 }): Promise<boolean> => {
   try {
     const t = await getTranslate(locale);
     const token = createToken(id, {
-      expiresIn: "1d",
+      expiresIn: linkTtlSeconds,
       purpose,
+      ...(ssoRecoveryStateId ? { ssoRecoveryStateId } : {}),
     });
     const { verifyLink, verificationRequestLink } = buildVerificationLinks({
       token,
@@ -180,6 +127,7 @@ export const sendVerificationEmail = async ({
     });
 
     return await sendEmail({
+      emailType: purpose === "sso_recovery" ? "sso_recovery_verification" : "email_verification",
       to: email,
       subject: t("emails.verification_email_subject"),
       html,
@@ -204,6 +152,7 @@ export const sendPasswordResetLinkEmail = async (user: {
     ...legalProps,
   });
   return await sendEmail({
+    emailType: "password_reset",
     to: user.email,
     subject: t("emails.forgot_password_email_subject"),
     html,
@@ -224,6 +173,7 @@ export const sendDeleteAccountConfirmationEmail = async (data: {
     ...legalProps,
   });
   return await sendEmail({
+    emailType: "account_deletion",
     to: data.email,
     subject: t("emails.delete_account_email_subject"),
     html,
@@ -246,6 +196,7 @@ export const sendVerificationLinkEmail = async (data: {
     ...legalProps,
   });
   return await sendEmail({
+    emailType: "email_verification",
     to: data.email,
     subject: t("emails.verification_email_subject"),
     html,
@@ -259,6 +210,7 @@ export const sendPasswordResetNotifyEmail = async (user: {
   const t = await getTranslate(user.locale);
   const html = await renderPasswordResetNotifyEmail({ t, ...legalProps });
   return await sendEmail({
+    emailType: "password_reset_notification",
     to: user.email,
     subject: t("emails.password_reset_notify_email_subject"),
     html,
@@ -279,16 +231,20 @@ export const sendSsoRecoveryFactorsRemovedEmail = async ({
   locale,
   passwordRemoved,
   twoFactorRemoved,
+  apiKeysRemoved,
 }: {
   email: string;
   locale: TUserLocale;
   passwordRemoved: boolean;
   twoFactorRemoved: boolean;
+  /** Keys the account had created were deleted with the strip (ENG-2634). */
+  apiKeysRemoved: boolean;
 }): Promise<boolean> => {
   const t = await getTranslate(locale);
   const html = await renderSsoRecoveryFactorsRemovedEmail({
     passwordRemoved,
     twoFactorRemoved,
+    apiKeysRemoved,
     // The account profile page is where both factors this mail can name are re-enrolled — the password
     // form and the 2FA card both live there. There is no separate /settings/security route.
     securitySettingsLink: `${WEBAPP_URL}/account/settings/profile`,
@@ -296,8 +252,38 @@ export const sendSsoRecoveryFactorsRemovedEmail = async ({
     ...legalProps,
   });
   return await sendEmail({
+    emailType: "sso_recovery_notification",
     to: email,
     subject: t("emails.sso_recovery_factors_removed_email_subject"),
+    html,
+  });
+};
+
+/**
+ * Tell a user who asked for a password reset that their account has no password and signs in with an
+ * identity provider instead (ENG-3262). Goes only to the address on file, so naming the provider here
+ * reveals nothing the forgot-password page does not — that page answers identically for every address.
+ */
+export const sendSsoSignInHintEmail = async ({
+  email,
+  locale,
+  providerNames,
+}: {
+  email: string;
+  locale: TUserLocale;
+  providerNames: string[];
+}): Promise<boolean> => {
+  const t = await getTranslate(locale);
+  const html = await renderSsoSignInHintEmail({
+    providerNames,
+    loginLink: `${WEBAPP_URL}/auth/login`,
+    t,
+    ...legalProps,
+  });
+  return await sendEmail({
+    emailType: "sso_sign_in_hint",
+    to: email,
+    subject: t("emails.sso_sign_in_hint_email_subject"),
     html,
   });
 };
@@ -315,8 +301,15 @@ export const sendInviteMemberEmail = async (
 
   const verifyLink = `${WEBAPP_URL}/invite?token=${encodeURIComponent(token)}`;
 
-  const html = await renderInviteEmail({ inviteeName, inviterName, verifyLink, t, ...legalProps });
+  const html = await renderInviteEmail({
+    inviteeName: toInviteDisplayName(inviteeName, ""),
+    inviterName: toInviteDisplayName(inviterName, t("common.anonymous")),
+    verifyLink,
+    t,
+    ...legalProps,
+  });
   return await sendEmail({
+    emailType: "invite",
     to: email,
     subject: t("emails.invite_member_email_subject"),
     html,
@@ -332,6 +325,7 @@ export const sendInviteAcceptedEmail = async (
   const t = await getTranslate(inviterLocale);
   const html = await renderInviteAcceptedEmail({ inviteeName, inviterName, t, ...legalProps });
   await sendEmail({
+    emailType: "invite_accepted",
     to: email,
     subject: t("emails.invite_accepted_email_subject"),
     html,
@@ -394,6 +388,7 @@ export const sendResponseFinishedEmail = async (
   });
 
   await sendEmail({
+    emailType: "response_notification",
     to: email,
     // Never put the respondent's email address in the subject — it's PII that ends up in
     // notification previews and mailbox lists; replying still reaches them via replyTo.
@@ -423,6 +418,7 @@ export const sendEmbedSurveyPreviewEmail = async (
     ...legalProps,
   });
   return await sendEmail({
+    emailType: "survey_preview",
     to,
     subject: t("emails.embed_survey_preview_email_subject"),
     html,
@@ -446,6 +442,7 @@ export const sendEmailCustomizationPreviewEmail = async (
   });
 
   return await sendEmail({
+    emailType: "customization_preview",
     to,
     subject: t("emails.email_customization_preview_email_subject"),
     html: emailHtmlBody,
@@ -473,6 +470,7 @@ export const sendLinkSurveyToVerifiedEmail = async (data: TLinkSurveyEmailData):
 
   const html = await renderLinkSurveyEmail({ surveyName, surveyLink, logoUrl, t, ...legalProps });
   return await sendEmail({
+    emailType: "verified_survey_link",
     to: data.email,
     subject: t("emails.verified_link_survey_email_subject"),
     html,

@@ -1,17 +1,20 @@
 import { FormbricksProvider } from "@/app/formbricks/components/formbricks-provider";
 import { PlainChat } from "@/app/plain/components/plain-chat";
 import { getIsActiveCustomer } from "@/app/plain/lib/customer";
-import { computePlainEmailHash } from "@/app/plain/lib/identity";
+import { computePlainCustomerDetailsSignature } from "@/app/plain/lib/identity";
 import { PostHogIdentify } from "@/app/posthog/PostHogIdentify";
 import {
   FORMBRICKS_APP_URL,
   FORMBRICKS_WORKSPACE_ID,
   IS_FORMBRICKS_SURVEYS_CONFIGURED,
   IS_PLAIN_CHAT_CONFIGURED,
+  IS_PRODUCTION,
   PLAIN_ACTIVE_CUSTOMER_LABEL_TYPE_ID,
   PLAIN_APP_ID,
   POSTHOG_KEY,
+  SENTRY_DSN,
 } from "@/lib/constants";
+import { SentryUser } from "@/lib/sentry/SentryUser";
 import { getUser } from "@/lib/user/service";
 import { getSession } from "@/modules/auth/lib/session";
 import { ClientLogout } from "@/modules/ui/components/client-logout";
@@ -40,6 +43,8 @@ const AppLayout = async ({ children }: Readonly<{ children: React.ReactNode }>) 
   return (
     <>
       <NoMobileOverlay />
+      {/* Same gate as the root layout's SentryClientConfigScript: browser Sentry only runs there. */}
+      {IS_PRODUCTION && SENTRY_DSN && user && <SentryUser userId={user.id} />}
       {POSTHOG_KEY && user && (
         <PostHogIdentify posthogKey={POSTHOG_KEY} userId={user.id} email={user.email} name={user.name} />
       )}
@@ -49,7 +54,11 @@ const AppLayout = async ({ children }: Readonly<{ children: React.ReactNode }>) 
           userEmail={user?.email}
           userName={user?.name}
           userId={user?.id}
-          emailHash={user?.email ? computePlainEmailHash(user.email) : null}
+          customerDetailsSignature={
+            user?.email
+              ? computePlainCustomerDetailsSignature({ email: user.email, externalId: user.id })
+              : null
+          }
           activeCustomerLabelTypeId={plainActiveCustomerLabelTypeId}
         />
       )}

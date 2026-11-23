@@ -11,6 +11,7 @@ export {
   ONE_SHOT_JOB_NAMES,
   enqueueResponsePipelineJob,
   enqueueTestLogJob,
+  enqueueWebhookDeliveryJob,
   enqueueWorkflowRunJob,
   getBackgroundJobProducer,
   recurringJobs,
@@ -19,7 +20,10 @@ export {
 } from "./queue";
 export { processResponsePipelineJob } from "./processors/response-pipeline";
 export { processTestLogJob } from "./processors/test-log";
+export { processWebhookDeliveryJob } from "./processors/webhook-delivery";
 export { processWorkflowRunJob } from "./processors/workflow-run";
+export { openJobsUpgradeQueue } from "./upgrade";
+export type { JobsUpgradeQueue } from "./upgrade";
 export { startJobsRuntime } from "./runtime";
 export type { JobsQueueHandle, RecurringJobHandle } from "./queue";
 export type { TRecurringJobKey } from "./recurring";
@@ -33,6 +37,7 @@ export {
   ZSurveySchedulingJobData,
   ZTestLogJobData,
   ZUsageTelemetryJobData,
+  ZWebhookDeliveryJobData,
   ZWorkflowRunJobData,
   ZWorkflowsUsageSnapshotJobData,
   ZWorkflowRunReconcileJobData,
@@ -45,6 +50,7 @@ export type {
   TSurveySchedulingJobData,
   TTestLogJobData,
   TUsageTelemetryJobData,
+  TWebhookDeliveryJobData,
   TWorkflowsUsageSnapshotJobData,
   TWorkflowRunJobData,
   TWorkflowRunReconcileJobData,

@@ -1,9 +1,18 @@
-import type { TSurveyStatus } from "@formbricks/types/surveys/types";
+import type { TSurveyStatus, TSurveyVisibility } from "@formbricks/types/surveys/types";
 import type { TV3SurveyGenerateBody } from "@/app/api/v3/surveys/generate/schemas";
-import type { TV3CreateSurveyBody, TV3SurveyValidationRequestBody } from "@/app/api/v3/surveys/schemas";
+import type {
+  TV3CreateSurveyBody,
+  TV3CreateSurveyRequestBody,
+  TV3SurveyCreatedFrom,
+  TV3SurveyValidationRequestBody,
+} from "@/app/api/v3/surveys/schemas";
 import { parseV3ApiError } from "@/modules/api/lib/v3-client";
 import { normalizeSurveyFilters } from "@/modules/survey/list/lib/utils";
 import { TSurveyListItem, TSurveyOverviewFilters } from "@/modules/survey/list/types/survey-overview";
+import type {
+  TSurveyVisibilityChangeResult,
+  TSurveyVisibilityState,
+} from "@/modules/survey/visibility/types";
 
 type TV3SurveyListItemResponse = Omit<
   TSurveyListItem,
@@ -121,6 +130,10 @@ export function buildSurveyListSearchParams({
     searchParams.append("filter[type][in]", type);
   });
 
+  normalizedFilters.visibility.forEach((visibility) => {
+    searchParams.append("filter[visibility][in]", visibility);
+  });
+
   return searchParams;
 }
 
@@ -191,6 +204,41 @@ export async function updateSurveyStatus(
   }
 
   const responseBody = (await response.json()) as TV3UpdateSurveyStatusResponse;
+  return responseBody.data;
+}
+
+export async function getSurveyVisibility(surveyId: string): Promise<TSurveyVisibilityState> {
+  const response = await fetch(`/api/v3/surveys/${surveyId}/visibility`, {
+    method: "GET",
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw await parseV3ApiError(response);
+  }
+
+  const responseBody = (await response.json()) as { data: TSurveyVisibilityState };
+  return responseBody.data;
+}
+
+export async function updateSurveyVisibility(
+  surveyId: string,
+  visibility: TSurveyVisibility
+): Promise<TSurveyVisibilityChangeResult> {
+  const response = await fetch(`/api/v3/surveys/${surveyId}/visibility`, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ visibility }),
+  });
+
+  if (!response.ok) {
+    throw await parseV3ApiError(response);
+  }
+
+  const responseBody = (await response.json()) as { data: TSurveyVisibilityChangeResult };
   return responseBody.data;
 }
 
@@ -316,8 +364,8 @@ export async function validateSurveyCreatePayload(
 }
 
 export async function createV3Survey(
-  payload: TV3CreateSurveyBody,
-  createdFrom?: "blank" | "template" | "xm-template" | "ai"
+  payload: TV3CreateSurveyRequestBody,
+  createdFrom?: TV3SurveyCreatedFrom
 ): Promise<TV3CreateSurveyResponse["data"]> {
   const url = createdFrom
     ? `/api/v3/surveys?createdFrom=${encodeURIComponent(createdFrom)}`

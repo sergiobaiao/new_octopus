@@ -60,10 +60,10 @@ export const canReadSurveyInWorkspace = async (workspaceId: string, surveyId: st
     return false;
   }
 
-  return can({ type: "user", id: session.user.id }, "workspace.read", {
-    type: "workspace",
-    id: workspaceId,
-  });
+  const actor = { type: "user", id: session.user.id } as const;
+  // ENG-3282: once survey visibility is enforced the survey itself decides — a restricted survey is its
+  // owner's and the organization administrators', whoever else can read the workspace.
+  return can(actor, "survey.read", { type: "survey", id: surveyId });
 };
 
 /**
@@ -87,6 +87,17 @@ export const getSurveyAuth = reactCache(
     ]);
 
     if (surveyWorkspaceId !== workspaceAuth.workspace.id) {
+      notFound();
+    }
+
+    // ENG-3282: workspace access is necessary but no longer sufficient once visibility is enforced.
+    // The same 404 as a foreign id, so a restricted survey's existence is not revealed.
+    if (
+      !(await can({ type: "user", id: workspaceAuth.session.user.id }, "survey.read", {
+        type: "survey",
+        id: surveyId,
+      }))
+    ) {
       notFound();
     }
 

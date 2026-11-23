@@ -24,6 +24,9 @@ vi.mock("@formbricks/database", () => ({
       findMany: vi.fn(),
       deleteMany: vi.fn(),
     },
+    invite: {
+      updateMany: vi.fn(),
+    },
     $transaction: vi.fn(),
   },
 }));
@@ -42,7 +45,7 @@ const organizationId = "org-1";
 const userId = "user-1";
 const teamId = "team-1";
 const mockMember = {
-  user: { name: "Test", email: "test@example.com", isActive: true },
+  user: { name: "Test", email: "test@example.com", isActive: true, lastLoginAt: new Date("2026-09-01") },
   userId,
   organizationId,
   accepted: true,
@@ -68,6 +71,7 @@ describe("getMembershipByOrganizationId", () => {
     expect(result[0].name).toBe("Test");
     expect(result[0].email).toBe("test@example.com");
     expect(result[0].isActive).toBe(true);
+    expect(result[0].lastLoginAt).toEqual(new Date("2026-09-01"));
   });
   test("throws DatabaseError on prisma error", async () => {
     const prismaError = new Prisma.PrismaClientKnownRequestError("db", {
@@ -152,6 +156,23 @@ describe("deleteMembership", () => {
     expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({
       teamMemberships: [{ teamId, userId }],
     });
+  });
+  test("expires the removed member's pending invites in that organization", async () => {
+    const now = new Date("2026-10-08T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      vi.mocked(prisma.teamUser.findMany).mockResolvedValue([]);
+
+      await deleteMembership(userId, organizationId);
+
+      expect(prisma.invite.updateMany).toHaveBeenCalledWith({
+        where: { organizationId, creatorId: userId, expiresAt: { gt: now } },
+        data: { expiresAt: now },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
   test("retries a serializable transaction conflict up to a successful attempt", async () => {
     const transactionConflict = new Prisma.PrismaClientKnownRequestError("transaction conflict", {

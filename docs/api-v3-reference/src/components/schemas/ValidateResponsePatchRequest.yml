@@ -13,10 +13,9 @@ properties:
     format: cuid2
   data:
     description: >-
-      Intended patch payload. Invalid documents are allowed so the endpoint can return repairable
-      validation errors.
-    anyOf:
-      - $ref: ./PatchResponseRequest.yml
-      - type: object
-        additionalProperties: true
+      Intended patch payload, checked against `PatchResponseRequest` by the operation rather than by this
+      envelope. Any JSON value is accepted here so the endpoint can return repairable validation
+      errors: a document that is not an object, or that breaks `PatchResponseRequest`, is a **200** with
+      `valid: false`, not a 400. Only the request limits come first: an array past its budget, or
+      nesting past 256 levels, is a 400 for any request.
 additionalProperties: false

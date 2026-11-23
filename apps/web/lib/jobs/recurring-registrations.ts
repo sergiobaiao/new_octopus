@@ -7,11 +7,15 @@ import {
   type TRecurringBackgroundJobSchedule,
   type TRecurringJobKey,
   type TResponsePipelineJobData,
+  type TWebhookDeliveryJobData,
   type TWorkflowRunJobData,
   recurringJobs,
 } from "@formbricks/jobs";
 import { processAuthzedProjectionDeliveryJob } from "@/lib/authzed/outbox-processor";
-import { processAuthzedScheduledReconciliationJob } from "@/lib/authzed/scheduled-reconciliation";
+import {
+  processAuthzedScheduledReconciliationJob,
+  processAuthzedSurveyAuditJob,
+} from "@/lib/authzed/scheduled-reconciliation";
 import { USAGE_TELEMETRY_DAILY_CRON_PATTERN, USAGE_TELEMETRY_TIME_ZONE } from "@/lib/telemetry/constants";
 import { processUsageTelemetryJob } from "@/lib/telemetry/process-usage-telemetry-job";
 import {
@@ -23,6 +27,7 @@ import { processWorkflowRunJob } from "@/modules/ee/workflows/lib/runner/process
 import { processWorkflowRunReconcileJob } from "@/modules/ee/workflows/lib/runner/process-workflow-run-reconcile-job";
 import { WORKFLOW_RUN_RECONCILE_INTERVAL_MS } from "@/modules/ee/workflows/lib/runner/reconcile-constants";
 import { processResponsePipelineJob } from "@/modules/response-pipeline/lib/process-response-pipeline-job";
+import { processWebhookDeliveryJob } from "@/modules/response-pipeline/lib/process-webhook-delivery-job";
 import {
   SURVEY_ARCHIVE_PURGE_DAILY_CRON_PATTERN,
   SURVEY_ARCHIVE_PURGE_TIME_ZONE,
@@ -49,6 +54,7 @@ interface RecurringJobRegistration {
   handler: JobHandler<TGlobalScopeJobData>;
   job: RecurringJobHandle;
   schedule: TRecurringBackgroundJobSchedule;
+  requiresReleaseActivation?: boolean;
 }
 
 /**
@@ -78,6 +84,16 @@ export const RECURRING_JOB_REGISTRATIONS_BY_KEY: Record<TRecurringJobKey, Recurr
     job: recurringJobs.authzedReconciliationAudit,
     schedule: {
       everyMs: 6 * 60 * 60 * 1_000,
+      kind: "every",
+    },
+  },
+  // ENG-3282: daily rather than six-hourly — its cost grows with the number of surveys, not grants.
+  authzedSurveyAudit: {
+    requiresReleaseActivation: true,
+    handler: processAuthzedSurveyAuditJob,
+    job: recurringJobs.authzedSurveyAudit,
+    schedule: {
+      everyMs: 24 * 60 * 60 * 1_000,
       kind: "every",
     },
   },
@@ -150,6 +166,8 @@ export const RECURRING_JOB_REGISTRATIONS: readonly RecurringJobRegistration[] = 
 export const getJobHandlerOverrides = (): JobHandlerOverrides => ({
   [ONE_SHOT_JOB_NAMES.responsePipeline]:
     toJobHandlerOverride<TResponsePipelineJobData>(processResponsePipelineJob),
+  [ONE_SHOT_JOB_NAMES.webhookDelivery]:
+    toJobHandlerOverride<TWebhookDeliveryJobData>(processWebhookDeliveryJob),
   [ONE_SHOT_JOB_NAMES.workflowRun]: toJobHandlerOverride<TWorkflowRunJobData>(processWorkflowRunJob),
   ...Object.fromEntries(
     RECURRING_JOB_REGISTRATIONS.map((registration) => [

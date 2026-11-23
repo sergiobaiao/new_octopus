@@ -1,10 +1,10 @@
 import "server-only";
 import { cache as reactCache } from "react";
-import { z } from "zod";
 import { prisma } from "@formbricks/database";
 import { Prisma } from "@formbricks/database/prisma";
 import { ZId, ZOptionalNumber } from "@formbricks/types/common";
-import { getIngestedStorageKeys } from "@formbricks/types/embedded-data-resolver";
+import { labelEmbeddedFields } from "@formbricks/types/embedded-data-label";
+import { getIngestedEmbeddedFields } from "@formbricks/types/embedded-data-resolver";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import {
   TResponseContact,
@@ -34,10 +34,12 @@ import { getQuotasSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[
 import { RESPONSES_PER_PAGE } from "@/lib/constants";
 import { getDisplayCountBySurveyId } from "@/lib/display/service";
 import { getLocalizedValue } from "@/lib/i18n/utils";
+import { TResponseCursor, ZResponseCursor, whereAfterResponseCursor } from "@/lib/response/pagination";
 import { buildWhereClause } from "@/lib/response/where-clause";
 import { getSurvey } from "@/lib/survey/service";
 import { getElementsFromBlocks } from "@/lib/survey/utils";
 import { validateInputs } from "@/lib/utils/validate";
+import { displayEmbeddedValue } from "@/modules/embedded-data/lib/value-display";
 import { convertFloatTo2Decimal } from "./utils";
 
 interface TSurveySummaryResponse {
@@ -50,6 +52,9 @@ interface TSurveySummaryResponse {
   ttc: TResponseTtc;
   finished: boolean;
 }
+
+/** A summary response as fetched, with the `createdAt` the batch loop continues after. */
+type TSurveySummaryResponseRow = TSurveySummaryResponse & { createdAt: Date };
 
 const getElementIdToBlockIdMap = (survey: TSurvey): Record<string, string> => {
   return survey.blocks.reduce<Record<string, string>>((acc, block) => {
@@ -908,10 +913,17 @@ export const getElementSummary = async (
       }
       case TSurveyElementTypeEnum.Ranking: {
         let values: TSurveyElementSummaryRanking["choices"] = [];
-        const elementChoices = element.choices.map((choice) => getLocalizedValue(choice.label, "default"));
+        const otherOption = element.choices.find((choice) => choice.id === "other");
+        const elementChoices = element.choices
+          .filter((choice) => choice.id !== "other")
+          .map((choice) => getLocalizedValue(choice.label, "default"));
         let totalResponseCount = 0;
         const choiceRankSums: Record<string, number> = {};
         const choiceCountMap: Record<string, number> = {};
+        // A ranked "Other" stores the respondent's text in its slot, so any unmatched entry is it.
+        let otherRankSum = 0;
+        let otherCount = 0;
+        const otherValues: NonNullable<TSurveyElementSummaryRanking["choices"][number]["others"]> = [];
 
         elementChoices.forEach((choice: string) => {
           choiceRankSums[choice] = 0;
@@ -933,6 +945,16 @@ export const getElementSummary = async (
               if (elementChoices.includes(value)) {
                 choiceRankSums[value] += ranking;
                 choiceCountMap[value]++;
+              } else if (otherOption && typeof value === "string") {
+                otherRankSum += ranking;
+                otherCount++;
+                if (value.trim() !== "") {
+                  otherValues.push({
+                    value,
+                    contact: response.contact,
+                    contactAttributes: response.contactAttributes,
+                  });
+                }
               }
             });
           }
@@ -948,6 +970,15 @@ export const getElementSummary = async (
           });
         });
 
+        if (otherOption) {
+          values.push({
+            value: getLocalizedValue(otherOption.label, "default") || "Other",
+            count: otherCount,
+            avgRanking: convertFloatTo2Decimal(otherCount > 0 ? otherRankSum / otherCount : 0),
+            others: otherValues.slice(0, VALUES_LIMIT),
+          });
+        }
+
         summary.push({
           type: element.type,
           element,
@@ -960,11 +991,13 @@ export const getElementSummary = async (
     }
   }
 
-  getIngestedStorageKeys(survey).forEach((hiddenFieldId) => {
+  // ENG-3233: the card is titled by the field's name and the samples are read by its storage key,
+  // which stays on `id` — the two are the same string only for a field nobody renamed.
+  labelEmbeddedFields(getIngestedEmbeddedFields(survey)).forEach(({ link, label }) => {
     let values: TSurveyElementSummaryHiddenFields["samples"] = [];
     responses.forEach((response) => {
-      const answer = response.data[hiddenFieldId];
-      if (answer && typeof answer === "string") {
+      const answer = displayEmbeddedValue(response.data[link.storageKey]);
+      if (answer) {
         values.push({
           updatedAt: response.updatedAt,
           value: answer,
@@ -976,7 +1009,8 @@ export const getElementSummary = async (
 
     summary.push({
       type: "hiddenField",
-      id: hiddenFieldId,
+      id: link.storageKey,
+      label,
       responseCount: values.length,
       samples: values.slice(0, VALUES_LIMIT),
     });
@@ -1004,18 +1038,18 @@ export const getSurveySummary = reactCache(
 
       // Use cursor-based pagination instead of count + offset to avoid expensive queries
       const responses: TSurveySummaryResponse[] = [];
-      let cursor: string | undefined = undefined;
+      let cursor: TResponseCursor | undefined = undefined;
       let hasMore = true;
 
       while (hasMore) {
-        const batch = await getResponsesForSummary(surveyId, batchSize, 0, filterCriteria, cursor);
+        const batch = await getResponsesForSummary(surveyId, batchSize, filterCriteria, cursor);
         responses.push(...batch);
 
-        if (batch.length < batchSize) {
+        const lastResponse = batch.at(-1);
+        if (!lastResponse || batch.length < batchSize) {
           hasMore = false;
         } else {
-          // Use the last response's ID as cursor for next batch
-          cursor = batch[batch.length - 1].id;
+          cursor = { id: lastResponse.id, createdAt: lastResponse.createdAt };
         }
       }
 
@@ -1053,16 +1087,14 @@ export const getResponsesForSummary = reactCache(
   async (
     surveyId: string,
     limit: number,
-    offset: number,
     filterCriteria?: TResponseFilterCriteria,
-    cursor?: string
-  ): Promise<TSurveySummaryResponse[]> => {
+    cursor?: TResponseCursor
+  ): Promise<TSurveySummaryResponseRow[]> => {
     validateInputs(
       [surveyId, ZId],
       [limit, ZOptionalNumber],
-      [offset, ZOptionalNumber],
       [filterCriteria, ZResponseFilterCriteria.optional()],
-      [cursor, z.cuid2().optional()]
+      [cursor, ZResponseCursor.optional()]
     );
 
     const queryLimit = limit ?? RESPONSES_PER_PAGE;
@@ -1074,17 +1106,11 @@ export const getResponsesForSummary = reactCache(
         ...buildWhereClause(survey, filterCriteria),
       };
 
-      // Add cursor condition for cursor-based pagination
-      if (cursor) {
-        whereClause.id = {
-          lt: cursor, // Get responses with ID less than cursor (for desc order)
-        };
-      }
-
       const responses = await prisma.response.findMany({
-        where: whereClause,
+        where: whereAfterResponseCursor(whereClause, cursor),
         select: {
           id: true,
+          createdAt: true,
           data: true,
           updatedAt: true,
           contact: {
@@ -1109,11 +1135,11 @@ export const getResponsesForSummary = reactCache(
           },
         ],
         take: queryLimit,
-        skip: offset,
       });
 
-      const transformedResponses: TSurveySummaryResponse[] = responses.map((responsePrisma) => ({
+      const transformedResponses: TSurveySummaryResponseRow[] = responses.map((responsePrisma) => ({
         id: responsePrisma.id,
+        createdAt: responsePrisma.createdAt,
         data: (responsePrisma.data ?? {}) as TResponseData,
         updatedAt: responsePrisma.updatedAt,
         contact: responsePrisma.contact

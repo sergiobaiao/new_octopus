@@ -1,5 +1,12 @@
+import { LEAKY_AI_ERRORS, findPlantedContent } from "@/lib/ai/__mocks__/leaky-ai-errors";
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { type TAITranslationField, translateFields } from "./translate-fields";
+import { AIOutputTokenLimitError } from "@formbricks/ai";
+import { InvalidInputError, TooManyRequestsError } from "@formbricks/types/errors";
+import {
+  AI_TRANSLATION_OUTPUT_TOO_LONG,
+  type TAITranslationField,
+  translateFields,
+} from "./translate-fields";
 
 vi.mock("server-only", () => ({}));
 
@@ -137,10 +144,42 @@ describe("translateFields", () => {
     );
   });
 
+  // ENG-2831: the token-limit error was neither an expected error nor a mapped code, so the modal fell
+  // back to a generic "Translation failed" and every occurrence landed in Sentry. It has to reach the
+  // client as a code it can explain.
+  test("maps an output token limit overflow to the ai_output_too_long code", async () => {
+    mockGenerateOrganizationAIObject.mockRejectedValue(
+      new AIOutputTokenLimitError({ maxOutputTokens: 8192, outputTokens: 8192, reasoningTokens: 0 })
+    );
+
+    await expect(translateFields({ ...baseInput, fields })).rejects.toThrow(
+      new InvalidInputError(AI_TRANSLATION_OUTPUT_TOO_LONG)
+    );
+  });
+
   test("propagates errors thrown by the AI provider", async () => {
     mockGenerateOrganizationAIObject.mockRejectedValue(new Error("provider failed"));
 
     await expect(translateFields({ ...baseInput, fields })).rejects.toThrow("provider failed");
+  });
+
+  // ENG-3720: a rejection from here reaches the server action client, which writes a thrown error whole
+  // to the logs and to Sentry — and an AI SDK error carries the survey text and the model's translation.
+  test.each(LEAKY_AI_ERRORS)("rethrows a failure with %s without what the call carried", async (_, build) => {
+    const error = build();
+    mockGenerateOrganizationAIObject.mockRejectedValue(error);
+
+    const rejection = await translateFields({ ...baseInput, fields }).catch((thrown: unknown) => thrown);
+
+    expect(rejection).toMatchObject({ name: "RedactedAIError", originalName: error.name });
+    expect(findPlantedContent(rejection)).toBeUndefined();
+  });
+
+  test("rethrows the quota error unchanged, so the client still gets its code", async () => {
+    const quotaError = new TooManyRequestsError("ai_quota_exceeded", 30);
+    mockGenerateOrganizationAIObject.mockRejectedValue(quotaError);
+
+    await expect(translateFields({ ...baseInput, fields })).rejects.toBe(quotaError);
   });
 
   test("echoes empty defaultText through without calling the model", async () => {

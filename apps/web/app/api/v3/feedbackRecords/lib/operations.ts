@@ -68,6 +68,7 @@ import {
   type TV3FeedbackRecord,
   serializeV3FeedbackDataset,
   serializeV3FeedbackRecord,
+  serializeV3FeedbackRecordDetail,
   serializeV3FeedbackRecordMatch,
 } from "./serializers";
 
@@ -172,6 +173,8 @@ const FILTER_KEY_KIND = {
   until: "scalar",
   created_since: "scalar",
   created_until: "scalar",
+  updated_since: "scalar",
+  updated_until: "scalar",
   value_date_min: "scalar",
   value_date_max: "scalar",
   value_number_min: "scalar",
@@ -548,7 +551,10 @@ export async function getV3FeedbackRecord({
       return owned.response;
     }
 
-    return successResponse(serializeV3FeedbackRecord(owned.record), { requestId, cache: CACHE });
+    return successResponse(serializeV3FeedbackRecordDetail(owned.record), {
+      requestId,
+      cache: CACHE,
+    });
   } catch (err) {
     return handleUnexpectedError(err, log, requestId, instance, "feedbackRecords.get");
   }

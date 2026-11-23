@@ -1,5 +1,6 @@
 import { createId } from "@paralleldrive/cuid2";
 import { z } from "zod";
+import { ZCustomCssInput, ZCustomCssScope } from "@formbricks/types/custom-css";
 import { ZSegmentFilters } from "@formbricks/types/segment";
 import { ZSurveyBlocks } from "@formbricks/types/surveys/blocks";
 import {
@@ -13,6 +14,8 @@ import {
   ZSurveyVariables,
   ZSurveyWelcomeCard,
 } from "@formbricks/types/surveys/types";
+import { lengthBoundedArray } from "@/app/api/v3/lib/bounded-array";
+import { BoundedInvalidParams } from "@/app/api/v3/lib/invalid-params";
 import { type InvalidParam, isInvalidParamCode } from "@/app/api/v3/lib/response";
 import { normalizeV3SurveyWriteLanguageCode } from "./language";
 import { V3_SURVEY_TRANSLATABLE_METADATA_KEYS } from "./translation-fields";
@@ -29,6 +32,12 @@ type TV3LanguageNormalizationOptions = TV3LanguageCompatibilityOptions & {
 
 type TV3SurveyDocumentSchemaOptions = TV3LanguageNormalizationOptions & {
   fallbackDefaultLanguage?: string;
+  /**
+   * `false` parses a document without the `V3_SURVEY_MAX_*` array caps. Those are bounds on request
+   * input; the stored survey is parsed with the same schema, and a survey the editor built above a cap
+   * has to stay editable through v3 and MCP (review on #9423).
+   */
+  boundArrays?: boolean;
 };
 
 const createZV3SurveyLanguageTag = (options?: TV3LanguageCompatibilityOptions) =>
@@ -175,10 +184,11 @@ function normalizeMetadata(
 
 const WELCOME_CARD_I18N_KEYS = ["headline", "subheader", "buttonLabel"] as const;
 const BLOCK_I18N_KEYS = ["buttonLabel", "backButtonLabel"] as const;
-const ENDING_I18N_KEYS = ["headline", "subheader", "buttonLabel"] as const;
+const ENDING_I18N_KEYS = ["headline", "subheader", "buttonLabel", "imageAltText"] as const;
 const ELEMENT_I18N_KEYS = [
   "headline",
   "subheader",
+  "imageAltText",
   "placeholder",
   "label",
   "otherOptionPlaceholder",
@@ -206,7 +216,7 @@ function normalizeChoice(
   defaultLanguage: string,
   options?: TV3LanguageNormalizationOptions
 ): unknown {
-  return normalizePublicI18nFields(value, defaultLanguage, ["label"], options);
+  return normalizePublicI18nFields(value, defaultLanguage, ["label", "imageAltText"], options);
 }
 
 function normalizeToggleInput(
@@ -379,6 +389,7 @@ function createV3SurveyDocumentNormalizer(options: {
 }
 
 const ROOT_KEYS = new Set([
+  "customCss",
   "workspaceId",
   "name",
   "type",
@@ -386,6 +397,8 @@ const ROOT_KEYS = new Set([
   "metadata",
   "defaultLanguage",
   "languages",
+  "showLanguageSwitch",
+  "autoSelectLanguage",
   "welcomeCard",
   "blocks",
   "endings",
@@ -395,10 +408,13 @@ const ROOT_KEYS = new Set([
   "targeting",
 ]);
 const PATCH_ROOT_KEYS = new Set([
+  "customCss",
   "name",
   "status",
   "metadata",
   "languages",
+  "showLanguageSwitch",
+  "autoSelectLanguage",
   "welcomeCard",
   "blocks",
   "endings",
@@ -452,6 +468,7 @@ const END_SCREEN_KEYS = new Set([
   "buttonLabel",
   "buttonLink",
   "imageUrl",
+  "imageAltText",
   "videoUrl",
   "hideDefaultIcon",
 ]);
@@ -463,6 +480,7 @@ const ELEMENT_BASE_KEYS = new Set([
   "headline",
   "subheader",
   "imageUrl",
+  "imageAltText",
   "videoUrl",
   "required",
   "isDraft",
@@ -591,7 +609,7 @@ function isElementTypeWithStrictKeys(type: string): type is ElementTypeWithStric
   return Object.hasOwn(ELEMENT_KEYS_BY_TYPE, type);
 }
 const LABEL_CHOICE_KEYS = new Set(["id", "label"]);
-const PICTURE_CHOICE_KEYS = new Set(["id", "imageUrl"]);
+const PICTURE_CHOICE_KEYS = new Set(["id", "imageUrl", "imageAltText"]);
 const TOGGLE_INPUT_KEYS = new Set(["show", "required", "placeholder"]);
 const CHAR_LIMIT_KEYS = new Set(["enabled", "min", "max"]);
 const VALIDATION_KEYS = new Set(["rules", "logic"]);
@@ -746,6 +764,7 @@ function validateChoice(
   addUnknownKeyIssues(value, allowedKeys, path, issues, choiceContext);
   if (isPlainObject(value)) {
     validateTranslatableField(value.label, `${path}.label`, issues, defaultLanguage, options);
+    validateTranslatableField(value.imageAltText, `${path}.imageAltText`, issues, defaultLanguage, options);
   }
 }
 
@@ -1091,7 +1110,55 @@ function addLanguageIssues(
 }
 
 const ZV3SurveyName = z.string().trim().min(1, "Survey name is required");
-const ZV3SurveyBlocks = ZSurveyBlocks.min(1, "At least one block is required");
+
+/**
+ * Ceilings on the top-level arrays of a survey document (ENG-1652, ENG-3384). Each sits far above any
+ * survey seen in production (the largest has 31 blocks) and is advertised as `maxItems` in the OpenAPI
+ * reference and in the MCP tool schemas. The arrays nested inside blocks — elements, choices, rows,
+ * logic — belong to the shared `@formbricks/types` schemas and are bounded by the route-level array
+ * budget (`@/app/api/v3/lib/array-budget`) rather than field by field.
+ */
+export const V3_SURVEY_MAX_BLOCKS = 1000;
+export const V3_SURVEY_MAX_ENDINGS = 100;
+export const V3_SURVEY_MAX_VARIABLES = 100;
+export const V3_SURVEY_MAX_LANGUAGES = 50;
+export const V3_SURVEY_MAX_HIDDEN_FIELDS = 200;
+export const V3_SURVEY_MAX_TRIGGERS = 50;
+
+/**
+ * A document array, capped for request input or plain for the stored document. Typed on the output
+ * alone so both variants slot into the same shape; the input side is `unknown` either way once the
+ * preprocess wraps it.
+ */
+function documentArray<TItem extends z.ZodType>(
+  item: TItem,
+  bounds: { min?: number; max: number; minMessage?: string },
+  bound: boolean
+): z.ZodType<z.output<TItem>[]> {
+  if (bound) {
+    return lengthBoundedArray(item, bounds);
+  }
+  return z.array(item).min(bounds.min ?? 0, bounds.minMessage ? { message: bounds.minMessage } : undefined);
+}
+
+const createZV3SurveyBlocks = (bound: boolean) =>
+  documentArray(
+    ZSurveyBlocks.element,
+    { min: 1, max: V3_SURVEY_MAX_BLOCKS, minMessage: "At least one block is required" },
+    bound
+  );
+const createZV3SurveyEndings = (bound: boolean) =>
+  documentArray(ZSurveyEndings.element, { max: V3_SURVEY_MAX_ENDINGS }, bound);
+const createZV3SurveyVariables = (bound: boolean) =>
+  documentArray(ZSurveyVariables.element, { max: V3_SURVEY_MAX_VARIABLES }, bound);
+const createZV3SurveyHiddenFields = (bound: boolean): z.ZodType<z.output<typeof ZSurveyHiddenFields>> =>
+  bound
+    ? ZSurveyHiddenFields.extend({
+        fieldIds: lengthBoundedArray(ZSurveyHiddenFields.shape.fieldIds.unwrap().element, {
+          max: V3_SURVEY_MAX_HIDDEN_FIELDS,
+        }).optional(),
+      })
+    : ZSurveyHiddenFields;
 
 // App-survey trigger references an existing workspace action class by id.
 // Existence/uniqueness is validated against workspace action classes at write time.
@@ -1102,18 +1169,26 @@ const ZV3SurveyTrigger = z.object({ actionClassId: z.cuid2() }).strict();
  * provided `distribution` object fully determines the runtime config (top-level replacement semantics).
  * Only honored when `type === "app"`; rejected for link surveys (see addAppDistributionIssues).
  */
-const ZV3SurveyDistribution = z
-  .object({
-    displayOption: ZSurveyDisplayOption.prefault("displayOnce"),
-    displayPercentage: z.number().min(0.01).max(100).nullable().prefault(null),
-    displayLimit: z.number().int().nonnegative().nullable().prefault(null),
-    recontactDays: z.number().int().nonnegative().nullable().prefault(null),
-    autoClose: z.number().int().nonnegative().nullable().prefault(null),
-    autoComplete: z.number().int().min(1, "Response limit must be greater than 0").nullable().prefault(null),
-    delay: z.number().int().nonnegative().prefault(0),
-    triggers: z.array(ZV3SurveyTrigger).prefault([]),
-  })
-  .strict();
+const createZV3SurveyDistribution = (bound: boolean) =>
+  z
+    .object({
+      displayOption: ZSurveyDisplayOption.prefault("displayOnce"),
+      displayPercentage: z.number().min(0.01).max(100).nullable().prefault(null),
+      displayLimit: z.number().int().nonnegative().nullable().prefault(null),
+      recontactDays: z.number().int().nonnegative().nullable().prefault(null),
+      autoClose: z.number().int().nonnegative().nullable().prefault(null),
+      autoComplete: z
+        .number()
+        .int()
+        .min(1, "Response limit must be greater than 0")
+        .nullable()
+        .prefault(null),
+      delay: z.number().int().nonnegative().prefault(0),
+      triggers: documentArray(ZV3SurveyTrigger, { max: V3_SURVEY_MAX_TRIGGERS }, bound).prefault([]),
+    })
+    .strict();
+
+const ZV3SurveyDistribution = createZV3SurveyDistribution(true);
 
 // App-survey contact targeting. `filters: []` means "show to everyone".
 const ZV3SurveyTargeting = z.object({ filters: ZSegmentFilters }).strict();
@@ -1171,20 +1246,42 @@ function addAppDistributionIssues(
   }
 }
 
-function createV3SurveyDocumentShape(options?: TV3LanguageCompatibilityOptions) {
+/**
+ * Survey custom CSS as an API caller writes it (ENG-3641): source only, both keys required, strict — a
+ * caller-supplied `compiled` or `processorVersion` is rejected, never trusted. `null` (or an empty
+ * string) for a field means no CSS for it; `customCss: null` clears both. Processed on every write by
+ * the shared custom CSS service, which also enforces the 20 000-byte survey budget.
+ */
+export const ZV3SurveyCustomCss = ZCustomCssInput.nullable().describe(
+  "Survey custom CSS source: `{ light, dark }`, both keys required, each a CSS string or null. Light applies in both appearances, dark adds overrides. null clears both. Source only — compiled output is computed by the server."
+);
+
+// Multi-language respondent settings. Nullable to mirror the Survey columns: `null` and `false` both
+// mean "off". On PATCH, omitting a key keeps the stored value and `null` clears it.
+const ZV3SurveyLanguageSetting = z.boolean().nullable();
+
+/** `bound: false` is for the stored document only — see `TV3SurveyDocumentSchemaOptions.boundArrays`. */
+function createV3SurveyDocumentShape(options?: TV3LanguageCompatibilityOptions, bound = true) {
   return {
     name: ZV3SurveyName,
     status: ZSurveyStatus.prefault("draft"),
     metadata: ZSurveyMetadata.prefault({}),
     defaultLanguage: createZV3SurveyLanguageTag(options).prefault(DEFAULT_V3_SURVEY_LANGUAGE),
-    languages: z.array(createZV3SurveyLanguageInput(options)).prefault([]),
+    languages: documentArray(
+      createZV3SurveyLanguageInput(options),
+      { max: V3_SURVEY_MAX_LANGUAGES },
+      bound
+    ).prefault([]),
+    showLanguageSwitch: ZV3SurveyLanguageSetting.prefault(null),
+    autoSelectLanguage: ZV3SurveyLanguageSetting.prefault(null),
     welcomeCard: ZSurveyWelcomeCard.prefault({ enabled: false }),
-    blocks: ZV3SurveyBlocks,
-    endings: ZSurveyEndings.prefault([]),
-    hiddenFields: ZSurveyHiddenFields.prefault({ enabled: false }),
-    variables: ZSurveyVariables.prefault([]),
-    distribution: ZV3SurveyDistribution.optional(),
+    blocks: createZV3SurveyBlocks(bound),
+    endings: createZV3SurveyEndings(bound).prefault([]),
+    hiddenFields: createZV3SurveyHiddenFields(bound).prefault({ enabled: false }),
+    variables: createZV3SurveyVariables(bound).prefault([]),
+    distribution: createZV3SurveyDistribution(bound).optional(),
     targeting: ZV3SurveyTargeting.optional(),
+    customCss: ZV3SurveyCustomCss.optional(),
   };
 }
 
@@ -1193,14 +1290,20 @@ function createV3SurveyPatchShape(options?: TV3LanguageCompatibilityOptions) {
     name: ZV3SurveyName.optional(),
     status: ZSurveyStatus.optional(),
     metadata: ZSurveyMetadata.optional(),
-    languages: z.array(createZV3SurveyLanguageInput(options)).optional(),
+    languages: lengthBoundedArray(createZV3SurveyLanguageInput(options), {
+      max: V3_SURVEY_MAX_LANGUAGES,
+    }).optional(),
+    showLanguageSwitch: ZV3SurveyLanguageSetting.optional(),
+    autoSelectLanguage: ZV3SurveyLanguageSetting.optional(),
     welcomeCard: ZSurveyWelcomeCard.optional(),
-    blocks: ZV3SurveyBlocks.optional(),
-    endings: ZSurveyEndings.optional(),
-    hiddenFields: ZSurveyHiddenFields.optional(),
-    variables: ZSurveyVariables.optional(),
+    blocks: createZV3SurveyBlocks(true).optional(),
+    endings: createZV3SurveyEndings(true).optional(),
+    hiddenFields: createZV3SurveyHiddenFields(true).optional(),
+    variables: createZV3SurveyVariables(true).optional(),
     distribution: ZV3SurveyDistribution.optional(),
     targeting: ZV3SurveyTargeting.optional(),
+    // Omitted: unchanged. `null`: clear both fields. An object: replaces both fields.
+    customCss: ZV3SurveyCustomCss.optional(),
   };
 }
 
@@ -1214,7 +1317,10 @@ export function createZV3SurveyDocumentBaseSchema(options?: TV3SurveyDocumentSch
       applyDefaultLanguage: true,
       allowedLanguageCodes: options?.allowedLanguageCodes,
     }),
-    z.object(createV3SurveyDocumentShape(options)).strict().superRefine(addLanguageIssues)
+    z
+      .object(createV3SurveyDocumentShape(options, options?.boundArrays ?? true))
+      .strict()
+      .superRefine(addLanguageIssues)
   );
 }
 
@@ -1242,8 +1348,17 @@ export const ZV3CreateSurveyBody = z
   })
   .pipe(ZV3CreateSurveyBodyBase);
 
+/**
+ * Where a created survey came from, for the `survey_created` analytics event and, through the request
+ * URL the audit log keeps as `apiUrl`, the audit trail. One list so the query schema, the operation and
+ * the clients cannot drift: each used to spell the union out by hand.
+ */
+export const V3_SURVEY_CREATED_FROM = ["blank", "template", "xm-template", "ai", "import"] as const;
+
+export type TV3SurveyCreatedFrom = (typeof V3_SURVEY_CREATED_FROM)[number];
+
 export const ZV3CreateSurveyQuery = z.object({
-  createdFrom: z.enum(["blank", "template", "xm-template", "ai"]).optional(),
+  createdFrom: z.enum(V3_SURVEY_CREATED_FROM).optional(),
 });
 
 export type TV3CreateSurveyQuery = z.infer<typeof ZV3CreateSurveyQuery>;
@@ -1292,6 +1407,112 @@ export function createZV3PatchSurveyBodySchema(
 
 export const ZV3PatchSurveyBody = createZV3PatchSurveyBodySchema();
 
+/**
+ * Block-level edit and reorder bodies (ENG-3069), shared by the REST routes and the MCP tools so
+ * both surfaces reject the same payloads with the same messages.
+ *
+ * Two deliberate shape choices:
+ *
+ * - A tagged op list, not `{update:[], insert:[], remove:[]}` buckets. Ops apply in order against a
+ *   working copy, so an `insert … after` may name a block an earlier op inserted; buckets cannot
+ *   express that ordering. Slack, Linear and the Artifact DB all use this shape.
+ * - References to *existing* blocks are plain non-empty strings, not `z.cuid2()`. A reference is
+ *   resolved against the survey's stored ids and a miss is a semantic 422 `dangling_reference`;
+ *   rejecting it at the schema as a 400 format error would tell the caller the wrong thing. Only
+ *   *new* block ids need to be cuid2, and `ZSurveyBlockId` enforces that downstream.
+ */
+export const V3_SURVEY_BLOCK_OPS_MAX = 100;
+
+// Bounded per the ENG-1652 policy: a reference is echoed back in `invalid_params[].reason` when it
+// does not resolve, so an unbounded id would let a caller inflate the error body. cuid2 is 24-32
+// chars; 128 is generous for any legitimate id.
+const ZV3BlockRef = z.string().trim().min(1).max(128);
+
+const ZV3SurveyBlockPayload = z
+  .record(z.string(), z.unknown())
+  .describe("Full block in the v3 survey document shape. Replaces the target block entirely.");
+
+export const ZV3SurveyBlockInsertPosition = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("start").describe("Insert before every existing block.") }),
+  z.strictObject({ type: z.literal("end").describe("Insert after every existing block.") }),
+  z.strictObject({
+    type: z.literal("after").describe("Insert directly after an existing block."),
+    blockId: ZV3BlockRef.describe(
+      "Block to insert after. May be a block inserted by an earlier op in the same request."
+    ),
+  }),
+]);
+
+export const ZV3SurveyBlockOp = z.discriminatedUnion("op", [
+  z.strictObject({
+    op: z.literal("update").describe("Replace an existing block."),
+    id: ZV3BlockRef.describe("Block to replace."),
+    block: ZV3SurveyBlockPayload,
+  }),
+  z.strictObject({
+    op: z.literal("insert").describe("Add a new block."),
+    block: ZV3SurveyBlockPayload,
+    position: ZV3SurveyBlockInsertPosition.describe("Where the new block goes."),
+  }),
+  z.strictObject({
+    op: z.literal("remove").describe("Delete an existing block and every element in it."),
+    id: ZV3BlockRef.describe("Block to delete."),
+  }),
+]);
+
+export const ZV3ExpectedUpdatedAt = z.iso
+  .datetime({ offset: true })
+  .describe(
+    "Optimistic-concurrency precondition: the survey's `updatedAt` from your last read. The write is rejected with 409 if the survey changed since."
+  );
+
+export const ZV3EditSurveyBlocksBody = z.strictObject({
+  ops: lengthBoundedArray(ZV3SurveyBlockOp, {
+    min: 1,
+    max: V3_SURVEY_BLOCK_OPS_MAX,
+    description: "Operations applied in order, atomically — all of them or none.",
+  }),
+  expectedUpdatedAt: ZV3ExpectedUpdatedAt.optional(),
+});
+
+/**
+ * Ceiling on a block order, defence in depth behind `reorderSurveyBlocks`'s bounded diagnostics.
+ *
+ * Not a batch size like `V3_SURVEY_BLOCK_OPS_MAX` — a valid order lists every block exactly once, so
+ * the real bound is blocks-per-survey, which is `V3_SURVEY_MAX_BLOCKS`. Set generously (the largest
+ * survey seen is 31 blocks) so no legitimate reorder is refused, while still keeping a 2 MB body from
+ * turning into ~419k entries. ENG-1652's policy applied to the input, as `ops` already does.
+ */
+export const V3_SURVEY_BLOCK_ORDER_MAX = V3_SURVEY_MAX_BLOCKS;
+
+export const ZV3SetSurveyBlockOrderBody = z.strictObject({
+  order: lengthBoundedArray(ZV3BlockRef, {
+    min: 1,
+    max: V3_SURVEY_BLOCK_ORDER_MAX,
+    description: "Every current block id, exactly once, in the desired order.",
+  }),
+  expectedUpdatedAt: ZV3ExpectedUpdatedAt.optional(),
+});
+
+/**
+ * The CSS-only validation variant (ENG-3641), used by the editor's live check and `validate_survey`.
+ * `surveyId`, when given, names an existing survey that must belong to `workspaceId`; survey scope
+ * without one validates an unsaved draft. Read-only: it processes and reports, it never saves.
+ */
+export const ZV3SurveyCustomCssValidationRequest = z
+  .object({
+    operation: z.literal("customCss"),
+    workspaceId: z.cuid2(),
+    scope: ZCustomCssScope,
+    surveyId: z.cuid2().optional(),
+    data: z.object({ customCss: ZV3SurveyCustomCss }).strict(),
+  })
+  .strict()
+  .refine((body) => body.scope === "survey" || body.surveyId === undefined, {
+    message: "surveyId is only valid with scope 'survey'",
+    path: ["surveyId"],
+  });
+
 export const ZV3SurveyValidationRequestBody = z.discriminatedUnion("operation", [
   z
     .object({
@@ -1306,9 +1527,8 @@ export const ZV3SurveyValidationRequestBody = z.discriminatedUnion("operation", 
       data: z.unknown(),
     })
     .strict(),
+  ZV3SurveyCustomCssValidationRequest,
 ]);
-
-export const ZV3EmptyQuery = z.object({}).strict();
 
 /**
  * `-fLang-` is an editor-only delimiter: the shared label validators embed it in the issue message so
@@ -1337,23 +1557,41 @@ function toV3InvalidParamReason(message: string): string {
     .join(" ");
 }
 
+/** Bounded like `formatZodIssues` in the wrapper: the issue list is as long as the caller made it. */
 export function formatV3ZodInvalidParams(error: z.ZodError, fallbackName: string): InvalidParam[] {
-  return error.issues.map((issue) => {
-    const params = "params" in issue && isPlainObject(issue.params) ? issue.params : {};
-    const code = isInvalidParamCode(params.code) ? params.code : undefined;
+  const invalidParams = new BoundedInvalidParams();
 
-    return {
-      name: issue.path.length > 0 ? issue.path.join(".") : fallbackName,
-      reason: toV3InvalidParamReason(issue.message),
-      ...(code ? { code } : {}),
-    };
-  });
+  for (const issue of error.issues) {
+    invalidParams.push(() => {
+      const params = "params" in issue && isPlainObject(issue.params) ? issue.params : {};
+      const code = isInvalidParamCode(params.code) ? params.code : undefined;
+
+      return {
+        name: issue.path.length > 0 ? issue.path.join(".") : fallbackName,
+        reason: toV3InvalidParamReason(issue.message),
+        ...(code ? { code } : {}),
+      };
+    });
+  }
+
+  return invalidParams.report(fallbackName, "request");
 }
 
+export type TV3SurveyBlockOp = z.infer<typeof ZV3SurveyBlockOp>;
+export type TV3SurveyBlockInsertPosition = z.infer<typeof ZV3SurveyBlockInsertPosition>;
+export type TV3EditSurveyBlocksBody = z.infer<typeof ZV3EditSurveyBlocksBody>;
+export type TV3SetSurveyBlockOrderBody = z.infer<typeof ZV3SetSurveyBlockOrderBody>;
 export type TV3SurveyDocument = z.infer<typeof ZV3SurveyDocumentBase>;
 export type TV3CreateSurveyBody = z.infer<typeof ZV3CreateSurveyBody>;
+/**
+ * What a client sends to `POST /api/v3/surveys`: the schema's input, before parsing fills defaults and
+ * maps the default language to the internal `default` translation key. Not interchangeable with
+ * `TV3CreateSurveyBody`, the parsed result — a parsed body sent back is refused for that key.
+ */
+export type TV3CreateSurveyRequestBody = z.input<typeof ZV3CreateSurveyBody>;
 export type TV3PatchSurveyBody = z.infer<typeof ZV3PatchSurveyBody>;
 export type TV3SurveyValidationRequestBody = z.infer<typeof ZV3SurveyValidationRequestBody>;
+export type TV3SurveyCustomCssValidationRequest = z.infer<typeof ZV3SurveyCustomCssValidationRequest>;
 export type TV3SurveyDistribution = z.infer<typeof ZV3SurveyDistribution>;
 export type TV3SurveyTargeting = z.infer<typeof ZV3SurveyTargeting>;
 export type TV3SurveyTrigger = z.infer<typeof ZV3SurveyTrigger>;

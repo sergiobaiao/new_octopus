@@ -1,4 +1,5 @@
 import { type Locator, type Page, expect } from "@playwright/test";
+import { prisma } from "@formbricks/database";
 import { surveys } from "@/playwright/utils/mock";
 import { test } from "./lib/fixtures";
 import * as helper from "./utils/helper";
@@ -14,10 +15,11 @@ test.beforeEach(async ({ page }) => {
   await helper.mockStorageUploads(page);
 });
 
-// The rendered alt is the human-readable form of the file name (decoded, no
-// extension or separator noise) — see getImageAltFromUrl in @formbricks/surveys.
-const firstPictureChoiceAlt = "logo transparent";
-const secondPictureChoiceAlt = "android chrome 192x192";
+// Picture choices are named by position, never by file name (a file name can carry personal data).
+const firstPictureChoiceAlt = "Option 1";
+const secondPictureChoiceAlt = "Option 2";
+// ...unless the creator gave the image alt text (ENG-3417); createAndSubmit sets it on the first choice only.
+const creatorPictureChoiceAlt = surveys.createAndSubmit.pictureSelectQuestion.firstChoiceAltText;
 
 const selectPictureChoice = async (pictureSelectQuestion: Locator, choiceAlt: string) => {
   const choiceImage = pictureSelectQuestion.getByRole("img", { name: choiceAlt });
@@ -187,9 +189,9 @@ test.describe("Survey Create & Submit Response without logic", async () => {
       const pictureSelectQuestion = page.locator("#questionCard-7");
       await expect(pictureSelectQuestion.getByRole("button", { name: "Next" })).toBeVisible();
       await expect(pictureSelectQuestion.getByRole("button", { name: "Back" })).toBeVisible();
-      await expect(pictureSelectQuestion.getByRole("img", { name: firstPictureChoiceAlt })).toBeVisible();
+      await expect(pictureSelectQuestion.getByRole("img", { name: creatorPictureChoiceAlt })).toBeVisible();
       await expect(pictureSelectQuestion.getByRole("img", { name: secondPictureChoiceAlt })).toBeVisible();
-      await selectPictureChoice(pictureSelectQuestion, firstPictureChoiceAlt);
+      await selectPictureChoice(pictureSelectQuestion, creatorPictureChoiceAlt);
       await pictureSelectQuestion.getByRole("button", { name: "Next" }).click();
 
       // File Upload Question
@@ -204,7 +206,7 @@ test.describe("Survey Create & Submit Response without logic", async () => {
         buffer: Buffer.from("this is test"),
       });
 
-      await page.getByText("Uploading...").waitFor({ state: "hidden" });
+      await page.getByText("Uploading…").waitFor({ state: "hidden" });
       await page.locator("#questionCard-8").getByRole("button", { name: "Next" }).click();
 
       // Matrix Question
@@ -259,6 +261,12 @@ test.describe("Survey Create & Submit Response without logic", async () => {
       for (let i = 0; i < surveys.createAndSubmit.ranking.choices.length; i++) {
         await page.getByText(surveys.createAndSubmit.ranking.choices[i]).click();
       }
+      // Ranking "Other" opens a required free-text box inside it
+      await page.getByRole("button", { name: "Add Other to ranking" }).click();
+      const rankingOtherInput = page.getByRole("textbox", { name: "Other" });
+      await page.locator("#questionCard-12").getByRole("button", { name: "Finish" }).click();
+      await expect(rankingOtherInput).toHaveAttribute("aria-invalid", "true");
+      await rankingOtherInput.fill(surveys.createAndSubmit.ranking.otherText);
       await page.locator("#questionCard-12").getByRole("button", { name: "Finish" }).click();
       // loading spinner -> wait for it to disappear
       await page.getByTestId("loading-spinner").waitFor({ state: "hidden" });
@@ -270,7 +278,7 @@ test.describe("Multi Language Survey Create", async () => {
   // 5 minutes
   test.setTimeout(1000 * 60 * 5);
 
-  test("Create Survey", async ({ page, users }) => {
+  test("Create Survey", async ({ browser, page, users }) => {
     const user = await users.create();
     await user.login();
 
@@ -661,6 +669,36 @@ test.describe("Multi Language Survey Create", async () => {
     await page.getByLabel("Copy survey link to clipboard").click();
     const germanSurveyUrl = await page.evaluate("navigator.clipboard.readText()");
     expect(germanSurveyUrl).toContain("lang=de");
+
+    await test.step("Browser language picks the survey language when no ?lang= is given", async () => {
+      const surveyUrl = new URL(germanSurveyUrl as string);
+      surveyUrl.search = "";
+      const surveyId = surveyUrl.pathname.split("/").pop()!;
+      const welcomeCard = (respondent: Page) => respondent.locator("#questionCard--1");
+
+      await prisma.survey.update({ where: { id: surveyId }, data: { autoSelectLanguage: true } });
+      // The runner's default `locale` ("en-US") overrides an Accept-Language in extraHTTPHeaders, so
+      // clear it for the header to reach the server as written.
+      const germanBrowser = await browser.newContext({
+        locale: undefined,
+        extraHTTPHeaders: { "Accept-Language": "de-DE,de;q=0.9,en;q=0.8" },
+      });
+      try {
+        const respondent = await germanBrowser.newPage();
+        await respondent.goto(surveyUrl.toString());
+        await expect(
+          welcomeCard(respondent).getByText(surveys.germanCreate.welcomeCard.headline)
+        ).toBeVisible();
+
+        // With the setting off, the same German browser gets the default (English) language —
+        // this survey keeps the template's English welcome headline.
+        await prisma.survey.update({ where: { id: surveyId }, data: { autoSelectLanguage: false } });
+        await respondent.reload();
+        await expect(welcomeCard(respondent).getByText("Welcome!", { exact: true })).toBeVisible();
+      } finally {
+        await germanBrowser.close();
+      }
+    });
   });
 });
 
@@ -904,7 +942,7 @@ test.describe("Testing Survey with advanced logic", async () => {
         mimeType: "application/msword",
         buffer: Buffer.from("this is test"),
       });
-      await page.getByText("Uploading...").waitFor({ state: "hidden" });
+      await page.getByText("Uploading…").waitFor({ state: "hidden" });
       await page.locator("#questionCard-10").getByRole("button", { name: "Next" }).click();
 
       // Date Question

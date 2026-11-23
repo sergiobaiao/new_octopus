@@ -1,5 +1,6 @@
 import type {
   FeedbackRecordData,
+  FeedbackRecordTaxonomy,
   SemanticSearchResultItem,
   SimilarRecordsResultItem,
 } from "@/modules/hub/types";
@@ -38,13 +39,13 @@ export type TV3FeedbackRecord = {
   value_number?: number;
   value_boolean?: boolean;
   value_date?: string;
-  value_id?: string | null;
+  value_id?: string;
   metadata?: Record<string, unknown>;
   sentiment?: string;
   sentiment_score?: number;
-  emotions?: string[] | string | null;
-  translation_lang_key?: string | null;
-  value_text_translated?: string | null;
+  emotions?: FeedbackRecordData["emotions"];
+  translation_lang_key?: string;
+  value_text_translated?: string;
   collected_at?: string;
   created_at?: string;
   updated_at?: string;
@@ -97,6 +98,25 @@ export const serializeV3FeedbackRecord = (record: FeedbackRecordData): TV3Feedba
   }
   return dto;
 };
+
+/** Only the get-one-record response carries the current taxonomy projection. */
+export type TV3FeedbackRecordDetail = TV3FeedbackRecord & { taxonomy: FeedbackRecordTaxonomy | null };
+
+export const serializeV3FeedbackRecordDetail = (record: FeedbackRecordData): TV3FeedbackRecordDetail => ({
+  ...serializeV3FeedbackRecord(record),
+  taxonomy: record.taxonomy
+    ? {
+        status: record.taxonomy.status,
+        run_id: record.taxonomy.run_id,
+        path: record.taxonomy.path.map(({ id, label, level, node_type }) => ({
+          id,
+          label,
+          level,
+          node_type,
+        })),
+      }
+    : null,
+});
 
 /**
  * One scored match from a similarity search. The Hub returns an identical row shape for text search and

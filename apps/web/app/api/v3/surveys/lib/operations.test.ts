@@ -1,15 +1,26 @@
-import { beforeEach, describe, expect, test, vi } from "vitest";
-import { DatabaseError, ResourceNotFoundError, ValidationError } from "@formbricks/types/errors";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  DatabaseError,
+  ResourceNotFoundError,
+  TooManyRequestsError,
+  ValidationError,
+} from "@formbricks/types/errors";
 import { requireV3WorkspaceAccess } from "@/app/api/v3/lib/auth";
+import { V3CustomCssInvalidError, V3CustomCssPlanRequiredError } from "@/app/api/v3/lib/custom-css";
 import { problemForbidden } from "@/app/api/v3/lib/response";
+import { recordSurveyListPredicateMismatch } from "@/lib/authorization/metrics";
+import { filterReadableSurveyIds } from "@/lib/authorization/resource-list";
 import { capturePostHogEvent } from "@/lib/posthog";
+import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
+import { previewCustomCss } from "@/modules/custom-css/lib/service";
 import { archiveSurvey, deleteSurvey, restoreSurvey } from "@/modules/survey/lib/surveys";
 import { getSurveyCount, getWorkspaceSurveyCount } from "@/modules/survey/list/lib/survey";
 import { getSurveyListPage } from "@/modules/survey/list/lib/survey-page";
 import { getAuthorizedV3Survey } from "../authorization";
 import { V3SurveyCreatePermissionError, V3SurveyInputValidationError, createV3Survey } from "../create";
 import { parseV3SurveysListQuery } from "../parse-v3-surveys-list-query";
-import { patchV3Survey } from "../patch";
+import { V3SurveyStaleError, V3SurveyStoredDocumentError, patchV3Survey } from "../patch";
 import { prepareV3SurveyCreateInput, prepareV3SurveyPatchInput } from "../prepare";
 import { V3SurveyReferenceValidationError } from "../reference-validation";
 import { ZV3CreateSurveyBody } from "../schemas";
@@ -25,10 +36,12 @@ import {
   createV3SurveyResponse,
   createV3SurveyResponseFromRawInput,
   deleteV3Survey,
+  editV3SurveyBlocksResponse,
   getV3Survey,
   listV3Surveys,
   patchV3SurveyResponse,
   restoreV3Survey,
+  setV3SurveyBlockOrderResponse,
   validateV3Survey,
   validateV3SurveyFromRawInput,
 } from "./operations";
@@ -36,6 +49,7 @@ import {
 vi.mock("@formbricks/logger", () => ({
   logger: {
     withContext: vi.fn(() => ({
+      info: vi.fn(),
       warn: vi.fn(),
       error: vi.fn(),
     })),
@@ -43,8 +57,22 @@ vi.mock("@formbricks/logger", () => ({
 }));
 
 vi.mock("@/app/api/v3/lib/auth", () => ({
+  // Plain, like the visibility context below: survives the suites' `vi.resetAllMocks()`.
+  getV3AuthorizationActor: (authentication: { apiKeyId?: string; user?: { id: string } } | null) =>
+    authentication?.user ? { type: "user", id: authentication.user.id } : { type: "apiKey", id: "api_key_1" },
   requireV3WorkspaceAccess: vi.fn(),
 }));
+
+vi.mock("@/lib/authorization/resource-list", () => ({ filterReadableSurveyIds: vi.fn() }));
+
+// ENG-3641: the dry-run half of the custom CSS service; the save rules have their own suite.
+vi.mock("@/modules/custom-css/lib/service", () => ({
+  previewCustomCss: vi.fn(),
+  resolveCustomCssWrite: vi.fn(),
+  invalidateCustomCssCaches: vi.fn(),
+}));
+vi.mock("@/lib/authorization/metrics", () => ({ recordSurveyListPredicateMismatch: vi.fn() }));
+vi.mock("@/modules/core/rate-limit/helpers", () => ({ applyRateLimit: vi.fn() }));
 
 vi.mock("@/lib/posthog", () => ({
   capturePostHogEvent: vi.fn(),
@@ -89,13 +117,70 @@ vi.mock("../parse-v3-surveys-list-query", () => ({
   parseV3SurveysListQuery: vi.fn(),
 }));
 
-vi.mock("../patch", () => ({
-  patchV3Survey: vi.fn(),
-}));
+vi.mock("../patch", () => {
+  // Real class, not a vi.fn: operations.ts branches on `instanceof` to map the 409.
+  class V3SurveyStaleError extends Error {
+    constructor(
+      readonly expectedUpdatedAt: Date,
+      readonly currentUpdatedAt: Date,
+      readonly detectedAt: "read" | "write"
+    ) {
+      super("Survey was modified since it was last read");
+      this.name = "V3SurveyStaleError";
+    }
+  }
+
+  return {
+    patchV3Survey: vi.fn(),
+    V3SurveyStoredDocumentError: class V3SurveyStoredDocumentError extends Error {
+      constructor(readonly invalidParams: unknown[]) {
+        super("Stored survey does not satisfy the v3 survey document contract");
+        this.name = "V3SurveyStoredDocumentError";
+      }
+    },
+    V3SurveyArchivedError: class V3SurveyArchivedError extends Error {
+      constructor() {
+        super("Survey is archived");
+        this.name = "V3SurveyArchivedError";
+      }
+    },
+    V3SurveyStaleError,
+    // Real behaviour, not a stub: the no-write path depends on this to reject a stale caller, so a
+    // no-op mock here would let that regression back in without failing a test.
+    assertV3SurveyPrecondition: (
+      currentSurvey: { updatedAt: Date },
+      precondition?: { expectedUpdatedAt: Date }
+    ): void => {
+      if (precondition && currentSurvey.updatedAt.getTime() !== precondition.expectedUpdatedAt.getTime()) {
+        throw new V3SurveyStaleError(precondition.expectedUpdatedAt, currentSurvey.updatedAt, "read");
+      }
+    },
+  };
+});
 
 vi.mock("../prepare", () => ({
   prepareV3SurveyCreateInput: vi.fn(),
   prepareV3SurveyPatchInput: vi.fn(),
+}));
+
+// ENG-3282: what the visibility context resolves to in these tests (marker off, an API key). Plain
+// functions rather than `vi.fn()`s, so the suites' `vi.resetAllMocks()` cannot clear them.
+const { RESOURCE_VISIBILITY, VISIBILITY_CONTEXT, visibilityOverride } = vi.hoisted(() => {
+  const context = {
+    actorContext: { enforced: false, kind: "apiKey" },
+    gates: { entitled: false, ready: false },
+  } as const;
+  return {
+    RESOURCE_VISIBILITY: { ...context, ownerName: null } as const,
+    VISIBILITY_CONTEXT: context,
+    // A test that needs enforcement on sets this and clears it again.
+    visibilityOverride: { context: null as unknown },
+  };
+});
+
+vi.mock("../visibility-context", () => ({
+  resolveV3SurveyResourceVisibility: async () => RESOURCE_VISIBILITY,
+  resolveV3SurveyVisibilityContext: async () => visibilityOverride.context ?? VISIBILITY_CONTEXT,
 }));
 
 vi.mock("../serializers", async () => {
@@ -123,7 +208,11 @@ const survey = {
   name: "Customer Survey",
   status: "draft",
   type: "link",
-  questions: [{ id: "question_1" }],
+  // Every stored survey carries one, and the precondition check reads it on both the write and the
+  // no-write path, so a fixture without it hides a 409 behind a TypeError.
+  updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+  // A v3-editable survey has no legacy questions; serializeV3SurveyResource rejects one that does.
+  questions: [],
 };
 const serializedSurvey = {
   id: "survey_1",
@@ -166,6 +255,7 @@ function mockListQuery(overrides: Record<string, unknown> = {}) {
     cursor: null,
     sortBy: undefined,
     filterCriteria: {},
+    visibilityFilter: {},
     includeTotalCount: true,
     ...overrides,
   } as any);
@@ -207,6 +297,8 @@ describe("listV3Surveys", () => {
       cursor: null,
       sortBy: undefined,
       filterCriteria: {},
+      actorContext: VISIBILITY_CONTEXT.actorContext,
+      visibilityFilter: {},
     });
     expect(await readJson(response)).toEqual({
       data: [serializedSurvey],
@@ -350,7 +442,7 @@ describe("createV3SurveyResponse", () => {
       authentication,
       requestId,
       "org_1",
-      undefined
+      { report: {} }
     );
     expect(capturePostHogEvent).not.toHaveBeenCalled();
     expect(auditLog).toMatchObject({
@@ -361,30 +453,36 @@ describe("createV3SurveyResponse", () => {
     expect(await readJson(response)).toEqual({ data: serializedSurvey });
   });
 
-  test("captures survey_created for session-authenticated product template creates", async () => {
-    const response = await createV3SurveyResponse({
-      body: createBody,
-      authentication: sessionAuthentication,
-      requestId,
-      instance,
-      createdFrom: "template",
-    });
+  test.each(["template", "import"] as const)(
+    "captures survey_created with created_from %s",
+    async (createdFrom) => {
+      const response = await createV3SurveyResponse({
+        body: createBody,
+        authentication: sessionAuthentication,
+        requestId,
+        instance,
+        createdFrom,
+      });
 
-    expect(response.status).toBe(201);
-    expect(capturePostHogEvent).toHaveBeenCalledWith(
-      "user_1",
-      "survey_created",
-      {
-        survey_id: "survey_1",
-        survey_type: "link",
-        organization_id: "org_1",
-        workspace_id: workspaceId,
-        question_count: 1,
-        created_from: "template",
-      },
-      { organizationId: "org_1", workspaceId }
-    );
-  });
+      expect(response.status).toBe(201);
+      expect(capturePostHogEvent).toHaveBeenCalledWith(
+        "user_1",
+        "survey_created",
+        {
+          survey_id: "survey_1",
+          survey_type: "link",
+          organization_id: "org_1",
+          workspace_id: workspaceId,
+          // 0, not 1: a v3 survey has blocks, never legacy questions. The old fixture carried a
+          // legacy shape, which is why this used to read 1. See review-followups.md — the
+          // question_count property itself is always 0 for v3 creates.
+          question_count: 0,
+          created_from: createdFrom,
+        },
+        { organizationId: "org_1", workspaceId }
+      );
+    }
+  );
 
   test("returns authorization responses from workspace access", async () => {
     vi.mocked(requireV3WorkspaceAccess).mockResolvedValue(problemForbidden(requestId, "nope", instance));
@@ -484,6 +582,20 @@ describe("createV3SurveyResponse", () => {
     ).toBe(500);
   });
 
+  test("answers a spent custom CSS budget on create with 429 and its Retry-After", async () => {
+    vi.mocked(createV3Survey).mockRejectedValueOnce(new TooManyRequestsError("Slow down", 30));
+
+    const response = await createV3SurveyResponse({
+      body: parsedCreateBody,
+      authentication,
+      requestId,
+      instance,
+    });
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("30");
+  });
+
   // ENG-2587. The document passes `ZV3CreateSurveyBody` but fails the survey service's stricter
   // write schema; `executeV3SurveyCreate` catches that with a pre-write parse and throws this typed
   // error. Before the fix there was no branch for it and it landed on the generic 500.
@@ -530,7 +642,12 @@ describe("createV3SurveyResponse", () => {
 describe("getV3Survey", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({ survey, authResult, response: null } as any);
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as any);
     vi.mocked(serializeV3SurveyResource).mockReturnValue(serializedSurvey as any);
   });
 
@@ -551,7 +668,9 @@ describe("getV3Survey", () => {
       requestId,
       instance,
     });
-    expect(vi.mocked(serializeV3SurveyResource)).toHaveBeenCalledWith(survey, { lang: ["en-US"] });
+    expect(vi.mocked(serializeV3SurveyResource)).toHaveBeenCalledWith(survey, RESOURCE_VISIBILITY, {
+      lang: ["en-US"],
+    });
     expect(await readJson(response)).toEqual({ data: serializedSurvey });
   });
 
@@ -618,7 +737,12 @@ describe("getV3Survey", () => {
 describe("deleteV3Survey", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({ survey, authResult, response: null } as any);
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as any);
     vi.mocked(deleteSurvey).mockResolvedValue(survey as any);
   });
 
@@ -691,13 +815,42 @@ describe("patchV3SurveyResponse", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     // Not archived by default (survey fixture has no archivedAt) so the read-only guard lets patches through.
-    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({ survey, authResult, response: null } as any);
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as any);
     vi.mocked(patchV3Survey).mockResolvedValue(updatedSurvey as any);
     vi.mocked(serializeV3SurveyResource).mockImplementation((input) => {
       return (input as any).name === "Updated Survey"
         ? (serializedUpdatedSurvey as any)
         : (serializedSurvey as any);
     });
+  });
+
+  test("reports a stored survey that fails the v3 contract as a state error, not a client error", async () => {
+    // ENG-3070: the caller sent { name }, so invalid_params naming blocks.* is about the stored
+    // survey. A distinct code says so rather than looking like a malformed request.
+    vi.mocked(patchV3Survey).mockRejectedValue(
+      new V3SurveyStoredDocumentError([
+        { name: "blocks.0.elements.0.headline", reason: "missing translation" },
+      ])
+    );
+
+    const response = await patchV3SurveyResponse({
+      surveyId: "survey_1",
+      body: { name: "Renamed" },
+      authentication,
+      requestId,
+      instance,
+    });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.code).toBe("stored_survey_invalid");
+    expect(body.detail).toMatch(/into the stored survey/);
+    expect(body.invalid_params).toEqual([expect.objectContaining({ name: "blocks.0.elements.0.headline" })]);
   });
 
   test("patches an authorized survey, serializes it, and enriches the audit log", async () => {
@@ -721,7 +874,21 @@ describe("patchV3SurveyResponse", () => {
       requestId,
       instance,
     });
-    expect(vi.mocked(patchV3Survey)).toHaveBeenCalledWith(survey, patchBody, requestId, "org_1");
+    // No `updatedAt` in the body → no precondition, last-write-wins as documented.
+    expect(vi.mocked(patchV3Survey)).toHaveBeenCalledWith(
+      survey,
+      patchBody,
+      requestId,
+      "org_1",
+      undefined,
+      serializedSurvey,
+      // ENG-3282: the caller's visible-survey clause, for targeting references.
+      expect.any(Object),
+      // ENG-3641: the write report the custom CSS warnings come back through.
+      {},
+      // The custom CSS budget's principal: this fixture's authentication names no user or key.
+      null
+    );
     expect(auditLog).toMatchObject({
       organizationId: "org_1",
       targetId: "survey_1",
@@ -748,6 +915,60 @@ describe("patchV3SurveyResponse", () => {
 
     expect(response.status).toBe(403);
     expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("evaluates a round-tripped updatedAt before the body is validated", async () => {
+    // A stale echo must answer 409 re-read-and-retry, not a 422 blaming the request for blocks that no
+    // longer fit a survey that moved on. So the pipeline reads it off the body itself, ahead of prepare.
+    const response = await patchV3SurveyResponse({
+      surveyId: "survey_1",
+      body: { name: "Stale", updatedAt: "2020-01-01T00:00:00.000Z" },
+      authentication,
+      requestId,
+      instance,
+    });
+
+    expect(response.status).toBe(409);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("forwards a matching round-tripped updatedAt as the write precondition", async () => {
+    const body = { name: "Fresh", updatedAt: "2026-01-01T00:00:00.000Z" };
+
+    await patchV3SurveyResponse({ surveyId: "survey_1", body, authentication, requestId, instance });
+
+    expect(vi.mocked(patchV3Survey)).toHaveBeenCalledWith(
+      survey,
+      body,
+      requestId,
+      "org_1",
+      { expectedUpdatedAt: new Date("2026-01-01T00:00:00.000Z") },
+      expect.anything(),
+      // ENG-3282: the caller's visible-survey clause, for targeting references.
+      expect.any(Object),
+      // ENG-3641: the write report the custom CSS warnings come back through.
+      {},
+      // The custom CSS budget's principal: this fixture's authentication names no user or key.
+      null
+    );
+  });
+
+  test("charges custom CSS processing to the caller and answers a spent budget with 429", async () => {
+    // The patch decides whether it processes CSS; the operation only names who pays for it — the same
+    // user or key CSS validation charges, so REST, MCP and the editor share one budget.
+    vi.mocked(patchV3Survey).mockRejectedValueOnce(new TooManyRequestsError("Slow down", 30));
+
+    const response = await patchV3SurveyResponse({
+      surveyId: "survey_1",
+      body: { customCss: { light: "a{}", dark: null } },
+      authentication: sessionAuthentication,
+      requestId,
+      instance,
+    });
+
+    expect(vi.mocked(patchV3Survey).mock.lastCall?.[8]).toBe("user_1");
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("30");
   });
 
   test("rejects patches to an archived survey with 422 and does not patch", async () => {
@@ -843,7 +1064,12 @@ describe("patchV3SurveyResponse", () => {
 describe("archiveV3Survey", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({ survey, authResult, response: null } as any);
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as any);
     vi.mocked(archiveSurvey).mockResolvedValue({
       id: "survey_1",
       status: "paused",
@@ -903,7 +1129,12 @@ describe("archiveV3Survey", () => {
 describe("restoreV3Survey", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({ survey, authResult, response: null } as any);
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as any);
     vi.mocked(restoreSurvey).mockResolvedValue({
       id: "survey_1",
       status: "paused",
@@ -944,7 +1175,12 @@ describe("validateV3Survey", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.mocked(requireV3WorkspaceAccess).mockResolvedValue(authResult);
-    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({ survey, authResult, response: null } as any);
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as any);
     vi.mocked(prepareV3SurveyCreateInput).mockReturnValue({
       ok: true,
       languageRequests: [{ code: "en-US", default: true, enabled: true }],
@@ -1014,7 +1250,13 @@ describe("validateV3Survey", () => {
       requestId,
       instance,
     });
-    expect(vi.mocked(prepareV3SurveyPatchInput)).toHaveBeenCalledWith(survey, { name: "" });
+    expect(vi.mocked(prepareV3SurveyPatchInput)).toHaveBeenCalledWith(
+      survey,
+      { name: "" },
+      {
+        reportedVisibility: expect.objectContaining({ visibility: "workspace" }),
+      }
+    );
     expect(await readJson(response)).toEqual({
       data: {
         valid: false,
@@ -1073,5 +1315,917 @@ describe("validateV3Survey", () => {
     } as any);
 
     expect(response.status).toBe(500);
+  });
+});
+
+describe("editV3SurveyBlocksResponse", () => {
+  const blockA = { id: "blk_a", name: "A", elements: [] };
+  const blockB = { id: "blk_b", name: "B", elements: [] };
+  const serializedWithBlocks = { id: "survey_1", name: "Customer Survey", blocks: [blockA, blockB] };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as any);
+    vi.mocked(patchV3Survey).mockResolvedValue(updatedSurvey as any);
+    vi.mocked(serializeV3SurveyResource).mockImplementation((input) =>
+      (input as any).name === "Updated Survey"
+        ? (serializedUpdatedSurvey as any)
+        : (serializedWithBlocks as any)
+    );
+  });
+
+  const call = (body: unknown, auditLog?: any): Promise<Response> =>
+    editV3SurveyBlocksResponse({
+      surveyId: "survey_1",
+      body,
+      authentication,
+      requestId,
+      instance,
+      auditLog,
+    });
+
+  test("authorizes the survey at readWrite before any op is applied", async () => {
+    // The level is set once in the shared pipeline; this pins it from the block endpoint's side so a
+    // per-operation refactor that lowered it to `read` would fail here, not only on the PATCH test.
+    await call({ ops: [{ op: "remove", id: "blk_b" }] });
+
+    expect(vi.mocked(getAuthorizedV3Survey)).toHaveBeenCalledWith(
+      expect.objectContaining({ surveyId: "survey_1", access: "readWrite" })
+    );
+  });
+
+  test("splices the ops into the stored blocks and writes the whole array once", async () => {
+    const auditLog = {} as any;
+    const replacement = { id: "blk_a", name: "A renamed", elements: [] };
+
+    const response = await call({ ops: [{ op: "update", id: "blk_a", block: replacement }] }, auditLog);
+
+    expect(response.status).toBe(200);
+    // No caller precondition, so the pipeline supplies its own — the survey as this request read it. A
+    // concurrent writer then costs a 409 instead of a silently dropped block.
+    expect(vi.mocked(patchV3Survey)).toHaveBeenCalledWith(
+      survey,
+      { blocks: [replacement, blockB] },
+      requestId,
+      "org_1",
+      { expectedUpdatedAt: survey.updatedAt },
+      expect.anything(),
+      // ENG-3282: the caller's visible-survey clause, for targeting references.
+      expect.any(Object),
+      // ENG-3641: the write report the custom CSS warnings come back through.
+      {},
+      // The custom CSS budget's principal: this fixture's authentication names no user or key.
+      null
+    );
+    expect(auditLog).toMatchObject({
+      organizationId: "org_1",
+      targetId: "survey_1",
+      oldObject: serializedWithBlocks,
+      newObject: serializedUpdatedSurvey,
+    });
+  });
+
+  test("generates an id for an inserted block that omits one, like create does", async () => {
+    // Every block id a caller has seen is server-generated, so omitting it on insert is the natural
+    // assumption — and create already mints one. Requiring it here was an inconsistency.
+    await call({ ops: [{ op: "insert", block: { name: "No id" }, position: { type: "end" } }] });
+
+    const [, input] = vi.mocked(patchV3Survey).mock.calls[0];
+    const blocks = (input as { blocks: { id: string; name?: string }[] }).blocks;
+    const inserted = blocks[blocks.length - 1];
+
+    expect(inserted.name).toBe("No id");
+    expect(inserted.id).toMatch(/^[0-9a-z]+$/);
+    expect(inserted.id.length).toBeGreaterThan(8);
+  });
+
+  test("keeps an explicit id so a later op can anchor after the new block", async () => {
+    await call({
+      ops: [
+        { op: "insert", block: { id: "blk_explicit", name: "A" }, position: { type: "start" } },
+        { op: "insert", block: { name: "B" }, position: { type: "after", blockId: "blk_explicit" } },
+      ],
+    });
+
+    const [, input] = vi.mocked(patchV3Survey).mock.calls[0];
+    const ids = (input as { blocks: { id: string }[] }).blocks.map((b) => b.id);
+    expect(ids[0]).toBe("blk_explicit");
+    expect(ids[1]).not.toBe("blk_explicit");
+  });
+
+  test("forwards expectedUpdatedAt as a write precondition", async () => {
+    // Matches the fixture's updatedAt: the precondition is now evaluated before the method, so a
+    // mismatching one never reaches patchV3Survey (that case is the 409 test below).
+    await call({
+      ops: [{ op: "remove", id: "blk_b" }],
+      expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    expect(vi.mocked(patchV3Survey)).toHaveBeenCalledWith(
+      survey,
+      { blocks: [blockA] },
+      requestId,
+      "org_1",
+      { expectedUpdatedAt: new Date("2026-01-01T00:00:00.000Z") },
+      expect.anything(),
+      // ENG-3282: the caller's visible-survey clause, for targeting references.
+      expect.any(Object),
+      // ENG-3641: the write report the custom CSS warnings come back through.
+      {},
+      // The custom CSS budget's principal: this fixture's authentication names no user or key.
+      null
+    );
+  });
+
+  test("refuses an oversized ops array with one issue, before touching the survey", async () => {
+    // Zod would report one issue per element; a 2 MB body of junk must not come back as a 2 MB 400.
+    const response = await call({ ops: Array.from({ length: 5000 }, () => 0) });
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.invalid_params).toEqual([expect.objectContaining({ name: "ops" })]);
+    expect(vi.mocked(getAuthorizedV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("remaps a stored-survey problem onto the block's stored index after a remove", async () => {
+    // Removing blk_a leaves blk_b at post-op index 0; the caller's GET shows it at blocks.1.
+    vi.mocked(patchV3Survey).mockRejectedValue(
+      new V3SurveyStoredDocumentError([{ name: "blocks.0.elements.0.headline", reason: "bad" }])
+    );
+
+    const response = await call({ ops: [{ op: "remove", id: "blk_a" }] });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.code).toBe("stored_survey_invalid");
+    expect(body.invalid_params).toEqual([expect.objectContaining({ name: "blocks.1.elements.0.headline" })]);
+  });
+
+  test("returns 400 for a malformed envelope without touching the survey", async () => {
+    const response = await call({ ops: [] });
+
+    expect(response.status).toBe(400);
+    expect(vi.mocked(getAuthorizedV3Survey)).not.toHaveBeenCalled();
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("returns 422 for an op that cannot apply, and does not write", async () => {
+    const response = await call({ ops: [{ op: "remove", id: "blk_zz" }] });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.invalid_params).toEqual([
+      expect.objectContaining({ name: "ops.0.id", code: "dangling_reference" }),
+    ]);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("answers a stale precondition with 409 even when the op could not have applied", async () => {
+    // The commonest reason an op fails to resolve is that the survey moved on — which is exactly what
+    // the caller's `expectedUpdatedAt` is asking about. RFC 9110 evaluates the precondition before
+    // the method, so the honest answer is 409 re-read-and-retry, not a 422 blaming the request.
+    const response = await call({
+      ops: [{ op: "remove", id: "blk_zz" }],
+      expectedUpdatedAt: "2020-01-01T00:00:00.000Z",
+    });
+
+    expect(response.status).toBe(409);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("refuses to edit by id when the stored survey repeats a block id", async () => {
+    // `findIndex` would act on whichever copy comes first — a guess. Refused as a stored-survey
+    // problem before anything is applied, with both positions named.
+    vi.mocked(serializeV3SurveyResource).mockReturnValue({
+      ...serializedWithBlocks,
+      blocks: [blockA, { ...blockB, id: "blk_a" }],
+    } as any);
+
+    const response = await call({ ops: [{ op: "remove", id: "blk_a" }] });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.code).toBe("stored_survey_invalid");
+    expect(body.invalid_params).toEqual([
+      expect.objectContaining({
+        name: "blocks.1.id",
+        code: "duplicate_identifier",
+        identifier: "blk_a",
+        firstUsedAt: "blocks.0.id",
+      }),
+    ]);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("reports a legacy question-based survey as a state error, not a 400", async () => {
+    // Without the guard the serializer throws and this answers 400, blaming the caller for a
+    // property of the stored survey — and contradicting the documented 422.
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey: { ...survey, questions: [{ id: "legacy" }] },
+      authResult,
+      response: null,
+    } as any);
+
+    const response = await call({ ops: [{ op: "remove", id: "blk_a" }] });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.code).toBe("stored_survey_invalid");
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("passes an authorization response straight through", async () => {
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey: null,
+      authResult: null,
+      response: new Response(null, { status: 403 }),
+    } as any);
+
+    const response = await call({ ops: [{ op: "remove", id: "blk_a" }] });
+
+    expect(response.status).toBe(403);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("refuses an archived survey", async () => {
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey: { ...survey, archivedAt: new Date() },
+      authResult,
+      response: null,
+    } as any);
+
+    const response = await call({ ops: [{ op: "remove", id: "blk_a" }] });
+
+    expect(response.status).toBe(422);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("remaps a downstream blocks.<i> path onto the op that produced it", async () => {
+    // Otherwise the caller gets "blocks.1.elements.0.headline" for an array it never sent.
+    vi.mocked(patchV3Survey).mockRejectedValue(
+      new V3SurveyReferenceValidationError([
+        { name: "blocks.1.elements.0.headline", reason: "bad", code: "missing_translation" },
+        { name: "blocks.0.logic.0", reason: "untouched block keeps its path" },
+      ])
+    );
+
+    const response = await call({
+      ops: [{ op: "insert", block: { id: "blk_new" }, position: { type: "after", blockId: "blk_a" } }],
+    });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.invalid_params).toEqual([
+      expect.objectContaining({ name: "ops.0.block.elements.0.headline" }),
+      expect.objectContaining({ name: "blocks.0.logic.0" }),
+    ]);
+  });
+
+  test("maps a race the compare-and-set catches to 409 with both timestamps", async () => {
+    // The pre-flight passes (precondition matches the fixture), then the UPDATE's own `where` finds the
+    // row moved on. That is the genuine race the CAS exists for, and it must surface the live value.
+    vi.mocked(patchV3Survey).mockRejectedValue(
+      new V3SurveyStaleError(
+        new Date("2026-01-01T00:00:00.000Z"),
+        new Date("2026-04-21T11:30:00.000Z"),
+        "write"
+      )
+    );
+
+    const response = await call({
+      ops: [{ op: "remove", id: "blk_b" }],
+      expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body.code).toBe("conflict");
+    expect(body.details).toEqual({
+      expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+      currentUpdatedAt: "2026-04-21T11:30:00.000Z",
+    });
+  });
+});
+
+describe("setV3SurveyBlockOrderResponse", () => {
+  const blockA = { id: "blk_a", name: "A", elements: [] };
+  const blockB = { id: "blk_b", name: "B", elements: [] };
+  const serializedWithBlocks = { id: "survey_1", name: "Customer Survey", blocks: [blockA, blockB] };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as any);
+    vi.mocked(patchV3Survey).mockResolvedValue(updatedSurvey as any);
+    vi.mocked(serializeV3SurveyResource).mockImplementation((input) =>
+      (input as any).name === "Updated Survey"
+        ? (serializedUpdatedSurvey as any)
+        : (serializedWithBlocks as any)
+    );
+  });
+
+  const call = (body: unknown, auditLog?: any): Promise<Response> =>
+    setV3SurveyBlockOrderResponse({
+      surveyId: "survey_1",
+      body,
+      authentication,
+      requestId,
+      instance,
+      auditLog,
+    });
+
+  test("authorizes the survey at readWrite before the order is applied", async () => {
+    await call({ order: ["blk_b", "blk_a"] });
+
+    expect(vi.mocked(getAuthorizedV3Survey)).toHaveBeenCalledWith(
+      expect.objectContaining({ surveyId: "survey_1", access: "readWrite" })
+    );
+  });
+
+  test("applies a permutation", async () => {
+    const response = await call({ order: ["blk_b", "blk_a"] });
+
+    expect(response.status).toBe(200);
+    expect(vi.mocked(patchV3Survey)).toHaveBeenCalledWith(
+      survey,
+      { blocks: [blockB, blockA] },
+      requestId,
+      "org_1",
+      { expectedUpdatedAt: survey.updatedAt },
+      expect.anything(),
+      // ENG-3282: the caller's visible-survey clause, for targeting references.
+      expect.any(Object),
+      // ENG-3641: the write report the custom CSS warnings come back through.
+      {},
+      // The custom CSS budget's principal: this fixture's authentication names no user or key.
+      null
+    );
+  });
+
+  test("remaps a downstream blocks.<i> path onto the block's stored index", async () => {
+    // Validation ran on the reordered array, where blk_a sits at index 1; GET shows it at blocks.0.
+    vi.mocked(patchV3Survey).mockRejectedValue(
+      new V3SurveyReferenceValidationError([{ name: "blocks.1.logic.0", reason: "bad" }])
+    );
+
+    const response = await call({ order: ["blk_b", "blk_a"] });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.invalid_params).toEqual([expect.objectContaining({ name: "blocks.0.logic.0" })]);
+  });
+
+  test("refuses an oversized order with one issue, before touching the survey", async () => {
+    const response = await call({ order: Array.from({ length: 5000 }, () => 0) });
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.invalid_params).toEqual([expect.objectContaining({ name: "order" })]);
+    expect(vi.mocked(getAuthorizedV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("skips the write when the order already matches, so updatedAt does not move", async () => {
+    // A no-op write would bump updatedAt and invalidate every other caller's precondition, which
+    // would make this endpoint's advertised idempotence false.
+    const auditLog = {} as any;
+
+    const response = await call({ order: ["blk_a", "blk_b"] }, auditLog);
+
+    expect(response.status).toBe(200);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+    expect(auditLog).toMatchObject({ oldObject: serializedWithBlocks, newObject: serializedWithBlocks });
+  });
+
+  test("refuses to reorder when the stored survey repeats a block id, instead of dropping one", async () => {
+    // `reorderSurveyBlocks` keys by id, so a duplicate collapses and a permutation of the unique ids
+    // passes — one block shorter, and validation never sees it because the result IS unique. Silent
+    // loss of a block is the failure these endpoints exist to prevent.
+    vi.mocked(serializeV3SurveyResource).mockReturnValue({
+      ...serializedWithBlocks,
+      blocks: [blockA, { ...blockB, id: "blk_a" }, { id: "blk_c", name: "C", elements: [] }],
+    } as any);
+
+    const response = await call({ order: ["blk_c", "blk_a"] });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.code).toBe("stored_survey_invalid");
+    expect(body.invalid_params[0]).toMatchObject({ name: "blocks.1.id", code: "duplicate_identifier" });
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("rejects a stale precondition even when the order would not change anything", async () => {
+    // RFC 9110 evaluates the precondition before the method. Short-circuiting the no-op write first
+    // would answer a caller whose view is out of date with 200, which reads as confirmation that
+    // nothing moved — the precise false reassurance the precondition exists to prevent.
+    const response = await call({
+      order: ["blk_a", "blk_b"],
+      expectedUpdatedAt: "2020-01-01T00:00:00.000Z",
+    });
+
+    expect(response.status).toBe(409);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("rejects an order that is not a permutation", async () => {
+    const response = await call({ order: ["blk_a"] });
+
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.invalid_params).toEqual([
+      expect.objectContaining({ name: "order", code: "missing_required_field", missingId: "blk_b" }),
+    ]);
+    expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+  });
+
+  test("returns 400 when the body is malformed", async () => {
+    const response = await call({ order: "not-an-array" });
+
+    expect(response.status).toBe(400);
+    expect(vi.mocked(getAuthorizedV3Survey)).not.toHaveBeenCalled();
+  });
+});
+
+describe("listV3Surveys visibility (ENG-3282)", () => {
+  const enforcedMember = {
+    actorContext: { enforced: true, isOrganizationAdmin: false, kind: "user", userId: "user_1" },
+    gates: { entitled: true, ready: true },
+  };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockListQuery();
+    vi.mocked(requireV3WorkspaceAccess).mockResolvedValue(authResult);
+    vi.mocked(getSurveyCount).mockResolvedValue(2);
+    vi.mocked(getWorkspaceSurveyCount).mockResolvedValue(2);
+    vi.mocked(serializeV3SurveyListItem).mockImplementation((row) => ({ id: row.id }) as any);
+  });
+
+  afterEach(() => {
+    visibilityOverride.context = null;
+  });
+
+  test("scopes the page and both counts with the caller's context", async () => {
+    visibilityOverride.context = enforcedMember;
+    mockListQuery({ visibilityFilter: { visibility: ["restricted"] } });
+    vi.mocked(getSurveyListPage).mockResolvedValue({ surveys: [], nextCursor: null } as any);
+    vi.mocked(filterReadableSurveyIds).mockResolvedValue(new Set());
+
+    await listV3Surveys({
+      searchParams: new URLSearchParams({ workspaceId }),
+      authentication: sessionAuthentication,
+      requestId,
+      instance,
+    });
+
+    expect(getSurveyListPage).toHaveBeenCalledWith(
+      workspaceId,
+      expect.objectContaining({
+        actorContext: enforcedMember.actorContext,
+        visibilityFilter: { visibility: ["restricted"] },
+      })
+    );
+    expect(getSurveyCount).toHaveBeenCalledWith(workspaceId, {}, enforcedMember.actorContext, {
+      visibility: ["restricted"],
+    });
+    expect(getWorkspaceSurveyCount).toHaveBeenCalledWith(workspaceId, enforcedMember.actorContext);
+  });
+
+  test("drops and counts a row the graph denies even though the SQL predicate admitted it", async () => {
+    visibilityOverride.context = enforcedMember;
+    vi.mocked(getSurveyListPage).mockResolvedValue({
+      surveys: [{ id: "survey_ok" }, { id: "survey_leak" }],
+      nextCursor: null,
+    } as any);
+    vi.mocked(filterReadableSurveyIds).mockResolvedValue(new Set(["survey_ok"]));
+
+    const response = await listV3Surveys({
+      searchParams: new URLSearchParams({ workspaceId }),
+      authentication: sessionAuthentication,
+      requestId,
+      instance,
+    });
+
+    expect(filterReadableSurveyIds).toHaveBeenCalledWith({ type: "user", id: "user_1" }, [
+      "survey_ok",
+      "survey_leak",
+    ]);
+    expect(recordSurveyListPredicateMismatch).toHaveBeenCalledWith(1);
+    expect((await readJson(response)).data).toEqual([{ id: "survey_ok" }]);
+  });
+
+  test("confirms only settled rows against the graph: a pending one is decided from PostgreSQL", async () => {
+    visibilityOverride.context = enforcedMember;
+    const settled = { visibilityProjectedVersion: 1, visibilityVersion: 1 };
+    vi.mocked(getSurveyListPage).mockResolvedValue({
+      surveys: [
+        { id: "survey_ok", ...settled },
+        // Just created: its initial projection, so the graph holds nothing for it yet.
+        { id: "survey_fresh", visibilityProjectedVersion: -1, visibilityVersion: 0 },
+        { id: "survey_leak", ...settled },
+      ],
+      nextCursor: null,
+    } as never);
+    vi.mocked(filterReadableSurveyIds).mockResolvedValue(new Set(["survey_ok"]));
+
+    const response = await listV3Surveys({
+      searchParams: new URLSearchParams({ workspaceId }),
+      authentication: sessionAuthentication,
+      requestId,
+      instance,
+    });
+
+    expect(filterReadableSurveyIds).toHaveBeenCalledWith({ type: "user", id: "user_1" }, [
+      "survey_ok",
+      "survey_leak",
+    ]);
+    expect(recordSurveyListPredicateMismatch).toHaveBeenCalledWith(1);
+    expect((await readJson(response)).data).toEqual([{ id: "survey_ok" }, { id: "survey_fresh" }]);
+  });
+
+  test("skips the bulk check entirely while visibility is not enforced", async () => {
+    vi.mocked(getSurveyListPage).mockResolvedValue({
+      surveys: [{ id: "survey_ok" }],
+      nextCursor: null,
+    } as any);
+
+    await listV3Surveys({
+      searchParams: new URLSearchParams({ workspaceId }),
+      authentication,
+      requestId,
+      instance,
+    });
+
+    expect(filterReadableSurveyIds).not.toHaveBeenCalled();
+  });
+
+  test("refuses the owner filter for an API key with 400", async () => {
+    mockListQuery({ visibilityFilter: { owner: ["me"] } });
+
+    const response = await listV3Surveys({
+      searchParams: new URLSearchParams({ workspaceId }),
+      authentication,
+      requestId,
+      instance,
+    });
+
+    expect(response.status).toBe(400);
+    expect((await readJson(response)).invalid_params).toEqual([
+      expect.objectContaining({ name: "filter[owner][in]" }),
+    ]);
+    expect(getSurveyListPage).not.toHaveBeenCalled();
+  });
+});
+
+describe("custom CSS (ENG-3641)", () => {
+  const otherWorkspaceSurvey = { ...survey, id: "survey_2", workspaceId: "tz4a98xxat96iws9zmbrgjzz" };
+  const cssWarning = {
+    code: "import_removed",
+    scope: "survey",
+    appearance: "light",
+    line: 1,
+    column: 1,
+    reason: "@import is not supported",
+  } as const;
+  const cssError = {
+    code: "syntax_error",
+    scope: "survey",
+    appearance: "light",
+    line: 2,
+    column: 5,
+    reason: "Unexpected token",
+  } as const;
+  const customCssBody = (overrides: Record<string, unknown> = {}) => ({
+    operation: "customCss" as const,
+    workspaceId,
+    scope: "survey" as const,
+    data: { customCss: { light: "a{}", dark: null } },
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(requireV3WorkspaceAccess).mockResolvedValue(authResult);
+    vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+      survey,
+      authResult,
+      response: null,
+      visibility: RESOURCE_VISIBILITY,
+    } as never);
+    vi.mocked(previewCustomCss).mockReturnValue({
+      ok: true,
+      compiled: { light: "@layer fb-survey{a}", dark: null },
+      warnings: [cssWarning],
+    });
+    vi.mocked(prepareV3SurveyCreateInput).mockReturnValue({
+      ok: true,
+      languageRequests: [{ code: "en-US", default: true, enabled: true }],
+    } as never);
+    vi.mocked(prepareV3SurveyPatchInput).mockReturnValue({ ok: true, languageRequests: [] } as never);
+  });
+
+  describe("validate operation customCss", () => {
+    test("needs workspace read only, returns compiled CSS and warnings, and writes nothing", async () => {
+      const response = await validateV3Survey({
+        body: customCssBody(),
+        authentication,
+        requestId,
+        instance,
+      } as never);
+
+      expect(response.status).toBe(200);
+      expect(vi.mocked(requireV3WorkspaceAccess)).toHaveBeenCalledWith(
+        authentication,
+        workspaceId,
+        "read",
+        requestId,
+        instance
+      );
+      expect(previewCustomCss).toHaveBeenCalledWith("survey", { light: "a{}", dark: null });
+      expect(await readJson(response)).toEqual({
+        data: {
+          valid: true,
+          operation: "customCss",
+          invalid_params: [],
+          customCss: { light: "@layer fb-survey{a}", dark: null },
+          warnings: [cssWarning],
+        },
+      });
+      expect(vi.mocked(patchV3Survey)).not.toHaveBeenCalled();
+      expect(vi.mocked(createV3Survey)).not.toHaveBeenCalled();
+    });
+
+    test("a rejected CSS returns errors and invalid_params and no compiled output", async () => {
+      vi.mocked(previewCustomCss).mockReturnValue({ ok: false, errors: [cssError] });
+
+      const response = await validateV3Survey({
+        body: customCssBody({ scope: "workspace" }),
+        authentication,
+        requestId,
+        instance,
+      } as never);
+
+      const body = await readJson(response);
+      expect(body.data).toEqual({
+        valid: false,
+        operation: "customCss",
+        invalid_params: [{ name: "customCss.light", reason: "Unexpected token (line 2, column 5)" }],
+        errors: [cssError],
+      });
+      expect(body.data).not.toHaveProperty("customCss");
+    });
+
+    test("without workspace read access nothing is processed", async () => {
+      vi.mocked(requireV3WorkspaceAccess).mockResolvedValue(problemForbidden(requestId, "nope", instance));
+
+      const response = await validateV3Survey({
+        body: customCssBody(),
+        authentication,
+        requestId,
+        instance,
+      } as never);
+
+      expect(response.status).toBe(403);
+      expect(previewCustomCss).not.toHaveBeenCalled();
+    });
+
+    test("a named survey needs read access to it, including a private survey", async () => {
+      vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+        survey: null,
+        authResult: null,
+        response: problemForbidden(requestId, "You are not authorized to access this resource", instance),
+      } as never);
+
+      const response = await validateV3Survey({
+        body: customCssBody({ surveyId: validSurveyId }),
+        authentication,
+        requestId,
+        instance,
+      } as never);
+
+      expect(response.status).toBe(403);
+      expect(vi.mocked(getAuthorizedV3Survey)).toHaveBeenCalledWith(
+        expect.objectContaining({ surveyId: validSurveyId, access: "read" })
+      );
+      expect(previewCustomCss).not.toHaveBeenCalled();
+    });
+
+    test("a survey from another workspace is refused like an unknown one", async () => {
+      vi.mocked(getAuthorizedV3Survey).mockResolvedValue({
+        survey: otherWorkspaceSurvey,
+        authResult,
+        response: null,
+        visibility: RESOURCE_VISIBILITY,
+      } as never);
+
+      const response = await validateV3Survey({
+        body: customCssBody({ surveyId: validSurveyId }),
+        authentication,
+        requestId,
+        instance,
+      } as never);
+
+      expect(response.status).toBe(403);
+      expect(previewCustomCss).not.toHaveBeenCalled();
+    });
+
+    test("spends the principal's custom CSS budget first; a spent budget is a 429 and nothing runs", async () => {
+      const cssKey = { apiKeyId: "key_css", organizationId: "org_1", workspacePermissions: [] } as never;
+      vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("Slow down", 30));
+
+      const response = await validateV3Survey({
+        body: customCssBody(),
+        authentication: cssKey,
+        requestId,
+        instance,
+      } as never);
+
+      expect(applyRateLimit).toHaveBeenCalledWith(rateLimitConfigs.api.v3CustomCss, "key_css");
+      expect(response.status).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe("30");
+      expect(requireV3WorkspaceAccess).not.toHaveBeenCalled();
+      expect(previewCustomCss).not.toHaveBeenCalled();
+    });
+
+    test("the raw entry point rejects compiled output and a surveyId on workspace scope", async () => {
+      for (const body of [
+        customCssBody({ data: { customCss: { light: "a{}", dark: null, compiled: "x" } } }),
+        customCssBody({ scope: "workspace", surveyId: validSurveyId }),
+        customCssBody({ data: { customCss: { light: "a{}" } } }),
+      ]) {
+        const response = await validateV3SurveyFromRawInput({ body, authentication, requestId, instance });
+        expect(response.status).toBe(400);
+      }
+      expect(previewCustomCss).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("create and patch validation", () => {
+    test("process customCss additively when the payload carries it", async () => {
+      const response = await validateV3Survey({
+        body: { operation: "create", data: { ...createBody, customCss: { light: "a{}", dark: null } } },
+        authentication,
+        requestId,
+        instance,
+      } as never);
+
+      expect((await readJson(response)).data).toMatchObject({
+        valid: true,
+        operation: "create",
+        customCss: { light: "@layer fb-survey{a}", dark: null },
+        warnings: [cssWarning],
+      });
+    });
+
+    test("spend the custom CSS budget only when the payload carries customCss", async () => {
+      const session = { user: { id: "user_css" }, expires: "2099-01-01" } as never;
+      await validateV3Survey({
+        body: { operation: "patch", surveyId: validSurveyId, data: { name: "x" } },
+        authentication: session,
+        requestId,
+        instance,
+      } as never);
+      expect(applyRateLimit).not.toHaveBeenCalled();
+
+      vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("Slow down"));
+      const response = await validateV3Survey({
+        body: { operation: "create", data: { ...createBody, customCss: { light: "a{}", dark: null } } },
+        authentication: session,
+        requestId,
+        instance,
+      } as never);
+
+      expect(applyRateLimit).toHaveBeenCalledWith(rateLimitConfigs.api.v3CustomCss, "user_css");
+      expect(response.status).toBe(429);
+      expect(previewCustomCss).not.toHaveBeenCalled();
+    });
+
+    test("leave a payload without customCss exactly as before", async () => {
+      const response = await validateV3Survey({
+        body: { operation: "patch", surveyId: validSurveyId, data: { name: "x" } },
+        authentication,
+        requestId,
+        instance,
+      } as never);
+
+      expect(previewCustomCss).not.toHaveBeenCalled();
+      expect((await readJson(response)).data).toEqual({
+        valid: true,
+        operation: "patch",
+        invalid_params: [],
+        languages: [],
+      });
+    });
+
+    test("report a CSS failure as invalid, with no compiled output", async () => {
+      vi.mocked(previewCustomCss).mockReturnValue({ ok: false, errors: [cssError] });
+
+      const response = await validateV3Survey({
+        body: {
+          operation: "patch",
+          surveyId: validSurveyId,
+          data: { customCss: { light: "a{", dark: null } },
+        },
+        authentication,
+        requestId,
+        instance,
+      } as never);
+
+      const { data } = await readJson(response);
+      expect(data).toMatchObject({ valid: false, operation: "patch", errors: [cssError] });
+      expect(data.invalid_params).toEqual([
+        { name: "customCss.light", reason: "Unexpected token (line 2, column 5)" },
+      ]);
+      expect(data).not.toHaveProperty("customCss");
+    });
+  });
+
+  describe("writes", () => {
+    test("create maps a plan refusal to 403 custom_css_plan_required", async () => {
+      vi.mocked(createV3Survey).mockRejectedValue(new V3CustomCssPlanRequiredError());
+
+      const response = await createV3SurveyResponse({
+        body: parsedCreateBody,
+        authentication,
+        requestId,
+        instance,
+      });
+
+      expect(response.status).toBe(403);
+      expect(await readJson(response)).toMatchObject({ code: "custom_css_plan_required" });
+    });
+
+    test("create maps rejected CSS to 422 with the processor's errors in details", async () => {
+      vi.mocked(createV3Survey).mockRejectedValue(new V3CustomCssInvalidError([cssError]));
+
+      const response = await createV3SurveyResponse({
+        body: parsedCreateBody,
+        authentication,
+        requestId,
+        instance,
+      });
+
+      expect(response.status).toBe(422);
+      expect(await readJson(response)).toMatchObject({
+        code: "unprocessable_content",
+        invalid_params: [{ name: "customCss.light" }],
+        details: { errors: [cssError] },
+      });
+    });
+
+    test("create returns the warnings beside data when CSS was processed", async () => {
+      vi.mocked(createV3Survey).mockImplementation(async (_body, _auth, _req, _org, options) => {
+        options!.report!.customCssWarnings = [cssWarning];
+        return survey as never;
+      });
+      vi.mocked(serializeV3SurveyResource).mockReturnValue(serializedSurvey as never);
+
+      const response = await createV3SurveyResponse({
+        body: parsedCreateBody,
+        authentication,
+        requestId,
+        instance,
+      });
+
+      expect(response.status).toBe(201);
+      expect(await readJson(response)).toEqual({ data: serializedSurvey, warnings: [cssWarning] });
+    });
+
+    test("patch returns the warnings beside data, and maps a plan refusal to 403", async () => {
+      vi.mocked(serializeV3SurveyResource).mockReturnValue(serializedSurvey as never);
+      vi.mocked(patchV3Survey).mockImplementation(async (...args: unknown[]) => {
+        (args[7] as { customCssWarnings?: unknown[] }).customCssWarnings = [cssWarning];
+        return updatedSurvey as never;
+      });
+
+      const ok = await patchV3SurveyResponse({
+        surveyId: "survey_1",
+        body: { customCss: { light: "a{}", dark: null } },
+        authentication,
+        requestId,
+        instance,
+      });
+      expect(await readJson(ok)).toEqual({ data: serializedSurvey, warnings: [cssWarning] });
+
+      vi.mocked(patchV3Survey).mockRejectedValue(new V3CustomCssPlanRequiredError());
+      const refused = await patchV3SurveyResponse({
+        surveyId: "survey_1",
+        body: { customCss: { light: "b{}", dark: null } },
+        authentication,
+        requestId,
+        instance,
+      });
+      expect(refused.status).toBe(403);
+      expect(await readJson(refused)).toMatchObject({ code: "custom_css_plan_required" });
+    });
   });
 });

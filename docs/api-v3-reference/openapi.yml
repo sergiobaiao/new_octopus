@@ -1,11 +1,14 @@
 # GENERATED FILE — do not edit. Source of truth: docs/api-v3-reference/src/ (one file per path/schema).
 # Regenerate with `pnpm api:v3:bundle`; CI verifies freshness with `pnpm api:v3:check`.
-# V3 API — surveys, workflows, action classes, contact attribute keys, tags and feedback records (hand-maintained source; not produced by generate-api-specs).
+# V3 API — surveys, responses, workflows, action classes, contact attribute keys, tags and feedback records (hand-maintained source; not produced by generate-api-specs).
+# Zod schemas for the adopted tags are generated from this file: `pnpm api:v3:schemas` (`pnpm api:v3:sync` runs both steps).
 openapi: 3.1.1
 info:
   title: Formbricks API v3
   description: |
-    **Surveys**: **GET /api/v3/surveys**, **POST /api/v3/surveys**, **POST /api/v3/surveys/generate**, **POST /api/v3/surveys/validate**, **GET /api/v3/surveys/{surveyId}**, **PATCH /api/v3/surveys/{surveyId}**, and **DELETE /api/v3/surveys/{surveyId}**.
+    **Surveys**: **GET /api/v3/surveys**, **POST /api/v3/surveys**, **POST /api/v3/surveys/generate**, **POST /api/v3/surveys/validate**, **GET /api/v3/surveys/{surveyId}**, **PATCH /api/v3/surveys/{surveyId}**, **PATCH /api/v3/surveys/{surveyId}/blocks**, **PUT /api/v3/surveys/{surveyId}/blocks/order**, and **DELETE /api/v3/surveys/{surveyId}**.
+
+    **Custom CSS**: survey CSS through `customCss` on **POST /api/v3/surveys**, **GET** and **PATCH /api/v3/surveys/{surveyId}**, workspace CSS through **GET** and **PATCH /api/v3/workspaces/{workspaceId}/custom-css**, and previews through `operation: customCss` on **POST /api/v3/surveys/validate**. Writes take and reads return source only; the server compiles it, returns removed constructs as top-level `warnings`, and never accepts compiled output.
 
     **Responses**: **GET /api/v3/responses**, **GET /api/v3/responses/count**, **POST /api/v3/responses/validate**, **POST /api/v3/responses/batch-delete**, **GET /api/v3/responses/{responseId}**, **POST /api/v3/responses**, **PATCH /api/v3/responses/{responseId}**, and **DELETE /api/v3/responses/{responseId}**.
 
@@ -16,7 +19,7 @@ info:
     **Spec location:** source of truth is the multi-file tree at `docs/api-v3-reference/src/` (root `openapi.yml` plus one file per path and component); `docs/api-v3-reference/openapi.yml` is the generated single-file bundle (alongside v2 at `docs/api-v2-reference/openapi.yml`).
 
     **workspaceId**
-    `workspaceId` is the canonical container identifier for this API. It is a **required query parameter on collection read endpoints** (`GET /api/v3/surveys`, `GET /api/v3/action-classes`, `GET /api/v3/contact-attribute-keys`) because those operate within a workspace. **`POST /api/v3/surveys` instead requires `workspaceId` in the request body**, not as a query parameter. Single-resource endpoints (`GET`/`PATCH`/`DELETE /api/v3/surveys/{surveyId}`) locate the resource by its globally-unique id and resolve the workspace from it, so they do **not** accept a `workspaceId` query parameter — sending one returns **400** (`Unrecognized key: "workspaceId"`).
+    `workspaceId` is the canonical container identifier for this API. It is a **required query parameter on collection read endpoints** (`GET /api/v3/surveys`, `GET /api/v3/action-classes`, `GET /api/v3/contact-attribute-keys`) because those operate within a workspace. **`POST /api/v3/surveys` instead requires `workspaceId` in the request body**, not as a query parameter. Single-resource endpoints (`GET`/`PATCH`/`DELETE /api/v3/surveys/{surveyId}`) locate the resource by its globally-unique id and resolve the workspace from it, so they do **not** accept a `workspaceId` query parameter — sending one returns **400** with an `invalid_params` entry naming the key itself (`name: "workspaceId"`, `reason: "Unsupported field 'workspaceId'"`), rather than one naming the body.
 
     **Auth**
     Authenticate with either a session cookie or **`x-api-key`**. In dual-auth mode, V3 checks the API key first when the header is present, otherwise it uses the session path. Unauthenticated callers get **401** before query validation.
@@ -29,12 +32,16 @@ info:
     A query parameter that an operation does not declare returns **400**, with the offending key reported in `invalid_params[].name` — including on operations that declare no query parameters at all. Unknown parameters are rejected rather than ignored on purpose: a silently-dropped filter returns *more* data than the caller believes they asked for, and a typo in a filter name is indistinguishable from no filter at all. The same applies to request bodies, where unsupported fields are rejected instead of stripped.
     Unrecognized **headers** are tolerated, as gateways and proxies legitimately add them; strictness is about parameters and body fields, not transport metadata.
     This is the rule for the surveys, responses, tags and workspace reference-list operations. The workflows family does not enforce it today, so treat parameter strictness there as unspecified rather than guaranteed.
+    **Request limits**
+    A request body may be at most **2 MB**; a larger one is refused with **413** before it is read. Inside a body, **no array may hold more than 1 000 items, and all arrays together may hold at most 50 000 elements**, at any depth — a body that exceeds either bound is refused with **400** and a single `invalid_params` entry naming the offending array, before any field is validated. The same holds for nesting: a body may nest at most **256** levels of objects and arrays, counted from the root, and a deeper one is refused the same way, naming where it went too deep. Fields with a tighter bound document it as `maxItems` on the field (a survey's `blocks`, `endings`, `variables`, `languages`, `hiddenFields.fieldIds` and `distribution.triggers` since 0.2.0). A 400 or 422 lists at most **50** `invalid_params` entries; when there are more, the last entry says how many were left out. Since 0.2.0.
     **Filtering**
     Filters use explicit operator-style query parameters under the **`filter[...]` family**. The survey list supports `filter[name][contains]`, `filter[status][in]`, and `filter[type][in]`. The workflow list supports `filter[name][contains]` and `filter[status][in]`; the workflow run list supports `filter[status][in]` and `filter[isDryRun][eq]`. Resource-scoping identifiers (`workspaceId`, `workflowId`, `responseId`) stay plain query parameters. Multi-value filters use repeated keys or comma-separated values (e.g. `filter[status][in]=draft&filter[status][in]=inProgress` or `filter[status][in]=draft,inProgress`). Sorting remains a flat `sortBy` query parameter.
 
     **Responses**
     The response resource is **self-describing**. Answers come back as a typed `answers[]` array in which each entry carries the element's id, label, type and value, rather than as a map keyed by element id — so a consumer holding only a response can read it without fetching the survey and joining. Hidden fields, survey variables and auto-captured context are one `embeddedData[]` collection rather than three parallel concepts, each entry declaring a `kind` and a `type`. Data whose element has since been deleted is reported in `unresolved[]` instead of being dropped silently. Labels are resolved at read time against the current survey definition, and the `resolution` object discloses that policy along with the survey's `updatedAt` so a consumer can detect wording drift.
     Writes take answers in the **stored map form** (`data`) while reads return the typed array. Resolving ids into labelled answers is unambiguous; the reverse would mean matching caller-supplied labels back onto option ids, so the write side keeps the stored shape. To stop that costing round-trippability, the **detailed read returns `data` unchanged** — so a single-response read can be edited and sent back as `PATCH { "data": … }`, and the typed `answers[]` array is an addition rather than a replacement.
+
+    One case where that round trip does not close: a write bound applies to `data` on the way in (`ResponseDataMapInput`) and none applies to the stored map, because v1 and v2 wrote it without one. A response carrying more answer keys than the write accepts therefore cannot be corrected through `PATCH` at all — the whole map is rejected, and sending a smaller one is not a workaround, because `data` is replaced wholesale and every key left out is deleted. Correct those through the v1/v2 management API or the dashboard. This is reachable only on surveys with more elements than the bound allows.
     Embedded Data is the exception, and it is symmetric rather than round-tripped: hidden fields and variables are read and written through `embeddedData`, addressed by **name** in both directions. No raw map of them is echoed, because a name is already what a write accepts — publishing the storage keys underneath (a variable's is its cuid) would expose a layout the caller has no use for. `data` therefore carries element answers only.
     Of those two, only `data` carries no `readOnly`, because it is the same map on the way in and on the way out. Embedded Data is writable through the **request's own** `embeddedData` map, not through the response field of that name — so `embeddedData[]`, like every other derived view on the resource, is marked `readOnly`, per its meaning of server-managed. `ResponseResource` lists them all. The list view omits `data`, since a bulk reader is not editing. `POST /api/v3/responses/validate` exists so a caller can see what a map would produce, and what a write would do, before committing to it.
     `createdAt` and `updatedAt` are **server-owned** on this resource: they cannot be supplied on create or changed by a patch. Response metering counts rows by `(surveyId, createdAt)`, and a client-chosen `createdAt` also lets rows be inserted into the middle of another consumer's already-paginated stream. Backdating stays available on v2 until a dedicated import path exists. The respondent's IP address and the `contactAttributes` snapshot that v1/v2 expose are not part of this resource in any view; that snapshot is copied from the contact at submission time and never refreshed, so it is stale PII by construction.
@@ -61,8 +68,8 @@ info:
     The v3-backed survey overview page intentionally removes actions that are not yet exposed by this contract: `Created by` filtering, `Duplicate`, `Copy...`, `Preview`, and `Copy link`.
 
     **Next steps (out of scope for this spec)**
-    Additional v3 survey update endpoints, optional ETag/304, field selection, translation-specific writes, and survey version history.
-  version: 0.1.0
+    Optional ETag/304, field selection, translation-specific writes, and survey version history.
+  version: 0.2.0
   x-implementation-notes:
     route: apps/web/app/api/v3/surveys/route.ts
     generate-route: apps/web/app/api/v3/surveys/generate/route.ts
@@ -89,7 +96,14 @@ paths:
       operationId: getSurveysV3
       summary: List surveys
       description: |
-        Returns surveys for the workspace. Session cookie, `x-api-key`, or a Bearer token.
+        Returns the surveys in the workspace **that the caller may read**. A restricted survey is listed only
+        to its owner and to the organisation's owners and managers; to everyone else, API keys included, it
+        does not exist here. `meta.totalCount` and `meta.workspaceSurveyCount` count that same readable set,
+        so neither number reveals a restricted survey to someone who cannot see it. The visibility predicate
+        is applied in the query and the cursor, never after the fact: `limit` keeps its meaning and
+        `meta.nextCursor` being `null` remains the only end-of-collection signal.
+
+        Session cookie, `x-api-key`, or a Bearer token.
       tags:
         - V3 Surveys
       parameters:
@@ -158,6 +172,27 @@ paths:
           explode: true
           description: Survey type filter (`link` / `app`). Same repeat-or-comma rules as `filter[status][in]`.
         - in: query
+          name: filter[visibility][in]
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/SurveyVisibility'
+          style: form
+          explode: true
+          description: 'Keep only surveys with one of these visibilities, as each item reports it (a survey with a change in flight counts as `restricted`). Same repeat-or-comma rules as `filter[status][in]`; unknown values → **400**. Filters within the readable set: a workspace member asking for `restricted` gets their own restricted surveys, an organisation manager gets everyone''s.'
+        - in: query
+          name: filter[owner][in]
+          schema:
+            type: array
+            items:
+              type: string
+              enum:
+                - me
+                - others
+          style: form
+          explode: true
+          description: '`me` keeps surveys whose `owner` is the caller; `others` keeps the rest, ownerless surveys included. Relative to the signed-in user, so an API key sending this parameter gets **400**.'
+        - in: query
           name: sortBy
           schema:
             type: string
@@ -192,32 +227,7 @@ paths:
                     items:
                       $ref: '#/components/schemas/SurveyListItem'
                   meta:
-                    type: object
-                    required:
-                      - limit
-                      - nextCursor
-                      - totalCount
-                      - workspaceSurveyCount
-                    properties:
-                      limit:
-                        type: integer
-                      nextCursor:
-                        type:
-                          - string
-                          - 'null'
-                        description: Opaque cursor for the next page. `null` when there are no more results.
-                      totalCount:
-                        type:
-                          - integer
-                          - 'null'
-                        minimum: 0
-                        description: Total number of surveys matching the current filters across all pages. `null` when `includeTotalCount=false`.
-                      workspaceSurveyCount:
-                        type:
-                          - integer
-                          - 'null'
-                        minimum: 0
-                        description: Total number of surveys in the workspace, archived (soft-deleted) ones included and independent of the current filters. `null` when `includeTotalCount=false` (the same gate as `totalCount`). Replaces the boolean `hasArchived` field of earlier releases.
+                    $ref: '#/components/schemas/SurveyListMeta'
         '400':
           $ref: '#/components/responses/V3BadRequest'
         '401':
@@ -276,6 +286,8 @@ paths:
                   languages:
                     - code: de-DE
                       enabled: true
+                  showLanguageSwitch: true
+                  autoSelectLanguage: true
                   welcomeCard:
                     enabled: true
                     headline:
@@ -455,6 +467,8 @@ paths:
                 properties:
                   data:
                     $ref: '#/components/schemas/SurveyResource'
+                  warnings:
+                    $ref: '#/components/schemas/CustomCssWarnings'
         '400':
           description: |
             Bad Request — the document failed schema validation, i.e. any rule checkable from the request body alone, without consulting stored state. Covers: invalid JSON; unknown or unsupported fields (including `distribution`/`targeting` sent on a `link` survey, which are `app`-only); missing required fields; wrong types or out-of-range values; bad enum values; malformed multilingual maps; and intra-document field-combination rules — notably `displayLimit` is required (must be >= 1) when `displayOption` is `displaySome`. Cross-reference failures that need stored state to detect return **422** instead. Every offending field is itemized in `invalid_params`. Unknown or forbidden fields carry `code: unsupported_field` (e.g. `distribution` on a link survey); omissions carry `code: missing_required_field` (e.g. `displayLimit` when `displayOption` is `displaySome`). Bare type, range, enum, and malformed-locale-map violations report the field `name` with a human-readable `reason` and no machine `code`.
@@ -465,17 +479,32 @@ paths:
         '401':
           $ref: '#/components/responses/V3Unauthorized'
         '403':
-          description: Forbidden — no write access, missing external URL permission, missing Contacts entitlement for app-survey targeting, or workspace does not exist (404 not used; avoids existence leak)
+          description: 'Forbidden — no write access, missing external URL permission, missing Contacts entitlement for app-survey targeting, or workspace does not exist (404 not used; avoids existence leak). Survey custom CSS on an organization without the Scale plan (Formbricks Cloud) is refused with `code: custom_css_plan_required`.'
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
         '422':
-          description: 'Unprocessable Content — the document passed schema validation but failed a cross-reference check that requires stored state to detect: duplicate stable ids, dangling logic/jump references, undeclared locale keys used in content, invalid media URLs, a `distribution.triggers[].actionClassId` referencing an action class that does not exist in the workspace (discover valid ids via `GET /api/v3/action-classes`), or a `targeting.filters` entry that cannot resolve in the workspace — an unknown contact-attribute key or segment, an unsupported person identifier, or an unknown device value. Also returned when the document passes this endpoint''s request schema but is rejected by the stricter validation the survey service applies on write — for example a CTA `buttonUrl` whose scheme the service does not accept. The `invalid_params` array pinpoints each issue (e.g. `code: invalid_reference` with the offending `identifier`).'
+          description: |-
+            Unprocessable Content — the document passed schema validation but failed a cross-reference check that requires stored state to detect: duplicate stable ids, dangling logic/jump references, undeclared locale keys used in content, invalid media URLs, a `distribution.triggers[].actionClassId` referencing an action class that does not exist in the workspace (discover valid ids via `GET /api/v3/action-classes`), or a `targeting.filters` entry that cannot resolve in the workspace — an unknown contact-attribute key or segment, an unsupported person identifier, or an unknown device value. Also returned when the document passes this endpoint's request schema but is rejected by the stricter validation the survey service applies on write — for example a CTA `buttonUrl` whose scheme the service does not accept. The `invalid_params` array pinpoints each issue (e.g. `code: invalid_reference` with the offending `identifier`).
+            Also returned when `customCss` cannot be processed (a syntax error, the 20 000-byte survey budget, a complexity limit): `invalid_params` names `customCss.light` / `customCss.dark` and `details.errors` carries the processor's located errors. Nothing is created.
+            Also returned with `code: workspace_survey_limit_reached` when the workspace already holds the maximum number of surveys. That problem carries no `invalid_params`; instead `details` is `{ count, limit }` — the workspace's current survey count and the limit it has reached — so a client can tell the user how many surveys to archive or delete before retrying.
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+              examples:
+                workspaceSurveyLimitReached:
+                  summary: The workspace has reached its survey limit
+                  value:
+                    title: Unprocessable Content
+                    status: 422
+                    detail: This workspace has reached its survey limit
+                    code: workspace_survey_limit_reached
+                    requestId: req_01j9zq7w3k2m4n5p6r7s8t9v0w
+                    details:
+                      count: 10000
+                      limit: 10000
         '429':
           $ref: '#/components/responses/V3TooManyRequests'
         '500':
@@ -684,6 +713,14 @@ paths:
                     detail: The AI provider could not generate a valid survey draft. Try again or add more detail.
                     code: bad_gateway
                     requestId: req_123
+                providerAuthFailed:
+                  summary: AI provider rejected the instance's credentials
+                  value:
+                    title: Bad Gateway
+                    status: 502
+                    detail: The AI provider rejected this instance's credentials. Ask your administrator to check the AI provider configuration.
+                    code: ai_provider_auth_failed
+                    requestId: req_123
         '503':
           description: AI is not configured on this Formbricks instance
           content:
@@ -714,6 +751,8 @@ paths:
 
         Use `400` only for malformed validation envelopes, unsupported operations, invalid `surveyId`,
         or unsupported query parameters.
+
+        **Custom CSS.** A create or patch payload that carries `customCss` is also run through the custom CSS processor; the result adds the compiled `customCss` and `warnings`, or `errors` and `valid=false`. `operation: customCss` validates CSS alone for a live preview — with `scope: workspace | survey` and, optionally, an existing `surveyId` in `workspaceId` — and returns the compiled CSS and warnings. Validation never saves, versions, touches timestamps or invalidates caches, needs only read access, and grants nothing: the write itself checks permissions and the plan again. Requests that process custom CSS also count against a separate budget of 60 per minute per user or API key, shared with the workspace custom CSS endpoint, with survey creates and updates that add or edit custom CSS, and with the MCP tools; beyond it they return **429**.
       tags:
         - V3 Surveys
       requestBody:
@@ -740,6 +779,17 @@ paths:
                             headline:
                               en-US: What should we improve?
                             required: true
+              customCssValidation:
+                summary: Validate custom CSS for a live preview
+                value:
+                  operation: customCss
+                  workspaceId: clxx1234567890123456789012
+                  scope: survey
+                  surveyId: clsv1234567890123456789012
+                  data:
+                    customCss:
+                      light: '[data-fb-part="headline"] { font-weight: 600; }'
+                      dark: null
               patchValidation:
                 summary: Validate a patch payload
                 value:
@@ -775,7 +825,9 @@ paths:
                   - data
                 properties:
                   data:
-                    $ref: '#/components/schemas/SurveyValidationResult'
+                    anyOf:
+                      - $ref: '#/components/schemas/SurveyValidationResult'
+                      - $ref: '#/components/schemas/CustomCssValidationResult'
               examples:
                 invalid:
                   summary: Invalid survey document
@@ -786,6 +838,39 @@ paths:
                       invalid_params:
                         - name: blocks.0.elements.0.buttonUrl
                           reason: Unsupported field 'buttonUrl' for element type 'openText'. Allowed fields...
+                customCssValid:
+                  summary: Custom CSS processed, with a removed construct
+                  value:
+                    data:
+                      valid: true
+                      operation: customCss
+                      invalid_params: []
+                      customCss:
+                        light: '@layer fb-survey { #fbjs [data-fb-part="headline"] { font-weight: 600 !important; } }'
+                        dark: null
+                      warnings:
+                        - code: import_removed
+                          scope: survey
+                          appearance: light
+                          line: 1
+                          column: 1
+                          reason: '@import is not supported and was removed'
+                customCssInvalid:
+                  summary: Custom CSS rejected
+                  value:
+                    data:
+                      valid: false
+                      operation: customCss
+                      invalid_params:
+                        - name: customCss.light
+                          reason: Unexpected end of input (line 3, column 1)
+                      errors:
+                        - code: syntax_error
+                          scope: survey
+                          appearance: light
+                          line: 3
+                          column: 1
+                          reason: Unexpected end of input
                 valid:
                   summary: Valid survey document
                   value:
@@ -892,6 +977,12 @@ paths:
                       createdAt: '2026-05-18T09:24:54.014Z'
                       updatedAt: '2026-05-18T09:24:54.014Z'
                       archivedAt: null
+                      visibility: workspace
+                      owner:
+                        name: Alice Example
+                      access:
+                        via: workspace
+                        canManageVisibility: false
                       name: CSAT Survey
                       type: link
                       status: inProgress
@@ -905,6 +996,8 @@ paths:
                           alias: german
                           default: false
                           enabled: false
+                      showLanguageSwitch: false
+                      autoSelectLanguage: null
                       welcomeCard:
                         enabled: false
                       blocks:
@@ -923,6 +1016,7 @@ paths:
                       hiddenFields:
                         enabled: false
                       variables: []
+                      customCss: null
                 filtered:
                   summary: Language-filtered projection with ?lang=de-DE
                   value:
@@ -932,6 +1026,12 @@ paths:
                       createdAt: '2026-05-18T09:24:54.014Z'
                       updatedAt: '2026-05-18T09:24:54.014Z'
                       archivedAt: null
+                      visibility: workspace
+                      owner:
+                        name: Alice Example
+                      access:
+                        via: workspace
+                        canManageVisibility: false
                       name: CSAT Survey
                       type: link
                       status: inProgress
@@ -945,6 +1045,8 @@ paths:
                           alias: german
                           default: false
                           enabled: false
+                      showLanguageSwitch: false
+                      autoSelectLanguage: null
                       welcomeCard:
                         enabled: false
                       blocks:
@@ -962,6 +1064,7 @@ paths:
                       hiddenFields:
                         enabled: false
                       variables: []
+                      customCss: null
         '400':
           description: Invalid survey id, unsupported query parameter, unknown language, or unsupported legacy survey shape
           content:
@@ -998,8 +1101,9 @@ paths:
         name renames are allowed but may be destructive for downstream exports or integrations.
         Element id changes are rejected once the survey and element are no longer drafts.
 
-        Optimistic concurrency (`ETag`, `If-Match`, or revision tokens) is future work; until then,
-        overlapping writes are last-write-wins.
+        Server-owned fields that `GET` returns (`id`, `workspaceId`, `type`, `createdAt`, `archivedAt`, `defaultLanguage`, `languages[].alias`) are accepted and verified, so the output of a `GET` can be sent straight back. Echoing the value you were given is a no-op; changing one is a **422** `read_only_field`.
+
+        A round-tripped `updatedAt` acts as an optimistic-concurrency precondition: the write is applied only if the survey has not changed since your read, and is otherwise rejected with **409**. Omit it and overlapping writes remain last-write-wins. Header-based preconditions (`ETag` / `If-Match`) are still future work.
       tags:
         - V3 Surveys
       parameters:
@@ -1029,6 +1133,16 @@ paths:
                       en-US: Product Feedback
                       de-DE: Produktfeedback
                     cx_operation: product_feedback
+              setCustomCss:
+                summary: Replace the survey's custom CSS
+                value:
+                  customCss:
+                    light: '[data-fb-part="button-primary"] { border-radius: 999px; }'
+                    dark: '#fbjs[data-appearance="dark"] { --acme-ink: #e6eef5; }'
+              clearCustomCss:
+                summary: Clear the survey's custom CSS
+                value:
+                  customCss: null
               replaceBlocks:
                 summary: Replace survey blocks
                 value:
@@ -1065,9 +1179,11 @@ paths:
                 properties:
                   data:
                     $ref: '#/components/schemas/SurveyResource'
+                  warnings:
+                    $ref: '#/components/schemas/CustomCssWarnings'
         '400':
           description: |
-            Bad Request — the patch failed schema validation, i.e. any rule checkable from the request body alone, without consulting stored state. Covers: malformed JSON; an unsupported query parameter; unknown, unsupported, or immutable fields (`type` cannot be changed after creation, and `distribution`/`targeting` are `app`-only — sending them when patching a `link` survey is rejected); wrong types or out-of-range values; bad enum values; malformed multilingual maps; and intra-document field-combination rules — notably `displayLimit` is required (must be >= 1) when `displayOption` is `displaySome`. Cross-reference failures that need stored state to detect return **422** instead. Every offending field is itemized in `invalid_params`. Unknown, forbidden, immutable, or wrongly-combined fields carry `code: unsupported_field` (e.g. `type`, or `distribution`/`targeting` on a link survey); omissions carry `code: missing_required_field`. Bare type, range, enum, and malformed-locale-map violations report the field `name` with a human-readable `reason` and no machine `code`.
+            Bad Request — the patch failed schema validation, i.e. any rule checkable from the request body alone, without consulting stored state. Covers: malformed JSON; an unsupported query parameter; unknown or unsupported fields (`distribution`/`targeting` are `app`-only — sending them when patching a `link` survey is rejected); wrong types or out-of-range values; bad enum values; malformed multilingual maps; and intra-document field-combination rules — notably `displayLimit` is required (must be >= 1) when `displayOption` is `displaySome`. Cross-reference failures that need stored state to detect return **422** instead. Every offending field is itemized in `invalid_params`. Unknown, forbidden, immutable, or wrongly-combined fields carry `code: unsupported_field` (e.g. `distribution`/`targeting` on a link survey; a changed server-owned field such as `type` is **422** `read_only_field`, not this); omissions carry `code: missing_required_field`. Bare type, range, enum, and malformed-locale-map violations report the field `name` with a human-readable `reason` and no machine `code`.
           content:
             application/problem+json:
               schema:
@@ -1075,16 +1191,37 @@ paths:
         '401':
           $ref: '#/components/responses/V3Unauthorized'
         '403':
-          description: Forbidden — no write access, missing external URL permission, missing Contacts entitlement for app-survey targeting, or survey does not exist (404 not used; avoids existence leak)
+          description: 'Forbidden — no write access, missing external URL permission, missing Contacts entitlement for app-survey targeting, or survey does not exist (404 not used; avoids existence leak). Adding or editing `customCss` on an organization without the Scale plan (Formbricks Cloud) is refused with `code: custom_css_plan_required`; clearing it, or a patch that leaves it unchanged, is not.'
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict — a round-tripped `updatedAt` did not match the stored survey, so it changed since your read. Nothing was written. `details` carries `expectedUpdatedAt` and the live `currentUpdatedAt`, so a client can re-read and retry without guessing.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                title: Conflict
+                status: 409
+                detail: Survey was modified since it was last read; updatedAt is now 2026-04-21T11:30:00.000Z. Re-read the survey and retry.
+                code: conflict
+                requestId: 6f1f7f3e-3b0e-4a1a-9f0a-7c9a1d2b3c4d
+                details:
+                  expectedUpdatedAt: '2026-04-21T10:00:00.000Z'
+                  currentUpdatedAt: '2026-04-21T11:30:00.000Z'
         '422':
           description: |-
-            Unprocessable Content — the request cannot be processed against stored state. Two cases:
+            Unprocessable Content — the request cannot be processed against stored state. Five cases:
             1. The target survey is archived (soft-deleted) and therefore read-only; restore it before editing. The `invalid_params` entry reports `name: archivedAt` with the reason `This survey is archived. Restore it before editing.`
-            2. The patched document passed schema validation but failed a cross-reference check that requires stored state to detect: an undeclared locale key used in content, a duplicate stable id, an immutable element-id change on a published survey, a dangling logic/jump reference, an invalid media URL, a `distribution.triggers[].actionClassId` referencing an action class that does not exist in the workspace (discover valid ids via `GET /api/v3/action-classes`), or a `targeting.filters` entry that cannot resolve in the workspace — an unknown contact-attribute key or segment, an unsupported person identifier, or an unknown device value. The `invalid_params` array pinpoints each issue (e.g. `code: invalid_reference` with the offending `identifier`).
+            2. The patched document passed schema validation but failed a cross-reference check that requires stored state to detect: an undeclared locale key used in content, a duplicate stable id, an immutable element-id change on a published survey, a dangling logic/jump reference, an invalid media URL, a `distribution.triggers[].actionClassId` referencing an action class that does not exist in the workspace (discover valid ids via `GET /api/v3/action-classes`), or a `targeting.filters` entry that cannot resolve in the workspace — an unknown contact-attribute key or segment, an unsupported person identifier, or an unknown device value. The `invalid_params` array pinpoints each issue (e.g. `code: invalid_reference` with the offending `identifier`). A patch that newly *introduces* a forward reference — a recall of an answer not yet given, a logic condition reading a later block, or a `requireAnswer` target that is not in a later block — is refused with `code: misordered_reference`; a survey that already contains one stays patchable, only newly created violations are rejected. A patch that newly *introduces* a loop in the conditional logic — jumps, fallbacks and next blocks leading back on themselves, so a respondent could never reach an ending — is refused the same way, reported at the `logic` of each block a new looping step leaves ("Cyclic logic detected in block N"). A survey that already loops stays patchable, and blocks that only lead into a loop are fine.
+
+            3. A server-owned field was echoed back with a different value — `code: read_only_field`, with the submitted value in `identifier`. Sending the value `GET` returned is always a no-op.
+
+            4. The *stored* survey cannot be read as a v3 document at all — `code: stored_survey_invalid`. The reported paths are into the survey, not into the request; repair it in the editor. A stored survey that reads fine but already fails validation (a missing translation, a dangling recall) stays patchable: only issues a patch newly introduces are refused. The exception is publishing: moving a `draft` out of `draft` still requires a survey that passes, and is refused as `stored_survey_invalid` while it does not.
+
+            5. `customCss` could not be processed (a syntax error, the 20 000-byte survey budget, a complexity limit). `invalid_params` names `customCss.light` / `customCss.dark`; `details.errors` carries the processor's located errors. Nothing is written, so the saved CSS stays in effect.
           content:
             application/problem+json:
               schema:
@@ -1156,6 +1293,270 @@ paths:
           $ref: '#/components/responses/V3Unauthorized'
         '403':
           $ref: '#/components/responses/V3Forbidden'
+        '429':
+          $ref: '#/components/responses/V3TooManyRequests'
+        '500':
+          $ref: '#/components/responses/V3InternalServerError'
+      security:
+        - sessionAuth: []
+        - apiKeyAuth: []
+        - bearerAuth: []
+  /api/v3/surveys/{surveyId}/blocks:
+    patch:
+      operationId: editSurveyBlocksV3
+      summary: Edit survey blocks
+      description: |
+        Edits a survey's blocks in place — update, insert or remove whole blocks without resending the ones you are not changing. Operations apply in order against a single snapshot and are applied atomically: either all of them land or none do.
+
+        Blocks are addressed by id, never by position, so a concurrent edit cannot silently redirect an operation onto a different block. An `update` replaces the target block entirely, the same whole-subtree rule `PATCH /api/v3/surveys/{surveyId}` uses, and the replacement must carry every language the survey has configured.
+
+        Pass `expectedUpdatedAt` (the `updatedAt` from your last read) to make the write conditional; see the **409** response. Session cookie or x-api-key.
+      tags:
+        - V3 Surveys
+      parameters:
+        - in: path
+          name: surveyId
+          required: true
+          schema:
+            type: string
+            format: cuid2
+          description: Survey identifier.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EditSurveyBlocksRequest'
+            examples:
+              updateOneBlock:
+                summary: Replace a single block
+                value:
+                  ops:
+                    - op: update
+                      id: k1p9wq2m4x7c3v8b5n6t0j2r
+                      block:
+                        id: k1p9wq2m4x7c3v8b5n6t0j2r
+                        name: Satisfaction
+                        elements:
+                          - id: satisfaction
+                            type: openText
+                            headline:
+                              en-US: How satisfied were you?
+                            required: true
+                            inputType: text
+                  expectedUpdatedAt: '2026-04-21T10:00:00.000Z'
+              insertAndRemove:
+                summary: Add a block after another and drop a third
+                value:
+                  ops:
+                    - op: insert
+                      position:
+                        type: after
+                        blockId: k1p9wq2m4x7c3v8b5n6t0j2r
+                      block:
+                        id: b4h8s2d6f0g3j5k7l9z1x3c5
+                        name: Follow-up
+                        elements:
+                          - id: followup
+                            type: openText
+                            headline:
+                              en-US: Anything else?
+                            required: false
+                            inputType: text
+                    - op: remove
+                      id: n7m4q8w2e6r0t3y5u1i9o2p4
+      responses:
+        '200':
+          description: Blocks updated; returns the full survey resource.
+          headers:
+            X-Request-Id:
+              schema:
+                type: string
+              description: Request correlation ID
+            Cache-Control:
+              schema:
+                type: string
+              example: private, no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SurveyResource'
+        '400':
+          $ref: '#/components/responses/V3BadRequest'
+        '401':
+          $ref: '#/components/responses/V3Unauthorized'
+        '403':
+          $ref: '#/components/responses/V3Forbidden'
+        '409':
+          description: |
+            The survey changed since the `expectedUpdatedAt` you supplied. Nothing was written. The problem's `details` carries `expectedUpdatedAt` and the live `currentUpdatedAt`, so a client can re-read and retry without guessing.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                title: Conflict
+                status: 409
+                detail: Survey was modified since it was last read; updatedAt is now 2026-04-21T11:30:00.000Z. Re-read the survey and retry.
+                code: conflict
+                requestId: 6f1f7f3e-3b0e-4a1a-9f0a-7c9a1d2b3c4d
+                details:
+                  expectedUpdatedAt: '2026-04-21T10:00:00.000Z'
+                  currentUpdatedAt: '2026-04-21T11:30:00.000Z'
+        '422':
+          description: |
+            The request is well-formed but could not be applied. `invalid_params[].name` points at the operation that failed — `ops.<i>.…` — including for problems found while validating the resulting document. The one exception is a block the request did not touch: those are reported at `blocks.<i>`, where `<i>` is the block's index in the stored survey — the same index `GET` returns, even when an earlier operation inserted or removed blocks before it — because the problem is in the stored survey rather than in any operation. A `stored_survey_invalid` response uses stored-survey paths throughout for the same reason.
+
+            Common codes: `dangling_reference` (an id that is not on the survey), `duplicate_identifier` (inserting an id that already exists), `missing_required_field` (an inserted block whose `id` is present but empty — omitting `id` entirely is fine, the server generates one), `immutable_identifier` (`block.id` contradicting the op's `id`), and `stored_survey_invalid` when the stored survey itself fails the document contract. The edit is also refused when it newly *introduces* a loop in the conditional logic — jumps, fallbacks and next blocks leading back on themselves, so a respondent could never reach an ending — reported at the `logic` of each block a new looping step leaves. A survey that already loops stays editable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                unknownBlock:
+                  summary: An operation names a block that is not on the survey
+                  value:
+                    title: Unprocessable Content
+                    status: 422
+                    detail: Block operations could not be applied
+                    code: unprocessable_content
+                    requestId: 6f1f7f3e-3b0e-4a1a-9f0a-7c9a1d2b3c4d
+                    invalid_params:
+                      - name: ops.1.id
+                        reason: Block 'n7m4q8w2e6r0t3y5u1i9o2p4' does not exist on this survey
+                        code: dangling_reference
+                        identifier: n7m4q8w2e6r0t3y5u1i9o2p4
+                        referenceType: block
+                        missingId: n7m4q8w2e6r0t3y5u1i9o2p4
+                storedSurveyInvalid:
+                  summary: The stored survey fails the document contract
+                  value:
+                    title: Unprocessable Content
+                    status: 422
+                    detail: The stored survey does not satisfy the v3 survey document contract. The reported paths are into the stored survey, not your request; a patch that includes corrected values for those fields is accepted, or repair them in the editor.
+                    code: stored_survey_invalid
+                    requestId: 6f1f7f3e-3b0e-4a1a-9f0a-7c9a1d2b3c4d
+                    invalid_params:
+                      - name: blocks.0.elements.0.headline
+                        reason: Translatable field is missing configured language 'de-DE'
+                        code: missing_translation
+        '429':
+          $ref: '#/components/responses/V3TooManyRequests'
+        '500':
+          $ref: '#/components/responses/V3InternalServerError'
+      security:
+        - sessionAuth: []
+        - apiKeyAuth: []
+        - bearerAuth: []
+  /api/v3/surveys/{surveyId}/blocks/order:
+    put:
+      operationId: setSurveyBlockOrderV3
+      summary: Set survey block order
+      description: |
+        Replaces the order of a survey's blocks. The body lists every current block id exactly once, in the order you want; block content is untouched.
+
+        Idempotent: the same `order` always yields the same survey, and an order that already matches performs no write at all, so `updatedAt` does not move and other callers' preconditions stay valid. A stale `expectedUpdatedAt` is still rejected with **409** on that path — the precondition is evaluated before the method, so a no-op outcome never reports success to a stale caller. Because the list must be a permutation, a dropped or duplicated block is rejected rather than silently applied — the failure mode that resending the whole `blocks` array cannot catch.
+
+        Pass `expectedUpdatedAt` (the `updatedAt` from your last read) to make the write conditional; see the **409** response. Session cookie or x-api-key.
+      tags:
+        - V3 Surveys
+      parameters:
+        - in: path
+          name: surveyId
+          required: true
+          schema:
+            type: string
+            format: cuid2
+          description: Survey identifier.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetSurveyBlockOrderRequest'
+            examples:
+              reorder:
+                summary: Move the third block to the front
+                value:
+                  order:
+                    - b4h8s2d6f0g3j5k7l9z1x3c5
+                    - k1p9wq2m4x7c3v8b5n6t0j2r
+                    - n7m4q8w2e6r0t3y5u1i9o2p4
+                  expectedUpdatedAt: '2026-04-21T10:00:00.000Z'
+      responses:
+        '200':
+          description: Order applied (or already matching); returns the full survey resource.
+          headers:
+            X-Request-Id:
+              schema:
+                type: string
+              description: Request correlation ID
+            Cache-Control:
+              schema:
+                type: string
+              example: private, no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SurveyResource'
+        '400':
+          $ref: '#/components/responses/V3BadRequest'
+        '401':
+          $ref: '#/components/responses/V3Unauthorized'
+        '403':
+          $ref: '#/components/responses/V3Forbidden'
+        '409':
+          description: |
+            The survey changed since the `expectedUpdatedAt` you supplied. Nothing was written; `details` carries `expectedUpdatedAt` and the live `currentUpdatedAt`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                title: Conflict
+                status: 409
+                detail: Survey was modified since it was last read; updatedAt is now 2026-04-21T11:30:00.000Z. Re-read the survey and retry.
+                code: conflict
+                requestId: 6f1f7f3e-3b0e-4a1a-9f0a-7c9a1d2b3c4d
+                details:
+                  expectedUpdatedAt: '2026-04-21T10:00:00.000Z'
+                  currentUpdatedAt: '2026-04-21T11:30:00.000Z'
+        '422':
+          description: |
+            The request is well-formed but could not be applied. Three distinct cases share this status; switch on the Problem-level `code`.
+
+            `unprocessable_content` — the order is not a permutation of the survey's blocks. Unknown ids (`dangling_reference`), repeated ids (`duplicate_identifier`) and omitted blocks (`missing_required_field`, reported at `order`) are returned together, capped at 50 with a final entry saying how many were left out. Also used when the new order would *introduce* a forward reference — a recall of an answer not yet given, or a logic condition reading a later block — reported as `misordered_reference` at the stored-document path. An order that already contains such a reference stays reorderable; only newly created ones are refused. Likewise when the new order would *introduce* a loop in the conditional logic — a jump that now points back at a block whose next step leads to it again, so a respondent could never reach an ending — reported at the `logic` of each block a new looping step leaves. Moving a block in front of an existing loop is fine; reordering blocks inside one changes the loop and is refused.
+
+            `stored_survey_invalid` — the stored survey cannot be reordered by id: it is a legacy question-based survey, exposes no v3 block list, or a block id occurs more than once. The request was not evaluated; `invalid_params[].name` points into the stored survey.
+
+            `archivedAt` in `invalid_params` (no `code`) — the survey is archived; restore it first.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                title: Unprocessable Content
+                status: 422
+                detail: Block order must list every block exactly once
+                code: unprocessable_content
+                requestId: 6f1f7f3e-3b0e-4a1a-9f0a-7c9a1d2b3c4d
+                invalid_params:
+                  - name: order
+                    reason: Block 'n7m4q8w2e6r0t3y5u1i9o2p4' is missing from the order; list every block exactly once
+                    code: missing_required_field
+                    identifier: n7m4q8w2e6r0t3y5u1i9o2p4
+                    referenceType: block
+                    missingId: n7m4q8w2e6r0t3y5u1i9o2p4
         '429':
           $ref: '#/components/responses/V3TooManyRequests'
         '500':
@@ -1326,6 +1727,267 @@ paths:
         - sessionAuth: []
         - apiKeyAuth: []
         - bearerAuth: []
+  /api/v3/surveys/{surveyId}/visibility:
+    get:
+      operationId: getSurveyVisibilityV3
+      summary: Read a survey's visibility and the impact of changing it
+      description: |
+        Returns the survey's enforced visibility, its owner, the caller's access, and what a change would do: `blockers[]` lists the outbound connections that currently make `restricted` refusable (webhooks, integrations, active feedback sources, and draft or enabled workflows), `impact` carries the numbers the confirmation dialogues show, `allowedTargets[]` the values a `POST` would act on right now, and `pending` / `version` describe a change still in flight. Read this before offering "Make restricted"; the `POST` answers **409** while `blockers[]` is non-empty.
+
+        Requires `survey.change_visibility`, the same permission as the `POST`: the survey's owner while they still hold read access to the workspace, or an organisation owner/manager, with the feature enabled. Everyone else — read or write members, team-level managers, every API key, and anyone who cannot see the survey at all — answers **403** with the same body as an unknown id. Connection names and ids are configuration, not survey content, and only the people who may act on them get to read them.
+
+        While `pending` is non-null the survey is restricted for everyone but its owner (within their workspace access: read to view, write to edit) and the organisation's owners and managers, whichever direction is queued — the application fails closed until the graph acknowledges the change — so `visibility` reads `restricted` in that state and `allowedTargets` includes the value that cancels the pending change.
+      tags:
+        - V3 Surveys
+      parameters:
+        - in: path
+          name: surveyId
+          required: true
+          schema:
+            type: string
+            format: cuid2
+          description: Survey identifier.
+      responses:
+        '200':
+          description: Visibility state retrieved
+          headers:
+            X-Request-Id:
+              schema:
+                type: string
+              description: Request correlation ID
+            Cache-Control:
+              schema:
+                type: string
+              example: private, no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SurveyVisibilityState'
+              examples:
+                visibleWithBlockers:
+                  summary: Workspace-visible survey that a webhook and a workflow depend on
+                  value:
+                    data:
+                      id: clsv1234567890123456789012
+                      visibility: workspace
+                      owner:
+                        name: Alice Example
+                      access:
+                        via: workspace
+                        canManageVisibility: true
+                      blockers:
+                        - type: webhook
+                          id: clwh1234567890123456789012
+                          name: Zapier — new responses
+                        - type: workflow
+                          id: clwf1234567890123456789012
+                          name: 'Notify #product on completion'
+                      impact:
+                        memberCount: 7
+                        responseCount: 212
+                      pending: null
+                      version: 2
+                      allowedTargets: []
+                privateDraft:
+                  summary: Restricted draft seen by its owner
+                  value:
+                    data:
+                      id: clsv2234567890123456789012
+                      visibility: restricted
+                      owner:
+                        name: Bob Example
+                      access:
+                        via: owner
+                        canManageVisibility: true
+                      blockers: []
+                      impact:
+                        memberCount: 7
+                        responseCount: 0
+                      pending: null
+                      version: 2
+                      allowedTargets:
+                        - workspace
+                pendingGrant:
+                  summary: Owner asked for workspace; the in-request projection failed, the outbox will finish it
+                  value:
+                    data:
+                      id: clsv2234567890123456789012
+                      visibility: restricted
+                      owner:
+                        name: Bob Example
+                      access:
+                        via: owner
+                        canManageVisibility: true
+                      blockers: []
+                      impact:
+                        memberCount: 7
+                        responseCount: 0
+                      pending: workspace
+                      version: 3
+                      allowedTargets:
+                        - workspace
+                        - restricted
+                ownerlessPrivateSeenByManager:
+                  summary: Departed author's restricted survey, read by an organisation manager
+                  value:
+                    data:
+                      id: clsv3234567890123456789012
+                      visibility: restricted
+                      owner: null
+                      access:
+                        via: organizationRole
+                        canManageVisibility: true
+                      blockers: []
+                      impact:
+                        memberCount: 7
+                        responseCount: 41
+                      pending: null
+                      version: 2
+                      allowedTargets:
+                        - workspace
+        '400':
+          $ref: '#/components/responses/V3BadRequest'
+        '401':
+          $ref: '#/components/responses/V3Unauthorized'
+        '403':
+          $ref: '#/components/responses/V3VisibilityForbidden'
+        '429':
+          $ref: '#/components/responses/V3TooManyRequests'
+        '500':
+          $ref: '#/components/responses/V3InternalServerError'
+      security:
+        - sessionAuth: []
+        - apiKeyAuth: []
+        - bearerAuth: []
+    post:
+      operationId: changeSurveyVisibilityV3
+      summary: Change a survey's visibility
+      description: |
+        Sets the survey to `restricted` or `workspace`.
+
+        **Restrictions take effect at once.** A `workspace → restricted` request stores the flag, a new `version` and a pending marker in one transaction. From that instant the survey is restricted on every path — single reads, lists and counts, responses, exports — for everyone but the owner and the organisation's owners and managers, whether or not the graph has caught up (fail closed). The owner keeps only the access their workspace role gives them — read to view, write to edit; an owner who loses workspace access loses the survey too. The relationships are then projected; the answer is **200** either way, with `pending: null` when the graph acknowledged this `version` inside the request and `pending: "restricted"` when the outbox will finish it.
+
+        **Grants take effect when enforced.** A `restricted → workspace` request answers **200** only once the graph has acknowledged this exact `version`; until then the survey stays restricted. If the in-request projection fails, the answer is **503** `projection_pending`: the change is stored and queued, `GET …/visibility` shows `pending: "workspace"`, and retrying is safe.
+
+        **Fencing.** Every accepted change increments the survey's `version`. Projection work carries the version it was issued for, and a projector holding an older version never writes, so a worker leased before a newer change cannot overtake it — including one that crashed before its verification pass. A **200** for a grant means the graph holds this exact version.
+
+        **No-ops and cancellation.** Requesting the value the survey already enforces, with nothing pending, is a **200** no-op: nothing is written or audited and `changedAt` / `changedBy` are unchanged. Requesting the enforced value while the *opposite* is pending **cancels** the pending change: a new version is stored, the queued work is superseded, and the answer is **200** with `pending: null`. Requesting the pending value again re-attempts the projection (200 or 503).
+
+        When `restricted` is refused for two reasons at once — no owner **and** outbound connections — the **422** wins: the missing owner cannot be fixed, so listing connections to remove would send the caller down a dead end.
+
+        Allowed for the survey's owner (while they still hold read access to the workspace) and for the organisation's owners and managers. **Not** for workspace members with write or team-level manage rights, and never for API keys. Every successful change is audit-logged with the actor.
+
+        Going `workspace → restricted` is refused with **409** while any outbound connection depends on the survey; resolve them first. It is refused with **422** when the survey has no owner, because "restricted" would then mean "administrators only" — duplicate the survey for a restricted copy. Going `restricted → workspace` has no preconditions.
+
+        This is the only way to change visibility: `PATCH /api/v3/surveys/{surveyId}` accepts `visibility`, `owner` and `access` only as the exact values `GET` returned (so a fetched survey round-trips), and rejects any other value as an unsupported field. Publishing does not change visibility; the publish dialogue chains this call before the status change.
+      tags:
+        - V3 Surveys
+      parameters:
+        - in: path
+          name: surveyId
+          required: true
+          schema:
+            type: string
+            format: cuid2
+          description: Survey identifier.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SurveyVisibilityChangeRequest'
+            examples:
+              makeVisible:
+                summary: Share with the workspace
+                value:
+                  visibility: workspace
+              makePrivate:
+                summary: Hide from the workspace
+                value:
+                  visibility: restricted
+      responses:
+        '200':
+          description: Visibility changed, or already at the requested value
+          headers:
+            X-Request-Id:
+              schema:
+                type: string
+              description: Request correlation ID
+            Cache-Control:
+              schema:
+                type: string
+              example: private, no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SurveyVisibilityChangeResult'
+              examples:
+                madeVisibleByOwner:
+                  summary: Owner shares a draft with the workspace before publishing
+                  value:
+                    data:
+                      id: clsv2234567890123456789012
+                      visibility: workspace
+                      owner:
+                        name: Bob Example
+                      access:
+                        via: workspace
+                        canManageVisibility: true
+                      version: 3
+                      pending: null
+                      changedAt: '2026-09-21T10:15:00.000Z'
+                      changedBy:
+                        type: user
+                        id: clus2234567890123456789012
+                        name: Bob Example
+                madePrivateByManager:
+                  summary: An organisation manager hides a departed colleague's survey
+                  value:
+                    data:
+                      id: clsv1234567890123456789012
+                      visibility: restricted
+                      owner:
+                        name: Alice Example
+                      access:
+                        via: organizationRole
+                        canManageVisibility: true
+                      version: 3
+                      pending: null
+                      changedAt: '2026-09-21T10:20:00.000Z'
+                      changedBy:
+                        type: user
+                        id: clus3234567890123456789012
+                        name: Carol Manager
+        '400':
+          $ref: '#/components/responses/V3BadRequest'
+        '401':
+          $ref: '#/components/responses/V3Unauthorized'
+        '403':
+          $ref: '#/components/responses/V3VisibilityForbidden'
+        '409':
+          $ref: '#/components/responses/V3VisibilityBlocked'
+        '422':
+          $ref: '#/components/responses/V3VisibilityNotAllowed'
+        '429':
+          $ref: '#/components/responses/V3TooManyRequests'
+        '500':
+          $ref: '#/components/responses/V3InternalServerError'
+        '503':
+          $ref: '#/components/responses/V3ProjectionPending'
+      security:
+        - sessionAuth: []
+        - apiKeyAuth: []
+        - bearerAuth: []
   /api/v3/responses:
     get:
       operationId: getResponsesV3
@@ -1438,42 +2100,7 @@ paths:
                     items:
                       $ref: '#/components/schemas/ResponseListItem'
                   meta:
-                    type: object
-                    required:
-                      - limit
-                      - nextCursor
-                      - totalCount
-                      - totalCountRelation
-                    properties:
-                      limit:
-                        type: integer
-                        minimum: 1
-                        description: The page size actually applied. Carries no `maximum` — it echoes what the server used rather than bounding what may be asked for.
-                      nextCursor:
-                        type:
-                          - string
-                          - 'null'
-                        description: 'Opaque cursor for the next page. `null` when there are no more results — the only reliable end-of-collection signal. Pass it back verbatim: the encoding is deliberately unspecified and may change without notice, so a client that decodes or constructs one is relying on something this contract does not promise.'
-                      totalCount:
-                        type:
-                          - integer
-                          - 'null'
-                        minimum: 0
-                        description: |
-                          Responses matching the current scope and filters across all pages, **counted only up to 10 000**. Exact below that; at the cap the value is exactly `10000` and means "at least 10 000", which `totalCountRelation` states explicitly. `null` unless `includeTotalCount=true`.
-
-                          The cap is not timidity — an exact count over this table grows superlinearly with the data while a capped one stays flat, so an uncapped total is the one part of a page whose cost is unbounded. Read `totalCountRelation` rather than testing for the magic number.
-                      totalCountRelation:
-                        type:
-                          - string
-                          - 'null'
-                        enum:
-                          - eq
-                          - gte
-                          - null
-                        description: |
-                          How to read `totalCount`: `eq` when it is exact, `gte` when the 10 000 cap was reached and it is a lower bound, `null` when `includeTotalCount=false`. This is the same eq/gte convention Elasticsearch uses for `hits.total.relation`, so a consumer can render "10,000+" honestly instead of claiming a precise figure it does not have.
-                    additionalProperties: false
+                    $ref: '#/components/schemas/ResponseListMeta'
               examples:
                 page:
                   summary: One page of responses, exercising several answer types
@@ -1575,6 +2202,12 @@ paths:
           $ref: '#/components/responses/V3Unauthorized'
         '403':
           $ref: '#/components/responses/V3Forbidden'
+        '413':
+          description: Payload Too Large — the request body exceeds the 2 MB limit.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '429':
           $ref: '#/components/responses/V3TooManyRequests'
         '500':
@@ -1689,9 +2322,17 @@ paths:
           $ref: '#/components/responses/V3Unauthorized'
         '403':
           $ref: '#/components/responses/V3Forbidden'
+        '413':
+          description: Payload Too Large — the request body exceeds the 2 MB limit.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '422':
           description: |
-            Unprocessable Content — the body is well-formed but conflicts with stored state: `surveyId` does not resolve, `endingId` is not an ending of that survey, `language` is not enabled on it, `contactId` is not a contact in the same workspace, `displayId` already backs another response, `singleUseId` is already used for this survey, or an answer violates the survey's own validation rules. Each is itemized in `invalid_params`.
+            Unprocessable Content — the body is well-formed but conflicts with stored state: `endingId` is not an ending of that survey, `language` is not enabled on it, `contactId` is not a contact in the same workspace, `displayId` does not exist for that survey or already backs another response, `singleUseId` is already used for this survey, a tag id does not resolve in the same workspace, an `embeddedData` name is not declared on the survey, is ambiguous, or is addressed twice by one payload, a file-upload answer references a file outside this survey's upload element, or an answer violates the survey's own validation rules. Each is itemized in `invalid_params`.
+
+            **`surveyId` is not in that list, and answers 403 instead** — whether it names no survey at all or one in another workspace. Every other id here is checked *after* authorization, inside a workspace the caller already holds, so a distinct answer for each discloses nothing. `surveyId` is the scope anchor and is necessarily checked *before* authorization, so a separate "no such survey" would let any valid API key probe the id space of every other tenant. The two cases are therefore byte-identical, as they are on `GET`, `PATCH` and `DELETE` of a response id.
           content:
             application/problem+json:
               schema:
@@ -1771,6 +2412,8 @@ paths:
             How hard to count. `capped` (the default) stops at 10 000 and reports `relation: gte` at the cap — flat cost, safe to call on anything. `exact` counts every matching row and reports `relation: eq` always.
 
             `exact` is the deliberate slow path: cost grows superlinearly with the matching set, so on a large or loosely-filtered scope it is markedly more expensive than a page of data. Ask for it when a person needs a precise figure, not on a dashboard poll. It exists so that the capped default is a sensible default rather than a limitation, and so the cap cannot be sidestepped by accident.
+
+            **`exact` requires `surveyId` or `contactId`**, and answers **400** naming `precision` without one — the same anchor rule `filter[finished][eq]` and `filter[language][in]` carry. `capped` stops at the cap whatever the scope, so its cost is flat; an unanchored `exact` is a full scan of every response in the workspace, and the contract refuses a query it cannot bound rather than serving it slowly. For a workspace-wide figure use the capped default, which reports `relation: gte` once it reaches the cap.
       responses:
         '200':
           description: Count retrieved successfully
@@ -1921,7 +2564,7 @@ paths:
                           identifier: fr
                           referenceType: language
         '400':
-          description: 'Bad Request — the envelope itself is malformed: missing or unknown `operation`, missing `data`, or a `patch` without `responseId`. Problems *inside* `data` are the point of this endpoint and come back as `200` with `valid: false`, not as a 400.'
+          description: 'Bad Request — the envelope itself is malformed: missing or unknown `operation`, missing `data`, or a `patch` without `responseId`; or the body breaks the request limits (an array past its budget, or nesting past 256 levels). Other problems *inside* `data` are the point of this endpoint and come back as `200` with `valid: false`, not as a 400.'
           content:
             application/problem+json:
               schema:
@@ -2243,7 +2886,7 @@ paths:
 
         `PATCH` is the only update verb — there is no `PUT`. Within it, `data` is replaced wholesale rather than deep-merged, so send the complete answer map; `embeddedData` merges by field name. Unknown top-level keys are rejected with **400** rather than ignored.
 
-        Setting `finished` to `true` fires the finish side of the response pipeline, including Hub ingestion. Updates otherwise emit `responseUpdated`.
+        Every patch emits `responseUpdated` and runs the response pipeline, including Hub ingestion. Transitioning `finished` to `true` additionally emits `responseFinished`; patching a response that is already finished does not re-emit it.
       tags:
         - V3 Responses
       parameters:
@@ -2305,8 +2948,14 @@ paths:
           $ref: '#/components/responses/V3Unauthorized'
         '403':
           $ref: '#/components/responses/V3Forbidden'
+        '413':
+          description: Payload Too Large — the request body exceeds the 2 MB limit.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '422':
-          description: 'Unprocessable Content — the body is well-formed but conflicts with stored state: `endingId` is not an ending of the response''s survey, `language` is not enabled on it, a tag id does not resolve in the same workspace, or an answer violates the survey''s validation rules.'
+          description: 'Unprocessable Content — the body is well-formed but conflicts with stored state: `endingId` is not an ending of the response''s survey, `language` is not enabled on it, a tag id does not resolve in the same workspace, an `embeddedData` name is not declared on the survey, is ambiguous, or is addressed twice by one payload, a file-upload answer references a file outside this survey''s upload element, or an answer violates the survey''s validation rules.'
           content:
             application/problem+json:
               schema:
@@ -3197,18 +3846,7 @@ paths:
                     items:
                       $ref: '#/components/schemas/ActionClassResource'
                   meta:
-                    type: object
-                    required:
-                      - limit
-                      - nextCursor
-                    properties:
-                      limit:
-                        type: integer
-                      nextCursor:
-                        type:
-                          - string
-                          - 'null'
-                        description: Opaque cursor for the next page. `null` when there are no more results.
+                    $ref: '#/components/schemas/CursorPaginationMeta'
         '400':
           $ref: '#/components/responses/V3BadRequest'
         '401':
@@ -3282,18 +3920,7 @@ paths:
                     items:
                       $ref: '#/components/schemas/ContactAttributeKeyResource'
                   meta:
-                    type: object
-                    required:
-                      - limit
-                      - nextCursor
-                    properties:
-                      limit:
-                        type: integer
-                      nextCursor:
-                        type:
-                          - string
-                          - 'null'
-                        description: Opaque cursor for the next page. `null` when there are no more results.
+                    $ref: '#/components/schemas/CursorPaginationMeta'
         '400':
           $ref: '#/components/responses/V3BadRequest'
         '401':
@@ -3539,6 +4166,168 @@ paths:
           $ref: '#/components/responses/V3InternalServerError'
       security:
         - sessionAuth: []
+  /api/v3/workspaces/{workspaceId}/custom-css:
+    get:
+      operationId: getWorkspaceCustomCssV3
+      summary: Read workspace custom CSS
+      description: |
+        Returns the workspace's shared survey CSS as editable **source** (light and dark), the one recoverable previous revision, whether the stored CSS is being delivered to respondents (`status`), and whether this caller may change it (`canEdit`, `planAllowed`). Compiled output is never returned here. Requires read access to the workspace. Session cookie, `x-api-key`, or a Bearer token.
+      tags:
+        - V3 Workspaces
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceIdPath'
+      responses:
+        '200':
+          description: Workspace custom CSS
+          headers:
+            X-Request-Id:
+              schema:
+                type: string
+              description: Request correlation ID
+            Cache-Control:
+              schema:
+                type: string
+              example: private, no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WorkspaceCustomCssResource'
+              example:
+                data:
+                  workspaceId: clxx1234567890123456789012
+                  customCss:
+                    light: '[data-fb-part="button-primary"] { border-radius: 999px; }'
+                    dark: null
+                  previous: null
+                  status: ok
+                  canEdit: true
+                  planAllowed: true
+        '400':
+          $ref: '#/components/responses/V3BadRequest'
+        '401':
+          $ref: '#/components/responses/V3Unauthorized'
+        '403':
+          $ref: '#/components/responses/V3Forbidden'
+        '429':
+          $ref: '#/components/responses/V3TooManyRequests'
+        '500':
+          $ref: '#/components/responses/V3InternalServerError'
+      security:
+        - sessionAuth: []
+        - apiKeyAuth: []
+        - bearerAuth: []
+    patch:
+      operationId: patchWorkspaceCustomCssV3
+      summary: Save or clear workspace custom CSS
+      description: |
+        Saves or clears the workspace's shared survey CSS. `customCss` replaces both fields; `null` clears all of it. The source is processed by the same processor every save path uses: constructs it removes come back as top-level `warnings`, and CSS it rejects is a **422** that leaves the saved CSS in effect. The replaced value becomes `previous`, the one recoverable revision — restore it by sending its source back. Unchanged source writes nothing.
+
+        Workspace CSS reaches every survey in the workspace, so writing it is narrower than writing a survey: **organization owners and managers** for signed-in users (session or OAuth), and a **`manage`** grant on this workspace for API keys — a Read & write grant is refused with **403**. On Formbricks Cloud, adding or editing needs the Scale plan (**403** `custom_css_plan_required`); clearing never does. Successful changes refresh the cached configuration the SDKs receive (they pick it up on their next configuration fetch). Saves that add or edit CSS count against a custom CSS budget of 60 per minute per user or API key, shared with custom CSS validation and with survey writes that add or edit custom CSS; beyond it they return **429**. Re-saving the same CSS and clearing it are never counted.
+      tags:
+        - V3 Workspaces
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchWorkspaceCustomCssRequest'
+            examples:
+              save:
+                summary: Save light and dark CSS
+                value:
+                  customCss:
+                    light: '[data-fb-part="button-primary"] { border-radius: 999px; }'
+                    dark: '#fbjs[data-appearance="dark"] { --acme-ink: #e6eef5; }'
+              clear:
+                summary: Clear all workspace CSS
+                value:
+                  customCss: null
+      responses:
+        '200':
+          description: Workspace custom CSS saved (or unchanged)
+          headers:
+            X-Request-Id:
+              schema:
+                type: string
+              description: Request correlation ID
+            Cache-Control:
+              schema:
+                type: string
+              example: private, no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WorkspaceCustomCssResource'
+                  warnings:
+                    $ref: '#/components/schemas/CustomCssWarnings'
+              example:
+                data:
+                  workspaceId: clxx1234567890123456789012
+                  customCss:
+                    light: '[data-fb-part="button-primary"] { border-radius: 999px; }'
+                    dark: null
+                  previous: null
+                  status: ok
+                  canEdit: true
+                  planAllowed: true
+                warnings: []
+        '400':
+          description: Bad Request — malformed body, a missing `customCss` key or a missing `light` / `dark` key, an unsupported field (including `compiled` or `processorVersion`), or a field that is neither a string nor null. Every offending field is itemized in `invalid_params`. CSS over the size budget is a **422** `source_too_large`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          $ref: '#/components/responses/V3Unauthorized'
+        '403':
+          description: 'Forbidden — no access to the workspace (404 not used; avoids existence leak), a principal that may not write workspace CSS (`code: forbidden`), or an addition or edit on an organization without the Scale plan (`code: custom_css_plan_required`).'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content — the CSS could not be processed (a syntax error, the 100 000-byte workspace budget, a complexity limit). `invalid_params` names `customCss.light` / `customCss.dark`; `details.errors` carries the processor's located errors. Nothing was saved.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                title: Unprocessable Content
+                status: 422
+                detail: Custom CSS failed validation
+                code: unprocessable_content
+                requestId: req_01j9zq7w3k2m4n5p6r7s8t9v0w
+                invalid_params:
+                  - name: customCss.light
+                    reason: Unexpected end of input (line 3, column 1)
+                details:
+                  errors:
+                    - code: syntax_error
+                      scope: workspace
+                      appearance: light
+                      line: 3
+                      column: 1
+                      reason: Unexpected end of input
+        '429':
+          $ref: '#/components/responses/V3TooManyRequests'
+        '500':
+          $ref: '#/components/responses/V3InternalServerError'
+      security:
+        - sessionAuth: []
+        - apiKeyAuth: []
+        - bearerAuth: []
   /api/v3/feedbackRecords:
     get:
       operationId: listFeedbackRecordsV3
@@ -3556,6 +4345,19 @@ paths:
         are **not** split. Filters on enrichment members (`sentiment`, `emotions`, `sentiment_score_*`)
         never match records that have not been enriched — use `has_sentiment=false` / `has_emotions=false`
         to find those.
+
+        **Incremental extraction.** To keep a copy of a dataset in sync, filter on `updated_since` and
+        page with `sort=updated_at&order=asc`, bounded by `updated_until`: every page is then one index
+        range, and a record that changes while you page normally comes back later in the run. Start each
+        run with a `limit=1` request and read its `Date` header: that value is this run's `updated_until`
+        and, minus a few minutes, the next run's `updated_since` — both bounds from the same value, or
+        records between them are never read. Do not use the newest `updated_at` received instead: it
+        skips a write that was still committing when you read past its timestamp.
+        Upsert by `id` and let the most recent fetch win. Deleted records leave nothing for
+        `updated_since` to match, so reconcile deletions separately: periodically list every record id
+        with no `updated_since`, and remove the local records that were not returned and were created
+        before that listing's start (its first response's `Date` header) minus the overlap. Run one
+        sync at a time.
       tags:
         - V3 Feedback Records
       parameters:
@@ -3694,6 +4496,18 @@ paths:
             format: date-time
           description: '`created_at <= created_until` (ISO 8601, inclusive).'
         - in: query
+          name: updated_since
+          schema:
+            type: string
+            format: date-time
+          description: '`updated_at >= updated_since` (ISO 8601, inclusive). `updated_at` is stamped when a record is created, corrected, or enriched (translation, sentiment, emotions), so this selects records created **or changed** since a point — the filter for incremental extraction. Deleted records are never returned; see "Incremental extraction" above for choosing the next value and for detecting deletions.'
+        - in: query
+          name: updated_until
+          schema:
+            type: string
+            format: date-time
+          description: '`updated_at <= updated_until` (ISO 8601, inclusive).'
+        - in: query
           name: value_number_min
           schema:
             type: number
@@ -3775,8 +4589,9 @@ paths:
             enum:
               - collected_at
               - created_at
+              - updated_at
             default: collected_at
-          description: 'Column to order by. Only columns that are non-null and immutable after insert are offered: a mutable sort key would let a row move across the cursor between pages and be skipped.'
+          description: 'Column to order by. `collected_at` and `created_at` never change. `updated_at` does, so it is accepted only with `order=asc`: a record that changes while you page then normally moves ahead of the cursor and is returned again (upsert it by `id`). Descending, or with no `order` (which defaults to `desc`), it answers **400**. Even ascending, a write that started before the cursor''s position and commits after it is missed by that run and picked up by the next, whose `updated_since` is the previous run''s start minus an overlap. Use `sort=updated_at&order=asc` with `updated_since` and `updated_until` for incremental extraction.'
         - in: query
           name: order
           schema:
@@ -4101,7 +4916,10 @@ paths:
       operationId: getFeedbackRecordV3
       summary: Get a feedback record
       description: |
-        Returns one feedback record by id. The gateway looks the record up to learn its dataset and
+        Returns one feedback record by id, with its read-only assignment in the active directory
+        taxonomy. The assignment reflects the current visible path in the active run; editing a record
+        does not reclassify it until another run. `taxonomy` is null if its lookup is unavailable.
+        The gateway looks the record up to learn its dataset and
         authorizes against that, so no `tenant_id` is sent. Requires an API key with **read**
         permission (or higher) on a workspace the record's dataset is assigned to.
 
@@ -4118,7 +4936,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/FeedbackRecord'
+                $ref: '#/components/schemas/FeedbackRecordDetail'
               examples:
                 enriched:
                   summary: A text record after enrichment
@@ -4144,6 +4962,18 @@ paths:
                       - anger
                     value_text_translated: Die Warteschlangen am Nordtor waren viel zu lang.
                     translation_lang_key: de
+                    taxonomy:
+                      status: classified
+                      run_id: 018e1234-5678-7abc-8ef0-123456789abe
+                      path:
+                        - id: 018e1234-5678-7abc-8ef0-123456789abf
+                          label: Queueing
+                          level: 1
+                          node_type: branch
+                        - id: 018e1234-5678-7abc-8ef0-123456789ac0
+                          label: North gate
+                          level: 2
+                          node_type: leaf
         '400':
           $ref: '#/components/responses/FeedbackRecordsBadRequest'
         '401':
@@ -4343,81 +5173,178 @@ components:
         The same management API key, presented as `Authorization: Bearer <key>` instead of `x-api-key`. Equivalent in every way — same key, same workspace permissions — and offered because it is what most HTTP clients and SDK generators reach for by default.
         A **401** from any operation that accepts it carries `WWW-Authenticate: Bearer realm="formbricks"`. Session-only operations accept neither this nor `x-api-key`.
   schemas:
-    SurveyListItem:
+    SurveyVisibility:
+      type: string
+      enum:
+        - restricted
+        - workspace
+      description: '`restricted`: readable by the owner and the organisation''s owners and managers only. The owner''s access is conditional on their workspace access, level for level: they read the survey only while they can read the workspace, and edit it only while they can write to it — being the owner grants nothing the workspace does not. `workspace`: readable by everyone with access to the workspace — today''s behaviour.'
+    SurveyOwner:
       type: object
-      description: |
-        Shape returned by `GET /api/v3/surveys`. Serialized dates are ISO 8601 strings.
-        The v3 overview contract intentionally omits internal fields such as `_count`.
-        Legacy DB rows may include survey **type** values `website` or `web` (see Prisma); filter **type** only accepts `link` | `app`.
+      description: 'The authorization owner — the person whose restricted surveys these are. Distinct from `creator`, which is attribution only and is never rewritten. Display only, like `creator`: no user id is exposed, because `access.via === "owner"` already answers "is this mine" and `filter[owner][in]=me` filters server-side. Ownership transfer can add an identifier later, additively. Durable source: `Survey.ownerId` in PostgreSQL, projected to `survey#owner@user`; the graph never holds ownership alone, so a rebuild from an empty graph restores it.'
       required:
-        - id
         - name
-        - workspaceId
-        - type
-        - status
-        - publishOn
-        - createdAt
-        - updatedAt
-        - archivedAt
-        - responseCount
-        - completedResponseCount
-        - creator
       properties:
-        id:
-          type: string
         name:
           type: string
-        workspaceId:
+      additionalProperties: false
+    SurveyAccess:
+      type: object
+      description: Why **this caller** can see the survey, and whether they may change its visibility. Derived by the server per request; a rendering hint only — every mutation is re-authorised on the server.
+      required:
+        - via
+        - canManageVisibility
+      properties:
+        via:
           type: string
-        type:
-          type: string
-          enum:
-            - link
-            - app
-            - website
-            - web
-        status:
-          type: string
-          enum:
-            - draft
-            - inProgress
-            - paused
-            - completed
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-        archivedAt:
-          type:
-            - string
-            - 'null'
-          format: date-time
-          description: Soft-delete/archive marker (ISO 8601); `null` when the survey is active.
-        publishOn:
-          type:
-            - string
-            - 'null'
-          format: date-time
-          description: Scheduled publish time (ISO 8601), or null if not scheduled.
-        responseCount:
-          type: integer
-          description: Number of responses, including partial ones.
-        completedResponseCount:
-          type: integer
-          description: Number of responses the respondent finished.
-        creator:
-          type:
-            - object
-            - 'null'
-          description: The user who created the survey, or null for API-key/system-created surveys.
+          description: 'Why this caller can see the survey. Known values today: `workspace` (the survey is workspace-visible and the caller has workspace read — always the value for API keys), `owner` (restricted, the caller owns it), `organizationRole` (restricted, the caller reaches it only as an organisation owner or manager — the case that shows the admin banner). **Open set, deliberately not an enum**: named person and team sharing will add values, so clients treat an unknown string as "some other access path" and never branch exhaustively. Explanatory metadata, not authorization truth — the server re-authorises every call.'
+          examples:
+            - workspace
+            - owner
+            - organizationRole
+        canManageVisibility:
+          type: boolean
+          description: 'Permission only: `true` when this caller holds `survey.change_visibility` — owner or organisation owner/manager, feature enabled for the organisation and deployment. It can be `true` while `allowedTargets` is empty (blockers, or no owner): it answers "may this person manage visibility at all", which is what shows or hides the controls; `allowedTargets` on `GET …/visibility` answers which transitions would succeed now. Stays `true` for an organisation manager on an ownerless restricted survey.'
+      additionalProperties: false
+    SurveyVisibilityFields:
+      type: object
+      description: The three fields every `SurveyListItem` and `SurveyResource` carries, merged into both via `allOf`. All required, always present.
+      required:
+        - visibility
+        - owner
+        - access
+      properties:
+        visibility:
+          allOf:
+            - $ref: '#/components/schemas/SurveyVisibility'
+          description: The **enforced** visibility on this request. `restricted` whenever a change is pending, in either direction (fail closed). `workspace` for every survey while the deployment's readiness marker is unset, whatever the stored flag, and always `workspace` for API keys.
+        owner:
+          anyOf:
+            - $ref: '#/components/schemas/SurveyOwner'
+            - type: 'null'
+          description: '`null` when the author''s account no longer exists (`Survey.ownerId` is set null on user deletion) or the survey was created with an API key. A survey with `owner: null` cannot be restricted; an organisation owner/manager can still make it workspace-visible.'
+        access:
+          $ref: '#/components/schemas/SurveyAccess'
+    SurveyListItem:
+      allOf:
+        - type: object
+          description: |
+            Shape returned by `GET /api/v3/surveys`. Serialized dates are ISO 8601 strings.
+            The v3 overview contract intentionally omits internal fields such as `_count`.
+            Legacy DB rows may include survey **type** values `website` or `web` (see Prisma); filter **type** only accepts `link` | `app`.
           required:
+            - id
             - name
+            - workspaceId
+            - type
+            - status
+            - publishOn
+            - createdAt
+            - updatedAt
+            - archivedAt
+            - responseCount
+            - completedResponseCount
+            - creator
           properties:
+            id:
+              type: string
             name:
               type: string
-          additionalProperties: false
+            workspaceId:
+              type: string
+            type:
+              type: string
+              enum:
+                - link
+                - app
+                - website
+                - web
+            status:
+              type: string
+              enum:
+                - draft
+                - inProgress
+                - paused
+                - completed
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+            archivedAt:
+              type:
+                - string
+                - 'null'
+              format: date-time
+              description: Soft-delete/archive marker (ISO 8601); `null` when the survey is active.
+            publishOn:
+              type:
+                - string
+                - 'null'
+              format: date-time
+              description: Scheduled publish time (ISO 8601), or null if not scheduled.
+            responseCount:
+              type: integer
+              description: Number of responses, including partial ones.
+            completedResponseCount:
+              type: integer
+              description: Number of responses the respondent finished.
+            creator:
+              type:
+                - object
+                - 'null'
+              description: The user who created the survey, or null for API-key/system-created surveys.
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+              additionalProperties: false
+        - $ref: '#/components/schemas/SurveyVisibilityFields'
+    ListPaginationMeta:
+      type: object
+      description: |-
+        The pagination half of a v3 list's `meta`, shared by every paginated collection.
+
+        Deliberately open, and never an endpoint's `meta` by itself: an endpoint composes it with `allOf` and closes the result with `unevaluatedProperties: false`. A base that closed itself could not be extended — inside an `allOf`, `additionalProperties: false` sees a sibling branch's properties as additional and rejects them. An endpoint that adds nothing still wraps it, so no `meta` anywhere is open.
+
+        Every field here is `required`. A shared envelope that makes its fields optional is how v3's predecessor stopped honouring its own pagination contract without the schema gate noticing (ENG-2622): `meta: {}` — or no `meta` at all — validated cleanly while the endpoint returned nothing.
+      required:
+        - limit
+        - nextCursor
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          description: 'The page size actually applied. Carries no `maximum`: it echoes what the server used, it does not bound what may be asked for. The request-side bound is the `limit` query parameter on the operation itself and differs per collection — read it there. A shared description cannot state it without being wrong for some of the operations that compose this base.'
+        nextCursor:
+          type:
+            - string
+            - 'null'
+          description: 'Opaque cursor for the next page. `null` when there are no more results — the only reliable end-of-collection signal, since the server may return fewer items than `limit` without the collection being exhausted. Pass it back verbatim: the encoding is deliberately unspecified and may change without notice, so a client that decodes or constructs one is relying on something this contract does not promise.'
+    SurveyListMeta:
+      allOf:
+        - $ref: '#/components/schemas/ListPaginationMeta'
+        - type: object
+          required:
+            - totalCount
+            - workspaceSurveyCount
+          properties:
+            totalCount:
+              type:
+                - integer
+                - 'null'
+              minimum: 0
+              description: Total number of surveys matching the current filters across all pages. `null` when `includeTotalCount=false`.
+            workspaceSurveyCount:
+              type:
+                - integer
+                - 'null'
+              minimum: 0
+              description: Total number of surveys in the workspace, archived (soft-deleted) ones included and independent of the current filters. `null` when `includeTotalCount=false` (the same gate as `totalCount`). Replaces the boolean `hasArchived` field of earlier releases.
+      unevaluatedProperties: false
+      description: The list `meta` for surveys — pagination, the filtered total, and the workspace total. Both counting fields are `required` but nullable, gated on `includeTotalCount`.
     InvalidParam:
       type: object
       description: |
@@ -4445,13 +5372,19 @@ components:
             - invalid_locale
             - invalid_reference
             - missing_required_field
+            - misordered_reference
             - missing_translation
+            - qsf_limit_exceeded
+            - qsf_not_recognized
+            - read_only_field
             - unsupported_field
             - unsupported_locale
           description: |
             Machine-readable validation category, when available.
 
             This is the shared error shape every v3 operation returns, so it lists what the API can emit today and nothing more — `INVALID_PARAM_CODES` in `app/api/v3/lib/response.ts` is the registry, and a code absent from it is dropped before the response is built. Categories for operations that do not exist yet are added with the code that emits them, not ahead of it.
+
+            `qsf_not_recognized` and `qsf_limit_exceeded` come from the Qualtrics import (an internal, session-only route sharing this shape): the file is not a Qualtrics export it can read, or it is one past an import limit, which `identifier` names.
         identifier:
           type: string
           description: Identifier involved in the validation failure, when available. For language errors, this can be the normalized language code.
@@ -4509,20 +5442,29 @@ components:
             - ai_generated_payload_invalid
             - ai_instance_not_configured
             - ai_output_too_long
+            - ai_provider_auth_failed
             - ai_smart_tools_disabled
             - bad_gateway
             - bad_request
             - conflict
+            - custom_css_plan_required
             - forbidden
             - internal_server_error
             - invalid_workflow_state
             - not_authenticated
             - not_found
             - payload_too_large
+            - projection_pending
             - service_unavailable
+            - stored_survey_invalid
+            - survey_not_workspace_visible
             - too_many_requests
             - unprocessable_content
+            - visibility_blocked_by_connections
+            - visibility_change_not_allowed
+            - visibility_not_enabled
             - workflow_not_executable
+            - workspace_survey_limit_reached
         requestId:
           type: string
         details:
@@ -4645,6 +5587,10 @@ components:
           type: boolean
         imageUrl:
           type: string
+        imageAltText:
+          allOf:
+            - $ref: '#/components/schemas/TranslatableText'
+          description: Text alternative for `imageUrl`, read by screen readers. Omit or leave empty for a decorative image (rendered as `alt=""`).
         videoUrl:
           type: string
         isDraft:
@@ -4945,6 +5891,10 @@ components:
           description: Stable picture choice id.
         imageUrl:
           type: string
+        imageAltText:
+          allOf:
+            - $ref: '#/components/schemas/TranslatableText'
+          description: Text alternative for `imageUrl`, read by screen readers. Omit or leave empty to fall back to the positional label ("Option 1", "Option 2", …); a choice image is never decorative, since the respondent selects it.
       additionalProperties: false
     SurveyPictureSelectionElement:
       allOf:
@@ -5535,6 +6485,10 @@ components:
           type: string
         imageUrl:
           type: string
+        imageAltText:
+          allOf:
+            - $ref: '#/components/schemas/TranslatableText'
+          description: Text alternative for `imageUrl`, read by screen readers. Omit or leave empty for a decorative image (rendered as `alt=""`).
         videoUrl:
           type: string
         hideDefaultIcon:
@@ -5592,8 +6546,11 @@ components:
       properties:
         enabled:
           type: boolean
+          description: |
+            Derived, not stored: `true` whenever the survey declares at least one hidden field. A value sent on create or update is ignored; to turn hidden fields off, remove them from `fieldIds`.
         fieldIds:
           type: array
+          maxItems: 200
           items:
             type: string
             pattern: ^[a-zA-Z0-9_-]+$
@@ -5729,6 +6686,7 @@ components:
         triggers:
           type: array
           default: []
+          maxItems: 50
           items:
             $ref: '#/components/schemas/SurveyTrigger'
           description: |
@@ -5997,11 +6955,29 @@ components:
         filters:
           $ref: '#/components/schemas/SegmentFilters'
       additionalProperties: false
+    CustomCssInput:
+      type: object
+      description: 'Custom CSS **source** as a caller writes it (ENG-3641). Both keys are required. `light` is base CSS that applies in both appearances; `dark` adds overrides on top of it when the survey renders dark. `null`, an empty string or whitespace means "no CSS" for that field. Source only: compiled output and the processor version are computed by the server on every write, and a request that supplies either is rejected. The combined source is limited to 100 000 UTF-8 bytes for a workspace and 20 000 for a survey; larger CSS is a **422** with error code `source_too_large`.'
+      required:
+        - light
+        - dark
+      properties:
+        light:
+          type:
+            - string
+            - 'null'
+          description: Base CSS, applied in light and dark appearance.
+        dark:
+          type:
+            - string
+            - 'null'
+          description: Additional CSS applied only in dark appearance.
+      additionalProperties: false
     CreateSurveyRequest:
       type: object
       description: |
         Strict v3 survey creation document. This endpoint accepts survey structure only: name,
-        metadata, languages, welcome card, blocks/elements/logic, endings, hidden fields, and variables.
+        metadata, languages and language settings, welcome card, blocks/elements/logic, endings, hidden fields, and variables.
         App surveys (`type: app`) additionally accept the `distribution` (display options + triggers) and `targeting` (contact segment filters) objects; these are rejected for `link` surveys.
         It rejects legacy `questions` and out-of-scope settings such as styling, follow-ups, recaptcha, single-use/email verification, slug, custom scripts, analytics fields, timestamps, and `createdBy`.
 
@@ -6055,11 +7031,24 @@ components:
         languages:
           type: array
           default: []
+          maxItems: 50
           items:
             $ref: '#/components/schemas/CreateSurveyLanguage'
           description: |
             Optional survey language configuration. Every non-default locale used by translatable maps
             must be declared here; omitted languages are not inferred from map keys.
+        showLanguageSwitch:
+          type:
+            - boolean
+            - 'null'
+          default: null
+          description: Show respondents a language switch on multi-language surveys. `null` and `false` both mean off.
+        autoSelectLanguage:
+          type:
+            - boolean
+            - 'null'
+          default: null
+          description: Open link and app surveys in the respondent's browser language when it matches an enabled survey language; otherwise the default language is used. `null` and `false` both mean off.
         welcomeCard:
           allOf:
             - $ref: '#/components/schemas/SurveyWelcomeCard'
@@ -6068,11 +7057,13 @@ components:
         blocks:
           type: array
           minItems: 1
+          maxItems: 1000
           items:
             $ref: '#/components/schemas/CreateSurveyBlock'
         endings:
           type: array
           default: []
+          maxItems: 100
           items:
             $ref: '#/components/schemas/SurveyEnding'
         hiddenFields:
@@ -6083,6 +7074,7 @@ components:
         variables:
           type: array
           default: []
+          maxItems: 100
           items:
             $ref: '#/components/schemas/CreateSurveyVariable'
         distribution:
@@ -6093,6 +7085,11 @@ components:
           allOf:
             - $ref: '#/components/schemas/SurveyTargeting'
           description: App-survey contact targeting. Only valid when `type` is `app`.
+        customCss:
+          anyOf:
+            - $ref: '#/components/schemas/CustomCssInput'
+            - type: 'null'
+          description: Optional survey custom CSS source. Processed by the server; constructs it removes come back as top-level `warnings` on the 201. Adding CSS needs the Scale plan on Formbricks Cloud (403 `custom_css_plan_required`); CSS that cannot be processed is a 422 with `details.errors`. Processing counts against the custom CSS budget of 60 per minute per user or API key, shared with custom CSS validation; beyond it the create is a 429 and nothing is written.
       additionalProperties: false
     SurveyLanguage:
       type: object
@@ -6230,92 +7227,168 @@ components:
         Survey variable. Variable ids are stable references used by logic and calculation actions.
         Variable names are human-readable labels and must be unique within the survey.
     SurveyResource:
+      allOf:
+        - type: object
+          required:
+            - id
+            - workspaceId
+            - createdAt
+            - updatedAt
+            - archivedAt
+            - name
+            - type
+            - status
+            - metadata
+            - defaultLanguage
+            - languages
+            - showLanguageSwitch
+            - autoSelectLanguage
+            - welcomeCard
+            - blocks
+            - endings
+            - hiddenFields
+            - variables
+            - customCss
+          properties:
+            id:
+              type: string
+            workspaceId:
+              type: string
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+            archivedAt:
+              type:
+                - string
+                - 'null'
+              format: date-time
+              description: Soft-delete/archive marker (ISO 8601); `null` when the survey is active.
+            name:
+              type: string
+            type:
+              type: string
+              enum:
+                - link
+                - app
+            status:
+              type: string
+              enum:
+                - draft
+                - inProgress
+                - paused
+                - completed
+            metadata:
+              anyOf:
+                - $ref: '#/components/schemas/SurveyMetadata'
+                - type: 'null'
+            defaultLanguage:
+              type: string
+              description: Emitted language code/tag for the survey default language. The internal `default` translation key is never exposed.
+            languages:
+              type: array
+              items:
+                $ref: '#/components/schemas/SurveyLanguage'
+            showLanguageSwitch:
+              type:
+                - boolean
+                - 'null'
+              description: Show respondents a language switch on multi-language surveys. `null` and `false` both mean off.
+            autoSelectLanguage:
+              type:
+                - boolean
+                - 'null'
+              description: Open link and app surveys in the respondent's browser language when it matches an enabled survey language; otherwise the default language is used. `null` and `false` both mean off.
+            welcomeCard:
+              $ref: '#/components/schemas/SurveyWelcomeCard'
+            blocks:
+              type: array
+              items:
+                $ref: '#/components/schemas/SurveyBlock'
+            endings:
+              type: array
+              items:
+                $ref: '#/components/schemas/SurveyEnding'
+            hiddenFields:
+              $ref: '#/components/schemas/SurveyHiddenFields'
+            variables:
+              type: array
+              items:
+                $ref: '#/components/schemas/SurveyVariable'
+            distribution:
+              allOf:
+                - $ref: '#/components/schemas/SurveyDistribution'
+              description: App-survey runtime/display settings. Present only for app surveys; omitted for link surveys.
+            targeting:
+              allOf:
+                - $ref: '#/components/schemas/SurveyTargeting'
+              description: App-survey contact targeting. Present only for app surveys; omitted for link surveys.
+            customCss:
+              anyOf:
+                - $ref: '#/components/schemas/CustomCssInput'
+                - type: 'null'
+              description: 'The survey''s custom CSS **source** (ENG-3641), `null` when it has none. Compiled output and the processor version are internal and never exposed here. The full resource may be sent back with PATCH: unchanged source is not reprocessed and needs no plan.'
+        - $ref: '#/components/schemas/SurveyVisibilityFields'
+    CustomCssWarning:
       type: object
+      description: 'A construct the custom CSS processor removed; the rest of the CSS still applies. `unknown_property` and `invalid_value` are notes instead: the declaration stays, but browsers ignore it. The `code` is stable — branch on it, not on `reason`, which never echoes customer source beyond a short construct name.'
       required:
-        - id
-        - workspaceId
-        - createdAt
-        - updatedAt
-        - archivedAt
-        - name
-        - type
-        - status
-        - metadata
-        - defaultLanguage
-        - languages
-        - welcomeCard
-        - blocks
-        - endings
-        - hiddenFields
-        - variables
+        - code
+        - scope
+        - appearance
+        - line
+        - column
+        - reason
       properties:
-        id:
+        code:
           type: string
-        workspaceId:
+          enum:
+            - import_removed
+            - font_face_removed
+            - external_resource_removed
+            - unsupported_at_rule_removed
+            - unsafe_property_removed
+            - unsafe_value_removed
+            - fixed_position_removed
+            - unsafe_selector_removed
+            - unknown_property
+            - invalid_value
+        scope:
           type: string
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-        archivedAt:
+          enum:
+            - workspace
+            - survey
+        appearance:
           type:
             - string
             - 'null'
-          format: date-time
-          description: Soft-delete/archive marker (ISO 8601); `null` when the survey is active.
-        name:
-          type: string
-        type:
-          type: string
           enum:
-            - link
-            - app
-            - website
-            - web
-        status:
+            - light
+            - dark
+            - null
+          description: Source field the issue is in; `null` when it concerns the scope as a whole.
+        line:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+          description: 1-based line in that field's source; `null` when there is no single location.
+        column:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+        reason:
           type: string
-          enum:
-            - draft
-            - inProgress
-            - paused
-            - completed
-        metadata:
-          anyOf:
-            - $ref: '#/components/schemas/SurveyMetadata'
-            - type: 'null'
-        defaultLanguage:
-          type: string
-          description: Emitted language code/tag for the survey default language. The internal `default` translation key is never exposed.
-        languages:
-          type: array
-          items:
-            $ref: '#/components/schemas/SurveyLanguage'
-        welcomeCard:
-          $ref: '#/components/schemas/SurveyWelcomeCard'
-        blocks:
-          type: array
-          items:
-            $ref: '#/components/schemas/SurveyBlock'
-        endings:
-          type: array
-          items:
-            $ref: '#/components/schemas/SurveyEnding'
-        hiddenFields:
-          $ref: '#/components/schemas/SurveyHiddenFields'
-        variables:
-          type: array
-          items:
-            $ref: '#/components/schemas/SurveyVariable'
-        distribution:
-          allOf:
-            - $ref: '#/components/schemas/SurveyDistribution'
-          description: App-survey runtime/display settings. Present only for app surveys; omitted for link surveys.
-        targeting:
-          allOf:
-            - $ref: '#/components/schemas/SurveyTargeting'
-          description: App-survey contact targeting. Present only for app surveys; omitted for link surveys.
+      additionalProperties: false
+    CustomCssWarnings:
+      type: array
+      description: 'Processing warnings for this write: constructs the processor removed. Additive, returned beside `data` (never inside it, so `data` can be sent back unchanged); present only when the write processed custom CSS.'
+      maxItems: 50
+      items:
+        $ref: '#/components/schemas/CustomCssWarning'
     AISurveyGenerationLocaleCode:
       type: string
       enum:
@@ -6441,14 +7514,37 @@ components:
             - type: object
               additionalProperties: true
       additionalProperties: false
+    PatchSurveyLanguage:
+      type: object
+      description: 'Language entry accepted by `PATCH /api/v3/surveys/{surveyId}`. Identical to the create shape plus `alias`, which `GET` returns so a round-tripped body carries it. `alias` belongs to the workspace language rather than the survey, so it is verified rather than applied: echoing the value `GET` returned is a no-op, and a different one is rejected with `read_only_field`.'
+      required:
+        - code
+      properties:
+        code:
+          type: string
+          description: 'Server-emitted survey language code/tag, echoed from `GET`. Deliberately not `LocaleCode`: existing surveys carry language-only and script-only codes (`vi`, `gu`), and a read-only echo has to accept whatever the read returned. New languages are still created through the strict shape.'
+          example: en-US
+        default:
+          type: boolean
+          description: Optional marker for readability; only the `defaultLanguage` entry may set this to true.
+        enabled:
+          type: boolean
+          default: true
+          description: Whether this language is enabled for respondent-facing delivery.
+        alias:
+          type:
+            - string
+            - 'null'
+          description: Workspace-level alias for the language. Read-only; echo the value `GET` returned.
+      additionalProperties: false
     PatchSurveyRequest:
       type: object
       minProperties: 1
       description: |
         Patch payload shape. Top-level fields are partial; any provided nested object or array
-        fully replaces that subtree. Omitted top-level fields are preserved. Immutable/system fields
-        such as `id`, `workspaceId`, `type`, `defaultLanguage`, timestamps, `questions`, analytics, styling,
-        and scripts are rejected. App surveys (stored `type: app`) additionally accept `distribution` and `targeting`; both are rejected for link surveys, and changing `targeting` filters requires the Contacts entitlement.
+        fully replaces that subtree. Omitted top-level fields are preserved.
+
+        The server-owned fields `GET` returns — `id`, `workspaceId`, `type`, `createdAt`, `updatedAt`, `archivedAt`, `defaultLanguage` and `languages[].alias` — are accepted and verified, so a survey fetched with `GET` can be sent straight back. Echoing the value you were given is a no-op; changing one is a **422** `read_only_field`. `visibility`, `owner` and `access` are accepted the same way, but a changed value is a **422** `unsupported_field`: visibility changes go through `POST /api/v3/surveys/{surveyId}/visibility`. A round-tripped `updatedAt` additionally acts as an optimistic-concurrency precondition, and a stale one is rejected with **409**. `questions`, analytics, styling and scripts remain rejected outright. App surveys (stored `type: app`) additionally accept `distribution` and `targeting`; both are rejected for link surveys, and changing `targeting` filters requires the Contacts entitlement.
 
         `metadata`, `languages`, `welcomeCard`, `blocks`, `endings`, `hiddenFields`, and `variables`
         replace their full top-level value when provided. Missing ids in replaced arrays are deletions.
@@ -6458,6 +7554,48 @@ components:
         Use `/api/v3/surveys/validate` with `operation: patch` before committing automated or agentic
         changes.
       properties:
+        id:
+          type: string
+          description: Read-only echo. Must match the survey being patched.
+        workspaceId:
+          type: string
+          description: Read-only echo. A survey cannot be moved between workspaces.
+        type:
+          type: string
+          enum:
+            - link
+            - app
+          description: Read-only echo. Immutable after creation.
+        createdAt:
+          type: string
+          format: date-time
+          description: Read-only echo of the creation timestamp.
+        updatedAt:
+          type: string
+          format: date-time
+          description: 'Read-only echo, and an optimistic-concurrency precondition: the write is applied only if the survey has not changed since the read this value came from, and is otherwise a **409**.'
+        archivedAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Read-only echo. Use `/archive` and `/restore` to change it.
+        visibility:
+          allOf:
+            - $ref: '#/components/schemas/SurveyVisibility'
+          description: Read-only echo. Accepted only unchanged, so a survey fetched with `GET` can be sent back; any other value is a **422** `unsupported_field`. Change it with `POST /api/v3/surveys/{surveyId}/visibility`.
+        owner:
+          anyOf:
+            - $ref: '#/components/schemas/SurveyOwner'
+            - type: 'null'
+          description: Read-only echo, accepted only unchanged (otherwise **422** `unsupported_field`).
+        access:
+          allOf:
+            - $ref: '#/components/schemas/SurveyAccess'
+          description: Read-only echo, accepted only unchanged (otherwise **422** `unsupported_field`).
+        defaultLanguage:
+          type: string
+          description: Read-only echo of the survey default language, in whatever shape `GET` returned — legacy surveys carry language-only codes, so this is not constrained to `LocaleCode`.
         name:
           type: string
           minLength: 1
@@ -6473,29 +7611,43 @@ components:
             - $ref: '#/components/schemas/SurveyMetadata'
         languages:
           type: array
+          maxItems: 50
           items:
-            $ref: '#/components/schemas/CreateSurveyLanguage'
+            $ref: '#/components/schemas/PatchSurveyLanguage'
           description: |
             Replaces the survey language configuration. The default language cannot be changed through
             PATCH; any `default: true` entry must match the existing default language. Languages referenced
             by `metadata`, `welcomeCard`, `blocks`, or `endings` translatable maps must be explicitly
             declared here, so remove the locale key from those maps as well when intentionally removing
             a language.
+        showLanguageSwitch:
+          type:
+            - boolean
+            - 'null'
+          description: Show respondents a language switch on multi-language surveys. `null` and `false` both mean off. Omit to keep the stored value.
+        autoSelectLanguage:
+          type:
+            - boolean
+            - 'null'
+          description: Open link and app surveys in the respondent's browser language when it matches an enabled survey language; otherwise the default language is used. `null` and `false` both mean off. Omit to keep the stored value.
         welcomeCard:
           $ref: '#/components/schemas/SurveyWelcomeCard'
         blocks:
           type: array
           minItems: 1
+          maxItems: 1000
           items:
             $ref: '#/components/schemas/SurveyBlock'
         endings:
           type: array
+          maxItems: 100
           items:
             $ref: '#/components/schemas/SurveyEnding'
         hiddenFields:
           $ref: '#/components/schemas/SurveyHiddenFields'
         variables:
           type: array
+          maxItems: 100
           items:
             $ref: '#/components/schemas/SurveyVariable'
         distribution:
@@ -6507,6 +7659,11 @@ components:
           allOf:
             - $ref: '#/components/schemas/SurveyTargeting'
           description: App-survey contact targeting. Only valid for stored app surveys.
+        customCss:
+          anyOf:
+            - $ref: '#/components/schemas/CustomCssInput'
+            - type: 'null'
+          description: 'Survey custom CSS source. Omitted: unchanged. `null`: clears both fields. An object replaces both fields and needs both keys. Change is judged on normalized source, so echoing the value `GET` returned is a no-op that needs no plan. Adding or editing needs the Scale plan on Formbricks Cloud (403 `custom_css_plan_required`); clearing never does. A failed write keeps the saved CSS. Only an addition or edit is processed, so only it counts against the custom CSS budget of 60 per minute per user or API key, shared with custom CSS validation; beyond it the patch is a 429.'
       additionalProperties: false
     ValidateSurveyPatchRequest:
       type: object
@@ -6529,15 +7686,54 @@ components:
             - type: object
               additionalProperties: true
       additionalProperties: false
+    ValidateSurveyCustomCssRequest:
+      type: object
+      description: Validate custom CSS alone, for a live editor preview (ENG-3641). Processes the CSS exactly as a save would and returns the compiled result and warnings, without saving, versioning, touching timestamps or invalidating caches. Requires read access to `workspaceId`, and to `surveyId` when given; a valid result grants nothing — the write path checks permissions and the plan again.
+      required:
+        - operation
+        - workspaceId
+        - scope
+        - data
+      properties:
+        operation:
+          type: string
+          enum:
+            - customCss
+        workspaceId:
+          type: string
+          format: cuid2
+        scope:
+          type: string
+          enum:
+            - workspace
+            - survey
+          description: Which budget and cascade layer the CSS is processed for.
+        surveyId:
+          type: string
+          format: cuid2
+          description: 'Optional, `scope: survey` only. An existing survey, which must belong to `workspaceId`; omit it to validate an unsaved draft.'
+        data:
+          type: object
+          required:
+            - customCss
+          properties:
+            customCss:
+              anyOf:
+                - $ref: '#/components/schemas/CustomCssInput'
+                - type: 'null'
+          additionalProperties: false
+      additionalProperties: false
     ValidateSurveyRequest:
       oneOf:
         - $ref: '#/components/schemas/ValidateSurveyCreateRequest'
         - $ref: '#/components/schemas/ValidateSurveyPatchRequest'
+        - $ref: '#/components/schemas/ValidateSurveyCustomCssRequest'
       discriminator:
         propertyName: operation
         mapping:
           create: '#/components/schemas/ValidateSurveyCreateRequest'
           patch: '#/components/schemas/ValidateSurveyPatchRequest'
+          customCss: '#/components/schemas/ValidateSurveyCustomCssRequest'
     SurveyValidationLanguage:
       type: object
       required:
@@ -6557,6 +7753,67 @@ components:
           enum:
             - connect_or_create
           description: Validation is read-only; a real write would connect an existing language or create it if missing.
+      additionalProperties: false
+    CustomCssCompiled:
+      type: object
+      description: 'Compiled custom CSS returned by a successful validation: complete stylesheets wrapped in the custom CSS cascade layers and scoped to the survey root. `null` for a field with no CSS. Never returned on a failed validation, and never part of an authenticated resource (those carry source).'
+      required:
+        - light
+        - dark
+      properties:
+        light:
+          type:
+            - string
+            - 'null'
+        dark:
+          type:
+            - string
+            - 'null'
+      additionalProperties: false
+    CustomCssError:
+      type: object
+      description: 'A failure that rejects the whole custom CSS operation: nothing is saved, no compiled output is returned, and the previously saved CSS stays in effect.'
+      required:
+        - code
+        - scope
+        - appearance
+        - line
+        - column
+        - reason
+      properties:
+        code:
+          type: string
+          enum:
+            - syntax_error
+            - source_too_large
+            - output_too_large
+            - limit_exceeded
+            - processing_failed
+        scope:
+          type: string
+          enum:
+            - workspace
+            - survey
+        appearance:
+          type:
+            - string
+            - 'null'
+          enum:
+            - light
+            - dark
+            - null
+        line:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+        column:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+        reason:
+          type: string
       additionalProperties: false
     SurveyValidationResult:
       type: object
@@ -6583,7 +7840,366 @@ components:
           description: Languages that a successful write would connect or create. Present only when `valid=true`.
           items:
             $ref: '#/components/schemas/SurveyValidationLanguage'
+        customCss:
+          $ref: '#/components/schemas/CustomCssCompiled'
+          description: Compiled custom CSS, when the payload carried `customCss` and `valid=true`. Never present on a failed validation.
+        warnings:
+          type: array
+          maxItems: 50
+          description: Constructs the processor removed from the payload's `customCss`, when it carried one.
+          items:
+            $ref: '#/components/schemas/CustomCssWarning'
+        errors:
+          type: array
+          maxItems: 50
+          description: Why the payload's `customCss` could not be processed, when it could not.
+          items:
+            $ref: '#/components/schemas/CustomCssError'
       additionalProperties: false
+    CustomCssValidationResult:
+      type: object
+      description: 'Result of `operation: customCss`. On success it carries the compiled CSS and warnings; on failure the processor''s errors, with no compiled output.'
+      required:
+        - valid
+        - operation
+        - invalid_params
+      properties:
+        valid:
+          type: boolean
+        operation:
+          type: string
+          enum:
+            - customCss
+        invalid_params:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvalidParam'
+        customCss:
+          $ref: '#/components/schemas/CustomCssCompiled'
+        warnings:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/CustomCssWarning'
+        errors:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/CustomCssError'
+      additionalProperties: false
+    SurveyBlockUpdateOperation:
+      type: object
+      additionalProperties: false
+      description: Replace one existing block, addressed by id.
+      required:
+        - op
+        - id
+        - block
+      properties:
+        op:
+          type: string
+          enum:
+            - update
+        id:
+          type: string
+          maxLength: 128
+          minLength: 1
+          description: Block to replace.
+        block:
+          allOf:
+            - $ref: '#/components/schemas/CreateSurveyBlock'
+          description: |
+            Replaces the target block entirely — the same whole-subtree rule PATCH uses. `block.id` is optional and taken from `id` when omitted; if present it must equal `id`.
+    SurveyBlockInsertPosition:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - start
+              description: Insert before every existing block.
+        - type: object
+          additionalProperties: false
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - end
+              description: Insert after every existing block.
+        - type: object
+          additionalProperties: false
+          required:
+            - type
+            - blockId
+          properties:
+            type:
+              type: string
+              enum:
+                - after
+            blockId:
+              type: string
+              maxLength: 128
+              minLength: 1
+              description: |
+                Block to insert after. May be a block inserted by an earlier operation in the same request, since operations are applied in order.
+      description: Where an inserted block goes. Anchored to a block id, never to a positional index.
+    SurveyBlockInsertOperation:
+      type: object
+      additionalProperties: false
+      description: Add a new block at an anchored position.
+      required:
+        - op
+        - block
+        - position
+      properties:
+        op:
+          type: string
+          enum:
+            - insert
+        block:
+          allOf:
+            - $ref: '#/components/schemas/CreateSurveyBlock'
+          description: |
+            New block. `id` is optional and generated when omitted, matching survey creation. Supply one only when a later operation in the same request anchors after it; if supplied it must not already exist on the survey.
+        position:
+          $ref: '#/components/schemas/SurveyBlockInsertPosition'
+    SurveyBlockRemoveOperation:
+      type: object
+      additionalProperties: false
+      description: Delete one existing block, addressed by id.
+      required:
+        - op
+        - id
+      properties:
+        op:
+          type: string
+          enum:
+            - remove
+        id:
+          type: string
+          maxLength: 128
+          minLength: 1
+          description: |
+            Block to delete, along with every element in it. Answers already collected for those elements are orphaned and the API cannot undo that.
+    SurveyBlockOperation:
+      oneOf:
+        - $ref: '#/components/schemas/SurveyBlockUpdateOperation'
+        - $ref: '#/components/schemas/SurveyBlockInsertOperation'
+        - $ref: '#/components/schemas/SurveyBlockRemoveOperation'
+      discriminator:
+        propertyName: op
+        mapping:
+          update: '#/components/schemas/SurveyBlockUpdateOperation'
+          insert: '#/components/schemas/SurveyBlockInsertOperation'
+          remove: '#/components/schemas/SurveyBlockRemoveOperation'
+      description: A single block operation.
+    EditSurveyBlocksRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - ops
+      properties:
+        ops:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/SurveyBlockOperation'
+          description: |
+            Operations applied in order against a single snapshot, atomically — either all of them land or none do. Each operation resolves against the state left by the previous one, so an insert may anchor after a block an earlier operation inserted, and a remove followed by an insert of the same id is legal.
+        expectedUpdatedAt:
+          type: string
+          format: date-time
+          description: |
+            Optimistic-concurrency precondition: the survey's `updatedAt` from your last read. If the survey changed since, the write is rejected with **409** and the response carries the current value. Omit it to accept last-write-wins.
+    SetSurveyBlockOrderRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - order
+      properties:
+        order:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            type: string
+            maxLength: 128
+            minLength: 1
+          description: |
+            Every current block id, exactly once, in the desired order. Ids are trimmed before use, so an id that is empty or whitespace-only is a **400**, as is a list of more than 1000 ids. A missing, unknown or repeated id is a **422** — repeats are reported as `duplicate_identifier` rather than rejected by the schema, so the response names the offending entry, and a dropped block cannot pass unnoticed, which is what makes this safer than resending the blocks.
+        expectedUpdatedAt:
+          type: string
+          format: date-time
+          description: |
+            Optimistic-concurrency precondition: the survey's `updatedAt` from your last read. If the survey changed since, the write is rejected with **409**.
+    SurveyVisibilityBlocker:
+      type: object
+      description: An outbound connection that must be removed before the survey can become restricted.
+      required:
+        - type
+        - id
+        - name
+      properties:
+        type:
+          type: string
+          enum:
+            - webhook
+            - integration
+            - feedbackSource
+            - dashboard
+            - workflow
+        id:
+          type: string
+        name:
+          type: string
+          description: Display name of the connection, for the UI to list. Never empty; falls back to the type.
+      additionalProperties: false
+    SurveyVisibilityImpact:
+      type: object
+      description: The numbers the confirmation dialogues show.
+      required:
+        - memberCount
+        - responseCount
+      properties:
+        memberCount:
+          type: integer
+          minimum: 0
+          description: People other than the owner and the organisation's owners/managers who can see the survey now (if workspace-visible) or would gain access (if restricted).
+        responseCount:
+          type: integer
+          minimum: 0
+          description: Responses on the survey, partial ones included.
+      additionalProperties: false
+    SurveyVisibilityState:
+      allOf:
+        - type: object
+          required:
+            - id
+          properties:
+            id:
+              type: string
+              description: Survey identifier.
+        - $ref: '#/components/schemas/SurveyVisibilityFields'
+        - type: object
+          required:
+            - blockers
+            - impact
+          properties:
+            blockers:
+              type: array
+              items:
+                $ref: '#/components/schemas/SurveyVisibilityBlocker'
+              description: Connections that make `restricted` refusable right now. Empty when being restricted is allowed, and always empty for the `workspace` direction.
+            impact:
+              $ref: '#/components/schemas/SurveyVisibilityImpact'
+        - type: object
+          required:
+            - pending
+            - version
+            - allowedTargets
+          properties:
+            pending:
+              anyOf:
+                - $ref: '#/components/schemas/SurveyVisibility'
+                - type: 'null'
+              description: The value a `POST` stored that the graph has not yet acknowledged. While non-null the survey is restricted for everyone but the owner (for as long as they keep the workspace access the action needs — read to view, write to edit) and the organisation's owners and managers, whichever value is pending — `visibility` reads `restricted`. Always `null` for a survey just created or copied whose visibility has not been changed yet — its stored value is in effect at once. `"restricted"` means the restriction is already enforced and only the graph is catching up; `"workspace"` means the grant is not yet in effect. `null` normally. Clears when the outbox delivers (within 60 seconds, or the deployment fails closed), or when a later `POST` cancels or supersedes it.
+            version:
+              type: integer
+              minimum: 0
+              description: 'Monotonic per survey; incremented by every accepted `POST`, including cancellations. Projection work is fenced on it: a projector holding an older version never writes. `0` for a survey whose visibility was never changed through this endpoint.'
+            allowedTargets:
+              type: array
+              items:
+                $ref: '#/components/schemas/SurveyVisibility'
+              uniqueItems: true
+              description: Values a `POST …/visibility` by this caller would act on right now. Never the enforced value — **except** when a different value is pending, in which case the enforced value is listed because requesting it cancels the pending change. Never `restricted` while `blockers[]` is non-empty or `owner` is `null`. Empty when nothing would happen. Drives the row menu and the editor control.
+    SurveyVisibilityChangeRequest:
+      type: object
+      required:
+        - visibility
+      properties:
+        visibility:
+          $ref: '#/components/schemas/SurveyVisibility'
+      additionalProperties: false
+    SurveyVisibilityActor:
+      type: object
+      description: Who made the change. Always a user, since API keys cannot change visibility.
+      required:
+        - type
+        - id
+        - name
+      properties:
+        type:
+          type: string
+          enum:
+            - user
+        id:
+          type: string
+        name:
+          type: string
+      additionalProperties: false
+    SurveyVisibilityChangeResult:
+      allOf:
+        - type: object
+          required:
+            - id
+          properties:
+            id:
+              type: string
+              description: Survey identifier.
+        - $ref: '#/components/schemas/SurveyVisibilityFields'
+        - type: object
+          required:
+            - version
+            - pending
+            - changedAt
+            - changedBy
+          properties:
+            version:
+              type: integer
+              minimum: 0
+              description: The survey's visibility version after this call. Unchanged by a no-op.
+            pending:
+              anyOf:
+                - $ref: '#/components/schemas/SurveyVisibility'
+                - type: 'null'
+              description: '`"restricted"` when the restriction is enforced but the graph is still catching up (the outbox will finish it); `null` otherwise. A grant never returns 200 with a pending value.'
+            changedAt:
+              type:
+                - string
+                - 'null'
+              format: date-time
+              description: When the current visibility was last set through this endpoint. `null` when it never was — the survey still has its creation visibility, which is the case for a no-op on a survey nobody has touched. Unchanged by a no-op otherwise.
+            changedBy:
+              anyOf:
+                - $ref: '#/components/schemas/SurveyVisibilityActor'
+                - type: 'null'
+              description: Who last set it. `null` exactly when `changedAt` is `null`.
+    VisibilityBlockedProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          required:
+            - details
+          properties:
+            details:
+              type: object
+              required:
+                - blockers
+              properties:
+                blockers:
+                  type: array
+                  minItems: 1
+                  items:
+                    $ref: '#/components/schemas/SurveyVisibilityBlocker'
+                  description: The same list `GET …/visibility` returns as `blockers[]`.
     ResponseResolution:
       type: object
       description: |
@@ -7092,10 +8708,27 @@ components:
 
             There is no `null` member: a declared key that resolves to nothing is **omitted** from the collection rather than carried with a null. So `embeddedData[]` enumerates what the response actually holds, not what the survey declares — a survey with twelve declared fields and two filled in yields two entries. A field with a default value is never unset, since the default is the fallback before the key is considered missing.
       additionalProperties: false
+    ResponseRawValue:
+      description: |
+        One stored answer or field value, in the four shapes the v3 contract can carry: a string, a number, a list of strings, or a string-to-string map.
+
+        Declared once and referenced by `ResponseDataMap` and `ResponseUnresolvedEntry.rawValue`, so the two places that publish stored JSON cannot drift apart. A stored value outside these shapes (a legacy JSON `null`, an array with non-string items, a map with non-string values) is not published at all rather than reaching a client as a body this contract would reject.
+      oneOf:
+        - type: string
+        - type: number
+        - type: array
+          items:
+            type: string
+        - type: object
+          additionalProperties:
+            type: string
     ResponseUnresolvedEntry:
       type: object
       description: |
-        Stored data whose element no longer exists in the survey definition. Deleting an element leaves its answers behind on already-collected responses and nothing cleans them up, so the payload reports them here instead of dropping them silently or faking them into `answers[]` without a type or a label. Consumers doing analysis can ignore this array; consumers doing export or migration should not.
+        Stored data that nothing in the current survey definition can account for. Deleting an element, a hidden field or a variable leaves its values behind on already-collected responses and nothing cleans them up, so the payload reports them here instead of dropping them silently or faking them into `answers[]` without a type or a label. Consumers doing analysis can ignore this array; consumers doing export or migration should not.
+
+        **A declared field's `defaultValue` takes precedence over anything unreadable stored under its key**, and that is worth stating because this collection otherwise reads as exhaustive. Resolution falls back to the default before a value is ever judged unreadable, so a field that declares one always resolves — and the stored bytes, whatever their shape, are reported nowhere. Only a field with **no** `defaultValue` can reach `valueShapeMismatch`.
+        A **scalar** under a defaultless field is not reported either, and the cause is the reporting guard rather than `locked`. Only `resolveEmbeddedValue` consults the lock; the guard that decides what reaches this collection admits objects only. So an uncoercible scalar — `"yes"` under a boolean field — resolves to nothing and is then excluded for being a scalar, lock or no lock. A non-scalar under a lockless, defaultless field is what does reach `valueShapeMismatch`. Neither omission is a silent drop by accident — one follows from resolution order, the other from the reporting guard — and both are written down so a consumer does not read `unresolved[]` as a guarantee that nothing was left behind. If either proves to matter in practice a reason code can be added without breaking anyone, whereas removing one could not — which is why this is documentation rather than a guess at a fifth enum member.
       required:
         - key
         - rawValue
@@ -7103,31 +8736,28 @@ components:
       properties:
         key:
           type: string
-          description: The key as stored on the response — usually a former element id or hidden-field key.
+          description: The key as stored on the response. For `elementNotInSurvey` it is a former element id or hidden-field name; for `variableNotInSurvey` a variable's cuid, since that map is keyed by id rather than by name; and for `valueShapeMismatch` the id or name of the element or declared field that *does* still exist — that reason means the key resolved and the value did not.
         rawValue:
           description: The stored value, returned verbatim and untyped because nothing describes it any more.
-          oneOf:
-            - type: string
-            - type: number
-            - type: array
-              items:
-                type: string
-            - type: object
-              additionalProperties:
-                type: string
+          $ref: '#/components/schemas/ResponseRawValue'
         reason:
           type: string
           enum:
             - elementNotInSurvey
-            - hiddenFieldNotInSurvey
             - variableNotInSurvey
             - valueShapeMismatch
           description: |
             Why the entry could not be resolved:
 
-            - `elementNotInSurvey` — no element with this id exists in the current definition.
-            - `hiddenFieldNotInSurvey` — the key is not among the survey's declared hidden fields.
-            - `variableNotInSurvey` — no variable with this id exists in the current definition.
+            - `elementNotInSurvey` — nothing in the current definition claims this key. It covers a deleted
+              element **and** a deleted hidden field, because the two cannot be told apart: an answer is
+              stored under its element id and a hidden field under its name, in one shared map, and storage
+              keeps no record of which kind a vanished key used to be.
+
+            - `variableNotInSurvey` — no variable with this id exists in the current definition. Variables
+              *are* distinguishable, because they live in their own map keyed by cuid rather than sharing
+              the answer map.
+
             - `valueShapeMismatch` — the key resolves to a current element **or a declared Embedded Data
               field**, but the stored value's shape cannot be read as an
               answer of that element's type (for example a string where the element expects a selection
@@ -7254,6 +8884,35 @@ components:
         A survey response as returned by the list endpoint. Self-describing: `answers[]` carries each element's id, label, type and value, so a consumer can read a response without also fetching the survey.
 
         `answers[]` and `embeddedData[]` ship on the list view as well as the detailed view — they are the point of the resource, and withholding them from the list would force consumers into an N+1 of item reads. The list view omits only the identity and provenance fields: `contact`, `displayId` and `singleUseId`. See `ResponseResource` for those.
+    ResponseListMeta:
+      allOf:
+        - $ref: '#/components/schemas/ListPaginationMeta'
+        - type: object
+          required:
+            - totalCount
+            - totalCountRelation
+          properties:
+            totalCount:
+              type:
+                - integer
+                - 'null'
+              minimum: 0
+              description: |
+                Responses matching the current scope and filters across all pages, **counted only up to 10 000**. Exact below that; at the cap the value is exactly `10000` and means "at least 10 000", which `totalCountRelation` states explicitly. `null` unless `includeTotalCount=true`.
+
+                The cap is not timidity — an exact count over this table grows superlinearly with the data while a capped one stays flat, so an uncapped total is the one part of a page whose cost is unbounded. Read `totalCountRelation` rather than testing for the magic number.
+            totalCountRelation:
+              type:
+                - string
+                - 'null'
+              enum:
+                - eq
+                - gte
+                - null
+              description: |
+                How to read `totalCount`: `eq` when it is exact, `gte` when the 10 000 cap was reached and it is a lower bound, `null` when `includeTotalCount=false`. This is the same eq/gte convention Elasticsearch uses for `hits.total.relation`, so a consumer can render "10,000+" honestly instead of claiming a precise figure it does not have.
+      unevaluatedProperties: false
+      description: The list `meta` for responses — pagination plus a bounded, opt-in total. Both counting fields are `required` but nullable, so `includeTotalCount=false` answers `null` rather than omitting them.
     ResponseDataMap:
       type: object
       description: |
@@ -7270,16 +8929,31 @@ components:
         Keeping the two apart is what lets the storage layout change underneath — the legacy columns go away eventually — without this contract either following it or breaking a round-trip it promised.
 
         The value shapes are the stored ones, and they differ by element type. `ResponseAnswer` documents each; `answers[]` on the read is the resolved view of this same map.
+
+        **Bounds are a write-side concern and live on `ResponseDataMapInput`, not here.** This schema is the stored shape, and a read must describe what the API can actually return: the v1 and v2 write paths store this same map with no cardinality limit, so a response written through them can carry more keys — or a longer multi-select — than a v3 write would accept. Declaring the write bounds on this schema would make `GET /api/v3/responses/{responseId}` promise something it cannot keep for those rows.
       additionalProperties:
-        oneOf:
-          - type: string
-          - type: number
-          - type: array
-            items:
-              type: string
-          - type: object
-            additionalProperties:
-              type: string
+        $ref: '#/components/schemas/ResponseRawValue'
+    ResponseDataMapInput:
+      allOf:
+        - $ref: '#/components/schemas/ResponseDataMap'
+        - type: object
+          description: |
+            The same map on the way in, with the cardinality bounds a v3 write enforces.
+
+            At most 500 keys, and at most 1000 entries in a multi-select array or matrix object. Both sit far above any real survey — a response holds one entry per element, a multi-select answer one per choice — and exist because every later reader pays per entry: the serializer's per-answer mapping, export columns, and the positional probe the "Other" response filter emits. Exceeding either is a **400** from the request schema, not a 422.
+
+            Deliberately separate from `ResponseDataMap`, which the read returns. These bounds are v3-only — the v1 and v2 write paths store the same map without them — so a stored response may exceed them, and the read schema must not claim otherwise.
+          maxProperties: 500
+          additionalProperties:
+            if:
+              type: array
+            then:
+              maxItems: 1000
+            else:
+              if:
+                type: object
+              then:
+                maxProperties: 1000
     ResponseEmbeddedDataInput:
       type: object
       description: |
@@ -7292,7 +8966,8 @@ components:
         - `ingested` (hidden fields) — accepted, through the same ingest contract the SDK uses: the name
           must be declared on the survey, the value is coerced to the field's declared `type`, a `locked`
           field ignores the write, and the whole payload is bounded. A name the survey does not declare is
-          a 400 rather than a silent drop.
+          a **422** rather than a silent drop — knowing whether a name is declared means loading the
+          survey, and these operations route every failure that needs stored state to 422.
 
         - `computed` (variables) — accepted, because a management caller correcting a response needs to,
           and v1 and v2 both allow it today.
@@ -7306,9 +8981,12 @@ components:
 
         `null` **clears** a field. Omission and `null` therefore mean different things — leave it alone versus remove its value — which is the only reading that makes a merge-shaped map able to express deletion at all. A cleared field is then absent from `embeddedData[]` on the next read, exactly as one that was never written, and a field whose definition carries a `defaultValue` falls back to that default rather than disappearing.
 
-        **An ambiguous name is refused.** The read says `key` is unique per `kind` rather than across the collection, because a survey predating the reserved-name guard can hold a variable and a hidden field under one name. This map has no `kind`, so on such a survey a name cannot say which field it means — and guessing would write the caller's value into the wrong one. A name that matches more than one declared field is a 400 naming it; rename one side on the survey to clear it. The set is finite, frozen and tracked, and nothing new can enter it.
+        **An ambiguous name is refused.** The read says `key` is unique per `kind` rather than across the collection, because a survey predating the reserved-name guard can hold a variable and a hidden field under one name. This map has no `kind`, so on such a survey a name cannot say which field it means — and guessing would write the caller's value into the wrong one. A name that matches more than one declared field is a **422** naming it, for the same reason as an undeclared one; rename one side on the survey to clear it. The set is finite, frozen and tracked, and nothing new can enter it.
 
         Reserved names collide differently and are not ambiguous: `reserved` is not writable at all, so a name that matches both a declared field and a catalog entry resolves to the declared one.
+
+        **At most 500 names.** Every name that matches no declared field becomes its own `invalid_params` entry naming it, so without a cap a large body answers with a 422 several times its own size. Far above any real survey; a v3-only bound, as on `data`.
+      maxProperties: 500
       additionalProperties:
         oneOf:
           - type: string
@@ -7320,9 +8998,14 @@ components:
       description: |
         Per-element time-to-complete, keyed by element id, in **milliseconds**. Accepted on create so that a caller replaying a real submission can carry its timing; reads report the same information as `durationSeconds` in seconds, on each answer and summed at the top level.
 
-        This is client-reported telemetry, not a measurement the server can vouch for, so each value is clamped into `[0, 86400000]` (24 hours per element) rather than rejected — a noisy timing value should never cost you the response. Any finite number is therefore accepted, which is why no bounds are declared here.
+        This is client-reported telemetry, not a measurement the server can vouch for, so each value is clamped into `[0, 86400000]` (24 hours per element) rather than rejected — a noisy timing value should never cost you the response. Any finite *value* is therefore accepted, and none is declared out of range.
 
-        **Do not send a `_total` key.** The server writes that bucket itself when the response is finished, by summing every value in this map — including a `_total` you supplied, which is then counted twice and permanently skews the stored total. `durationSeconds` on the read is computed from the real element entries and ignores the bucket entirely, so there is nothing to gain by sending one.
+        The number of **entries** is capped at 500, matching `data`: a response holds one timing per element, so anything beyond that is not telemetry the server can use. A map with more entries is **rejected** — `maxProperties` below is enforced during request validation, so the whole write fails rather than the excess being trimmed or stored.
+
+        **Do not send a `_total` key.** The server owns that bucket: it drops any `_total` you supply and writes its own when the response is finished, by summing the element entries. Sending one therefore changes nothing rather than skewing the stored total, and `durationSeconds` on the read is computed from the element entries regardless.
+
+        **An omitted map is not the same as an empty one.** Omitting `ttc` stores no timings at all and the response reports no `durationSeconds`; sending `{}` on a finished response stores a `_total` of zero, which reads as "completed instantly".
+      maxProperties: 500
       additionalProperties:
         type: number
     ResponseMetaInput:
@@ -7384,7 +9067,7 @@ components:
           type: boolean
           description: 'Whether this response is complete. Creating with `finished: true` fires the finish side of the pipeline immediately, including Hub ingestion.'
         data:
-          $ref: '#/components/schemas/ResponseDataMap'
+          $ref: '#/components/schemas/ResponseDataMapInput'
         embeddedData:
           $ref: '#/components/schemas/ResponseEmbeddedDataInput'
         ttc:
@@ -7394,6 +9077,7 @@ components:
         tags:
           type: array
           uniqueItems: true
+          maxItems: 100
           description: Tag ids to apply, so a tagged response can be created in one call rather than a create followed by a patch. Tags must already exist in the same workspace — create them via `POST /api/v3/tags`. Applied in the same transaction as the response.
           items:
             type: string
@@ -7414,10 +9098,13 @@ components:
           description: Contact to attribute the response to. **Create-only** — a response cannot later be re-linked to a different contact. Must be a contact in the same workspace.
         displayId:
           type: string
+          format: cuid2
           description: Display (survey impression) this response answers. Create-only. Each display can back at most one response.
         singleUseId:
           type: string
-          description: Single-use link id, for surveys configured with single-use links. Create-only, and unique per survey.
+          minLength: 1
+          maxLength: 255
+          description: 'Single-use link id, for surveys configured with single-use links. Create-only, and unique per survey. Bounded because the value is indexed with `surveyId`: an empty string would slip past the uniqueness pre-check and still be stored, and an oversize one overflows the index entry.'
       additionalProperties: false
     ResponseContact:
       type: object
@@ -7478,7 +9165,7 @@ components:
 
         They are not the *same* view, and the differences are deliberate. A write accepts `ingested` and `computed` fields only: a `reserved` entry describes the submission environment, and being able to read one back is not a licence to author it. An unset field is **omitted** from the read while `null` on a write **clears** one, because a merge-shaped map has no other way to spell deletion. And a name the read returns twice under different `kind`s cannot be written at all — see `ResponseEmbeddedDataInput`, which refuses an ambiguous name rather than guessing.
 
-        Values themselves round-trip: within those two kinds every value the read emits is accepted verbatim on a write, and a `date` reads and writes as the same ISO-8601 string. So a read-edit-write cycle loses nothing except on the finite set of legacy surveys carrying one name as both a variable and a hidden field, where the write refuses the name outright.
+        Values themselves round-trip: within those two kinds every value the read emits is accepted verbatim on a write, and a `date` reads and writes as the same ISO-8601 string. So a read-edit-write cycle loses nothing except in two cases, both confined to rows v1 or v2 wrote. The first is the finite set of legacy surveys carrying one name as both a variable and a hidden field, where the write refuses the name outright. The second is a `data` map holding more keys than `ResponseDataMapInput` accepts: the stored map is unbounded and the write bound is not, so such a response cannot be patched here — and trimming it to fit is not a workaround, since `data` is replaced wholesale and an omitted key is a deletion.
 
         Note which fields carry `readOnly` here and which do not, because it is the opposite of what an "echo" framing would suggest. `readOnly` means a value is managed exclusively by the server, so it marks the **derived** views — `answers[]`, `embeddedData[]`, `unresolved[]`, `resolution`, the denormalized `surveyName` and `workspaceId`, the timestamps, `durationSeconds` and `id`. `data` is *not* read-only: it is exactly what the write endpoints accept, and leaving it unmarked is what makes this representation round-trippable rather than merely informative.
 
@@ -7496,44 +9183,7 @@ components:
           enum:
             - create
         data:
-          description: Intended create payload. Invalid documents are allowed so the endpoint can return repairable validation errors.
-          anyOf:
-            - $ref: '#/components/schemas/CreateResponseRequest'
-            - type: object
-              additionalProperties: true
-      additionalProperties: false
-    PatchResponseRequest:
-      type: object
-      description: |
-        Partially updates a response. Strict at the top level: unknown keys return **400** rather than being ignored, and at least one patchable field must be present.
-
-        `data` is **replaced wholesale**, not deep-merged — send the complete answer map you want stored. `embeddedData` is the exception and merges by name: it addresses individual fields, so a field the payload omits keeps its value rather than being cleared.
-
-        **Note for the implementation, because the obvious shortcut is wrong.** The one shipped update service merges `data` (`apps/web/lib/response/service.ts`, `// merge data object`), and merges `ttc` with it. Reusing it would ship merge semantics under a replace contract, silently — an unimplemented route has no test to catch the difference. v3 replaces on purpose: a merge makes it impossible to delete an answer, which a correction flow needs. A patch that sets `finished` to `true` fires the finish side of the response pipeline.
-
-        Not patchable, and rejected if sent: `createdAt`, `updatedAt`, `surveyId`, `contactId`, `displayId`, `singleUseId`, `contactAttributes`, and the create-only `ttc` and `meta` — timing and submission context describe the original submission event, so they are set once and not revised. `contactId` is create-only deliberately — re-attributing an existing response to a different person is a capability only v2 offers, and it is not carried forward.
-      minProperties: 1
-      properties:
-        finished:
-          type: boolean
-        endingId:
-          type:
-            - string
-            - 'null'
-        language:
-          type:
-            - string
-            - 'null'
-        data:
-          $ref: '#/components/schemas/ResponseDataMap'
-        embeddedData:
-          $ref: '#/components/schemas/ResponseEmbeddedDataInput'
-        tags:
-          type: array
-          description: Complete set of tag ids for this response, replacing whatever is currently applied. Tags must already exist in the same workspace — create them via `POST /api/v3/tags`.
-          items:
-            type: string
-            format: cuid2
+          description: 'Intended create payload, checked against `CreateResponseRequest` by the operation rather than by this envelope. Any JSON value is accepted here so the endpoint can return repairable validation errors: a document that is not an object, or that breaks `CreateResponseRequest`, is a **200** with `valid: false`, not a 400. Only the request limits come first: an array past its budget, or nesting past 256 levels, is a 400 for any request.'
       additionalProperties: false
     ValidateResponsePatchRequest:
       type: object
@@ -7550,11 +9200,7 @@ components:
           type: string
           format: cuid2
         data:
-          description: Intended patch payload. Invalid documents are allowed so the endpoint can return repairable validation errors.
-          anyOf:
-            - $ref: '#/components/schemas/PatchResponseRequest'
-            - type: object
-              additionalProperties: true
+          description: 'Intended patch payload, checked against `PatchResponseRequest` by the operation rather than by this envelope. Any JSON value is accepted here so the endpoint can return repairable validation errors: a document that is not an object, or that breaks `PatchResponseRequest`, is a **200** with `valid: false`, not a 400. Only the request limits come first: an array past its budget, or nesting past 256 levels, is a 400 for any request.'
       additionalProperties: false
     ValidateResponseRequest:
       oneOf:
@@ -7593,7 +9239,7 @@ components:
           description: The display that would be linked, or `null` if none.
         firesPipeline:
           type: boolean
-          description: Whether a real write would run the response pipeline — webhooks, integrations, follow-ups, and Hub ingestion. True for a create, and for a patch that transitions the response to finished.
+          description: 'Whether a real write would run the response pipeline — webhooks, integrations, follow-ups, and Hub ingestion. Always `true`: a create emits `responseCreated` and every patch emits `responseUpdated`, so a write is never side-effect free. A patch that transitions the response to finished additionally emits `responseFinished`; the transition decides which events go out, not whether any do.'
         countsTowardMeteredResponses:
           type: boolean
           description: Whether a real write would consume one metered monthly response.
@@ -7666,6 +9312,42 @@ components:
           maxItems: 100
           uniqueItems: true
           description: Response ids to delete, at most 100 per call.
+          items:
+            type: string
+            format: cuid2
+      additionalProperties: false
+    PatchResponseRequest:
+      type: object
+      description: |
+        Partially updates a response. Strict at the top level: unknown keys return **400** rather than being ignored, and at least one patchable field must be present.
+
+        `data` is **replaced wholesale**, not deep-merged — send the complete answer map you want stored. `embeddedData` is the exception and merges by name: it addresses individual fields, so a field the payload omits keeps its value rather than being cleared.
+
+        v3 replaces on purpose, where v1 and v2 merge: a merge makes it impossible to delete an answer, which a correction flow needs.
+
+        **Every patch runs the response pipeline**, emitting `responseUpdated` — so webhooks, integrations and follow-ups fire for a correction as much as for a substantive edit. A patch that *transitions* the response to finished additionally emits `responseFinished`; one that patches an already-finished response does not re-emit it.
+
+        Not patchable, and rejected if sent: `createdAt`, `updatedAt`, `surveyId`, `contactId`, `displayId`, `singleUseId`, `contactAttributes`, and the create-only `ttc` and `meta` — timing and submission context describe the original submission event, so they are set once and not revised. `contactId` is create-only deliberately — re-attributing an existing response to a different person is a capability only v2 offers, and it is not carried forward.
+      minProperties: 1
+      properties:
+        finished:
+          type: boolean
+        endingId:
+          type:
+            - string
+            - 'null'
+        language:
+          type:
+            - string
+            - 'null'
+        data:
+          $ref: '#/components/schemas/ResponseDataMapInput'
+        embeddedData:
+          $ref: '#/components/schemas/ResponseEmbeddedDataInput'
+        tags:
+          type: array
+          maxItems: 100
+          description: Complete set of tag ids for this response, replacing whatever is currently applied. Repeats are allowed and collapse, because the set is applied as a set. Tags must already exist in the same workspace — create them via `POST /api/v3/tags`.
           items:
             type: string
             format: cuid2
@@ -7860,21 +9542,13 @@ components:
           minimum: 0
           description: Total number of runs (dry runs included) for this workflow.
     CursorPaginationMeta:
-      type: object
-      required:
-        - limit
-        - nextCursor
-      properties:
-        limit:
-          type: integer
-          minimum: 1
-          maximum: 100
-        nextCursor:
-          type:
-            - string
-            - 'null'
-          description: Opaque cursor for the next page. `null` when there are no more results.
-      additionalProperties: false
+      allOf:
+        - $ref: '#/components/schemas/ListPaginationMeta'
+      unevaluatedProperties: false
+      description: |-
+        A list `meta` carrying pagination and nothing else — the shape for collections that do not report a total and have no domain context to echo.
+
+        Adds nothing to `ListPaginationMeta`; the `allOf` wrapper is what closes it. Each composing operation bounds its own requests through its `limit` query parameter, which is why this shape states no cap of its own.
     WorkflowNodeUi:
       type: object
       description: Builder-only UI metadata that does not affect workflow execution. Additional keys are preserved.
@@ -8400,6 +10074,7 @@ components:
                   - definition_not_executable
                   - survey_not_found
                   - ending_card_not_found
+                  - survey_not_workspace_visible
                   - recipient_not_allowed
                 description: Machine-readable problem category.
               field:
@@ -8509,6 +10184,60 @@ components:
           type: integer
           minimum: 0
           description: Responses currently carrying this tag. `0` when the tag exists but has never been applied.
+    WorkspaceCustomCssResource:
+      type: object
+      description: 'A workspace''s shared survey CSS (ENG-3641): editable source for authorized readers, never compiled output. It applies to every survey in the workspace, beneath each survey''s own CSS.'
+      required:
+        - workspaceId
+        - customCss
+        - previous
+        - status
+        - canEdit
+        - planAllowed
+      properties:
+        workspaceId:
+          type: string
+        customCss:
+          anyOf:
+            - $ref: '#/components/schemas/CustomCssInput'
+            - type: 'null'
+          description: Current source; `null` when the workspace has no custom CSS.
+        previous:
+          anyOf:
+            - $ref: '#/components/schemas/CustomCssInput'
+            - type: 'null'
+          description: The one recoverable previous revision. Restore it by sending this source back with PATCH; it is processed and authorized like any other save.
+        status:
+          type: string
+          enum:
+            - ok
+            - stale
+            - withheld
+          description: '`stale`: compiled by an older processor and delivered by recompiling its source. `withheld`: the source no longer passes the current processor, so respondents receive none of it until it is fixed and saved again.'
+        errors:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/CustomCssError'
+          description: Present only when `status` is `withheld`.
+        canEdit:
+          type: boolean
+          description: 'Whether this caller may PATCH it: organization owners and managers for signed-in users, a `manage` grant on this workspace for API keys.'
+        planAllowed:
+          type: boolean
+          description: Whether the organization's plan allows additions and edits (Scale on Formbricks Cloud; every self-hosted plan). Removing CSS is always allowed.
+      additionalProperties: false
+    PatchWorkspaceCustomCssRequest:
+      type: object
+      required:
+        - customCss
+      properties:
+        customCss:
+          anyOf:
+            - $ref: '#/components/schemas/CustomCssInput'
+            - type: 'null'
+          description: Replaces both fields. `null` clears all workspace CSS. Adding or editing CSS needs the Scale plan on Formbricks Cloud; clearing either field or all CSS never does.
+      additionalProperties: false
     FeedbackRecordFieldType:
       type: string
       description: 'The type of a feedback field, which determines which `value_*` member carries the answer: `text` → `value_text` (the only enrichable type), `categorical` → `value_text` + `value_id`, `nps` / `csat` / `ces` / `rating` / `number` → `value_number`, `boolean` → `value_boolean`, `date` → `value_date`.'
@@ -8542,9 +10271,53 @@ components:
         - fear
         - surprise
         - disgust
+    FeedbackRecordTaxonomy:
+      type: object
+      description: Read-time view of the record's membership in the active directory taxonomy.
+      additionalProperties: false
+      required:
+        - status
+        - run_id
+        - path
+      properties:
+        status:
+          type: string
+          enum:
+            - classified
+            - unclassified
+            - no_active_taxonomy
+        run_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        path:
+          type: array
+          description: Currently visible non-root nodes in root-to-leaf order; empty unless classified.
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - id
+              - label
+              - level
+              - node_type
+            properties:
+              id:
+                type: string
+                format: uuid
+              label:
+                type: string
+              level:
+                type: integer
+              node_type:
+                type: string
+                enum:
+                  - branch
+                  - leaf
     FeedbackRecord:
       type: object
-      description: 'One piece of feedback in the normalized Feedback Record shape. Field names are `snake_case`: the payload is the Hub''s, passed through the API gateway unchanged. Optional members are **absent** (not `null`) when unset.'
+      description: 'One piece of feedback in the normalized Feedback Record shape. Field names are `snake_case`: the payload is the Hub''s, passed through the API gateway unchanged. Optional members are **absent** (not `null`) when unset, except `taxonomy` on the get-one response, which is null if its lookup fails.'
       additionalProperties: false
       required:
         - id
@@ -8557,6 +10330,11 @@ components:
         - submission_id
         - tenant_id
       properties:
+        taxonomy:
+          description: Read-only active directory taxonomy assignment. Returned only by the get-one operation; null if the lookup is temporarily unavailable.
+          oneOf:
+            - $ref: '#/components/schemas/FeedbackRecordTaxonomy'
+            - type: 'null'
         id:
           type: string
           format: uuid
@@ -8918,6 +10696,12 @@ components:
         next_cursor:
           type: string
           description: Opaque keyset cursor for the next page. Present only when a full page was returned and there may be more results. Pass it back unchanged as `cursor`.
+    FeedbackRecordDetail:
+      allOf:
+        - $ref: '#/components/schemas/FeedbackRecord'
+        - type: object
+          required:
+            - taxonomy
     UpdateFeedbackRecordRequest:
       type: object
       description: A partial update. Only the members sent are changed; an empty body is accepted and changes nothing. Provenance (`tenant_id`, `source_*`, `field_*`, `submission_id`, `collected_at`) is immutable.
@@ -9043,6 +10827,109 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    V3VisibilityForbidden:
+      description: 'Forbidden, one of two codes. `forbidden`: the caller cannot see the survey, **or** sees it but may not change its visibility — workspace members without ownership, team-level managers, and every API key — with the same body as any unreadable survey. `visibility_not_enabled`: the organisation lacks the RBAC / access-control entitlement, or the deployment''s readiness marker for survey visibility is not set; this answer does not depend on the survey.'
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+        Cache-Control:
+          schema:
+            type: string
+          example: private, no-store
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            notAllowed:
+              summary: Team-level manager, or an API key
+              value:
+                title: Forbidden
+                status: 403
+                detail: You are not authorized to access this resource
+                code: forbidden
+                requestId: req_01j8z3
+            notEnabled:
+              summary: Organisation is not entitled, or the deployment has not enabled visibility
+              value:
+                title: Forbidden
+                status: 403
+                detail: Survey visibility is not enabled for this organization.
+                code: visibility_not_enabled
+                requestId: req_01j8z4
+    V3VisibilityBlocked:
+      description: Conflict — `restricted` was requested while outbound connections depend on the survey. Remove or re-point them, then retry. `details.blockers` matches `blockers[]` from the `GET`.
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+        Cache-Control:
+          schema:
+            type: string
+          example: private, no-store
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/VisibilityBlockedProblem'
+          example:
+            title: Conflict
+            status: 409
+            detail: Make this survey visible to the workspace to keep using it in 2 connections, or remove them before restricting it.
+            code: visibility_blocked_by_connections
+            requestId: req_01j8z5
+            details:
+              blockers:
+                - type: webhook
+                  id: clwh1234567890123456789012
+                  name: Zapier — new responses
+                - type: workflow
+                  id: clwf1234567890123456789012
+                  name: 'Notify #product on completion'
+    V3VisibilityNotAllowed:
+      description: 'Unprocessable — `restricted` was requested on a survey with no owner (`owner: null`). Restricted means "the owner and the organisation''s administrators"; with no owner it would mean administrators only, which is not a state the product offers. Duplicate the survey to get a restricted copy you own.'
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+        Cache-Control:
+          schema:
+            type: string
+          example: private, no-store
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            title: Unprocessable Content
+            status: 422
+            detail: This survey has no author and can't be restricted. Duplicate it to get a restricted copy you own.
+            code: visibility_change_not_allowed
+            requestId: req_01j8z6
+    V3ProjectionPending:
+      description: 'Service Unavailable — only for a **grant** (`restricted → workspace`): the flag and a new `version` were stored, but the graph did not acknowledge the projection within the request. The survey stays restricted meanwhile (fail closed); the change is queued durably and lands within 60 seconds or the deployment fails closed. `GET …/visibility` shows `pending: "workspace"`. Retrying the `POST` is safe: it re-attempts the projection and answers **200** only when the graph holds this exact version. A `POST` for `restricted` cancels the pending grant. A restriction never answers 503 — it is enforced the moment it is stored. Chosen over **202 Accepted** so the pending state stays an exception, not the normal path every client must poll.'
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          example: 5
+        X-Request-Id:
+          schema:
+            type: string
+        Cache-Control:
+          schema:
+            type: string
+          example: private, no-store
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            title: Service Unavailable
+            status: 503
+            detail: The visibility change is queued but not yet enforced. Re-read the survey's visibility.
+            code: projection_pending
+            requestId: req_01j8z7
     V3UnprocessableContent:
       description: Unprocessable Content — semantic validation failed or the requested lifecycle transition is invalid.
       headers:
@@ -9109,7 +10996,7 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     FeedbackRecordsBadRequest:
-      description: 'Bad Request. From the **gateway** (`text/plain`): a missing or malformed `tenant_id`, a request body that is not JSON, or a path under `/api/v3/feedbackRecords` that is not one of the documented operations. A record id that is not a UUID and a path such as `/count` both fall in that last case and share the one `Unsupported FeedbackRecords route` body, so the two cannot be told apart from the response. From the **feedback store** (`application/problem+json`): schema validation failures — an unknown enum value, an inverted range, a malformed or re-ordered cursor, or a string with NULL bytes or invalid UTF-8.'
+      description: 'Bad Request. From the **gateway** (`text/plain`): a missing or malformed `tenant_id`; a request body that is not a single JSON object; a body whose top-level keys can be read more than one way (a repeated key, a key with non-ASCII characters, or a key that differs from `tenant_id` only in letter case); a `tenant_id` query parameter given more than once; or a path under `/api/v3/feedbackRecords` that is not one of the documented operations. A record id that is not a UUID and a path such as `/count` both fall in that last case and share the one `Unsupported FeedbackRecords route` body, so the two cannot be told apart from the response. From the **feedback store** (`application/problem+json`): schema validation failures — an unknown enum value, an inverted range, a malformed or re-ordered cursor, or a string with NULL bytes or invalid UTF-8.'
       content:
         text/plain:
           schema:
@@ -9118,6 +11005,12 @@ components:
             missingTenant:
               summary: Gateway — tenant_id missing or malformed
               value: Invalid or missing tenant_id
+            invalidBody:
+              summary: Gateway — body is not a single JSON object, or has a repeated or non-ASCII key
+              value: Invalid request body
+            ambiguousTenant:
+              summary: Gateway — tenant_id given in more than one spelling, or repeated in the query
+              value: Ambiguous tenant_id
             unsupportedRoute:
               summary: Gateway — not a documented operation
               value: Unsupported FeedbackRecords route
@@ -9269,6 +11162,14 @@ components:
         type: string
         format: cuid2
       description: Workflow identifier.
+    WorkspaceIdPath:
+      in: path
+      name: workspaceId
+      required: true
+      schema:
+        type: string
+        format: cuid2
+      description: Workspace identifier.
     FeedbackRecordsTenantIdQuery:
       in: query
       name: tenant_id

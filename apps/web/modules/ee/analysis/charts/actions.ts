@@ -19,8 +19,11 @@ import {
   getCharts,
   updateChart,
 } from "@/modules/ee/analysis/charts/lib/charts";
-import { dropEmptyMeasureRows } from "@/modules/ee/analysis/charts/lib/empty-measure-rows";
-import { pruneOptionLabels, resolveOptionGrouping } from "@/modules/ee/analysis/charts/lib/option-grouping";
+import {
+  dropEmptyMeasureRows,
+  withOptionIdFilter,
+} from "@/modules/ee/analysis/charts/lib/empty-measure-rows";
+import { pruneChartLabels, resolveOptionGrouping } from "@/modules/ee/analysis/charts/lib/option-grouping";
 import { checkFeedbackDirectoryAccess, checkWorkspaceAccess } from "@/modules/ee/analysis/lib/access";
 import {
   type TDimensionValue,
@@ -289,10 +292,11 @@ export const executeQueryAction = authenticatedActionClient
         source: "charts.executeQueryAction",
       });
 
-      const { rewrittenQuery, optionLabels } = await resolveOptionGrouping(parsedInput.query, workspaceId);
+      const grouping = await resolveOptionGrouping(parsedInput.query, workspaceId, feedbackDirectoryId);
+      const { rewrittenQuery } = grouping;
 
       const rawRows = await executeTenantScopedQuery({
-        query: rewrittenQuery,
+        query: withOptionIdFilter(rewrittenQuery),
         feedbackDirectoryId,
         workspaceId,
         organizationId,
@@ -303,9 +307,7 @@ export const executeQueryAction = authenticatedActionClient
       // Cube emits a row per group present in the source, including groups no selected measure can
       // answer for — they render as blank bars and empty Chart Data rows (ENG-3150).
       const rows = dropEmptyMeasureRows(Array.isArray(rawRows) ? rawRows : [], rewrittenQuery);
-      const usedLabels = pruneOptionLabels(rewrittenQuery, rows, optionLabels);
-
-      return { rows, ...(usedLabels ? { optionLabels: usedLabels } : {}), effectiveQuery: rewrittenQuery };
+      return { rows, ...pruneChartLabels(grouping, rows), effectiveQuery: rewrittenQuery };
     }
   );
 
@@ -341,6 +343,8 @@ export const generateAIChartAction = authenticatedActionClient
         source: "charts.generateAIChartAction",
       });
 
+      await applyRateLimit(rateLimitConfigs.actions.aiChartGeneration, ctx.user.id);
+
       const { chartType, query, name } = await generateAIChartQuery({
         organizationId,
         workspaceId,
@@ -350,20 +354,26 @@ export const generateAIChartAction = authenticatedActionClient
       });
 
       const validatedQuery = ZChartQuery.parse(query);
-
-      const data = await executeTenantScopedQuery({
-        query: validatedQuery,
-        feedbackDirectoryId,
-        workspaceId,
-        organizationId,
-        userId: ctx.user.id,
-        source: "charts.generateAIChartAction",
-      });
+      // Resolved like a builder query, so an AI chart grouped by option or matrix-row ids renders
+      // survey labels (and a matrix its survey order) from the first paint, not bare ids.
+      const [grouping, data] = await Promise.all([
+        resolveOptionGrouping(validatedQuery, workspaceId, feedbackDirectoryId),
+        executeTenantScopedQuery({
+          query: withOptionIdFilter(validatedQuery),
+          feedbackDirectoryId,
+          workspaceId,
+          organizationId,
+          userId: ctx.user.id,
+          source: "charts.generateAIChartAction",
+        }),
+      ]);
+      const rows = Array.isArray(data) ? data : [];
 
       return {
         query: validatedQuery,
         chartType,
-        data: Array.isArray(data) ? data : [],
+        data: rows,
+        ...pruneChartLabels(grouping, rows),
         // Prefills the chart-name input (only when the user hasn't typed a name).
         suggestedName: name,
       };

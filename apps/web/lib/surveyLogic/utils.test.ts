@@ -1,8 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
-import {
-  type TEmbeddedValueResponse,
-  deriveLegacyEmbeddedData,
-} from "@formbricks/types/embedded-data-resolver";
+import { embeddedFieldsFromLegacyInput } from "@formbricks/types/embedded-data-mapping";
+import { type TEmbeddedValueResponse } from "@formbricks/types/embedded-data-resolver";
 import { TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import { TResponseData, TResponseVariables } from "@formbricks/types/responses";
 import { TSurveyBlockLogic, TSurveyBlockLogicAction } from "@formbricks/types/surveys/blocks";
@@ -100,7 +98,7 @@ describe("surveyLogic", () => {
     ],
     // The rows are the only thing `getSurveyEmbeddedFields` reads since ENG-2412, so a fixture that
     // declares a variable has to carry the matching row — that is what a real survey read returns.
-    embeddedFields: deriveLegacyEmbeddedData({
+    embeddedFields: embeddedFieldsFromLegacyInput({
       variables: [{ id: "v", name: "num", type: "number", value: 0 }],
     }),
     displayOption: "displayOnce",
@@ -307,6 +305,40 @@ describe("surveyLogic", () => {
     // the selection does not match: equals is false, doesNotEqual is true
     expect(evaluateLogic(multiSurvey, data, vars, condition("equals", "opt2"), "en")).toBe(false);
     expect(evaluateLogic(multiSurvey, data, vars, condition("doesNotEqual", "opt2"), "en")).toBe(true);
+  });
+
+  test("evaluateLogic treats doesNotIncludeAllOf as the inverse of includesAllOf", () => {
+    const vars: TResponseVariables = {};
+    const evaluate = (
+      operator: "includesAllOf" | "doesNotIncludeAllOf" | "doesNotIncludeOneOf",
+      right: string[]
+    ) =>
+      evaluateLogic(
+        mockSurvey,
+        { farr: ["foo", "bar"] },
+        vars,
+        {
+          id: "g",
+          connector: "and",
+          conditions: [
+            {
+              id: "c",
+              leftOperand: { type: "hiddenField", value: "farr" },
+              operator,
+              rightOperand: { type: "static", value: right },
+            },
+          ],
+        },
+        "en"
+      );
+
+    // One of the values is missing, so the answer does not include all of them — but it does include one.
+    expect(evaluate("includesAllOf", ["foo", "baz"])).toBe(false);
+    expect(evaluate("doesNotIncludeAllOf", ["foo", "baz"])).toBe(true);
+    expect(evaluate("doesNotIncludeOneOf", ["foo", "baz"])).toBe(false);
+    // Every value is present.
+    expect(evaluate("includesAllOf", ["foo", "bar"])).toBe(true);
+    expect(evaluate("doesNotIncludeAllOf", ["foo", "bar"])).toBe(false);
   });
 
   test("performActions calculates, requires, and jumps correctly", () => {
@@ -895,7 +927,7 @@ describe("surveyLogic", () => {
       ],
       questions: [],
       variables: TWO_VARIABLES,
-      embeddedFields: deriveLegacyEmbeddedData({ variables: TWO_VARIABLES }),
+      embeddedFields: embeddedFieldsFromLegacyInput({ variables: TWO_VARIABLES }),
     };
 
     const data: TResponseData = {
@@ -1091,7 +1123,7 @@ describe("surveyLogic", () => {
       ],
       questions: [],
       variables: TWO_VARIABLES,
-      embeddedFields: deriveLegacyEmbeddedData({ variables: TWO_VARIABLES }),
+      embeddedFields: embeddedFieldsFromLegacyInput({ variables: TWO_VARIABLES }),
     };
 
     const vars: TResponseVariables = {
@@ -1186,7 +1218,7 @@ describe("surveyLogic", () => {
     const surveyWithVars: TJsWorkspaceStateSurvey = {
       ...mockSurvey,
       variables: TWO_VARIABLES,
-      embeddedFields: deriveLegacyEmbeddedData({ variables: TWO_VARIABLES }),
+      embeddedFields: embeddedFieldsFromLegacyInput({ variables: TWO_VARIABLES }),
     };
 
     const data: TResponseData = {
@@ -1481,7 +1513,7 @@ describe("computed fields resolve through the inlined EmbeddedData rows", () => 
 
   const computedRow = (dataType: "number" | "string", defaultValue: number | string) => [
     {
-      field: { name: "score", source: "computed" as const, dataType, defaultValue, locked: false },
+      field: { key: null, name: "score", source: "computed" as const, dataType, defaultValue, locked: false },
       link: { storageKey: STORAGE_KEY },
     },
   ];

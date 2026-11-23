@@ -1,12 +1,12 @@
 "use client";
 
 import { useAutoAnimate } from "@formkit/auto-animate/react";
-import { ChevronDownIcon, LayoutTemplateIcon, PlusCircleIcon } from "lucide-react";
+import { ChevronDownIcon, LayoutTemplateIcon, PlusCircleIcon, UploadIcon } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { type ComponentProps, useEffect, useMemo, useState } from "react";
+import { type ComponentProps, useCallback, useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
-import type { TSurveyStatus, TSurveyType } from "@formbricks/types/surveys/types";
+import type { TSurveyStatus, TSurveyType, TSurveyVisibility } from "@formbricks/types/surveys/types";
 import type { TUserLocale } from "@formbricks/types/user";
 import type { TWorkspaceConfigChannel } from "@formbricks/types/workspace";
 import { CUSTOM_SURVEY_TEMPLATE_ID } from "@/app/lib/templates";
@@ -15,6 +15,7 @@ import { FORMBRICKS_SURVEYS_FILTERS_KEY_LS } from "@/lib/localStorage";
 import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
 import { CreateWithAIDialog } from "@/modules/survey/components/template-list/components/create-with-ai-dialog";
 import { useCreateSurveyFromTemplate } from "@/modules/survey/components/template-list/hooks/use-create-survey-from-template";
+import { ImportSurveyDialog } from "@/modules/survey/import/components/import-survey-dialog";
 import { useArchiveSurvey } from "@/modules/survey/list/hooks/use-archive-survey";
 import { useDeleteSurvey } from "@/modules/survey/list/hooks/use-delete-survey";
 import { useRenameSurvey } from "@/modules/survey/list/hooks/use-rename-survey";
@@ -22,9 +23,18 @@ import { useRestoreSurvey } from "@/modules/survey/list/hooks/use-restore-survey
 import { useSurveys } from "@/modules/survey/list/hooks/use-surveys";
 import { useUpdateSurveyStatus } from "@/modules/survey/list/hooks/use-update-survey-status";
 import { initialFilters } from "@/modules/survey/list/lib/constants";
-import { normalizeSurveyFilters, parseStoredSurveyFilters } from "@/modules/survey/list/lib/utils";
+import {
+  normalizeSurveyFilters,
+  parseStoredSurveyFilters,
+  serializeStoredSurveyFilters,
+} from "@/modules/survey/list/lib/utils";
 import { TSurveyOverviewFilters } from "@/modules/survey/list/types/survey-overview";
 import { TemplateContainerWithPreview } from "@/modules/survey/templates/components/template-container";
+import { useUpdateSurveyVisibility } from "@/modules/survey/visibility/hooks/use-update-survey-visibility";
+import {
+  type TSurveyVisibilityUiGate,
+  withoutVisibilityControls,
+} from "@/modules/survey/visibility/lib/state";
 import { AiIcon } from "@/modules/ui/components/ai";
 import { Button } from "@/modules/ui/components/button";
 import {
@@ -53,6 +63,9 @@ interface SurveysListProps {
   isAIAvailable: boolean;
   aiUnavailableReason?: TAIUnavailableReason;
   showFeaturedTemplates?: boolean;
+  /** ENG-3395: the server-side restricted-surveys gate — see `TSurveyVisibilityUiGate`. */
+  surveyVisibilityGate: TSurveyVisibilityUiGate;
+  currentUserId: string;
 }
 
 type NewSurveyMenuProps = {
@@ -73,6 +86,7 @@ const NewSurveyMenu = ({
   const { t } = useTranslation();
   const router = useRouter();
   const [isAIDialogOpen, setIsAIDialogOpen] = useState(false);
+  const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
   const createSurveyMutation = useCreateSurveyFromTemplate();
   const workspaceBasePath = `/workspaces/${workspace.id}`;
 
@@ -113,9 +127,15 @@ const NewSurveyMenu = ({
             <ChevronDownIcon />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-52">
+        <DropdownMenuContent align="end" className="w-60">
           <DropdownMenuItem icon={<AiIcon />} onSelect={() => setIsAIDialogOpen(true)}>
             {t("workspace.surveys.ai_create.create_with_ai")}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            data-testid="import-survey-menu-item"
+            icon={<UploadIcon className="size-4" />}
+            onSelect={() => setIsImportDialogOpen(true)}>
+            {t("workspace.surveys.import.menu_item")}
           </DropdownMenuItem>
           <DropdownMenuItem
             icon={<LayoutTemplateIcon className="size-4" />}
@@ -141,6 +161,13 @@ const NewSurveyMenu = ({
         open={isAIDialogOpen}
         onOpenChange={setIsAIDialogOpen}
       />
+      <ImportSurveyDialog
+        workspaceId={workspace.id}
+        isAIAvailable={isAIAvailable}
+        aiUnavailableReason={aiUnavailableReason}
+        open={isImportDialogOpen}
+        onOpenChange={setIsImportDialogOpen}
+      />
     </>
   );
 };
@@ -156,9 +183,17 @@ export const SurveysList = ({
   isAIAvailable,
   aiUnavailableReason,
   showFeaturedTemplates = false,
+  surveyVisibilityGate,
 }: Readonly<SurveysListProps>) => {
   const { t } = useTranslation();
   const [surveyFilters, setSurveyFilters] = useState<TSurveyOverviewFilters>(initialFilters);
+  // Set when a visibility request answers `visibility_not_enabled`: changing visibility was switched off
+  // after this page rendered, so every visibility control goes away until the next load. The markers
+  // stay: what is enforced is not decided by that answer.
+  const [isVisibilityTurnedOff, setIsVisibilityTurnedOff] = useState(false);
+  const visibilityGate = isVisibilityTurnedOff
+    ? withoutVisibilityControls(surveyVisibilityGate)
+    : surveyVisibilityGate;
   const [isFilterInitialized, setIsFilterInitialized] = useState(false);
   const [parent] = useAutoAnimate();
 
@@ -192,7 +227,7 @@ export const SurveysList = ({
 
     globalThis.window.localStorage.setItem(
       FORMBRICKS_SURVEYS_FILTERS_KEY_LS,
-      JSON.stringify(normalizedFilters)
+      serializeStoredSurveyFilters(normalizedFilters)
     );
   }, [normalizedFilters, isFilterInitialized]);
 
@@ -219,6 +254,13 @@ export const SurveysList = ({
   const archiveSurveyMutation = useArchiveSurvey({ queryKey });
   const restoreSurveyMutation = useRestoreSurvey({ queryKey });
   const renameSurveyMutation = useRenameSurvey({ queryKey });
+  const updateSurveyVisibilityMutation = useUpdateSurveyVisibility({ listQueryKey: queryKey });
+
+  // Stable: the Collaborate modal runs it from an effect.
+  const handleVisibilityNotEnabled = useCallback(() => {
+    setIsVisibilityTurnedOff(true);
+    setSurveyFilters((prev) => (prev.visibility.length > 0 ? { ...prev, visibility: [] } : prev));
+  }, []);
 
   const showInitialLoading = !isFilterInitialized || (isLoading && surveys.length === 0);
   // Only a workspace without a single survey gets the onboarding empty states. Every other empty
@@ -247,6 +289,10 @@ export const SurveysList = ({
     await renameSurveyMutation.mutateAsync({ surveyId, name });
   };
 
+  const handleUpdateSurveyVisibility = async (surveyId: string, visibility: TSurveyVisibility) => {
+    await updateSurveyVisibilityMutation.mutateAsync({ surveyId, visibility });
+  };
+
   const createSurveyButton = (
     <NewSurveyMenu
       workspace={workspace}
@@ -260,7 +306,10 @@ export const SurveysList = ({
   if (showInitialLoading) {
     return (
       <PageContentWrapper>
-        <PageHeader pageTitle={t("common.surveys")} />
+        {/* The CTA depends on nothing the query fetches, so it stays live while the list loads —
+            someone who came to create a survey should not wait for a list they did not ask for
+            (ENG-2579). Same expression as the loaded state below, so the header does not shift. */}
+        <PageHeader pageTitle={t("common.surveys")} cta={isReadOnly ? <></> : createSurveyButton} />
         <div className="flex items-center justify-between">
           <div className="flex h-9 animate-pulse gap-2">
             <div className="w-48 rounded-md bg-slate-300"></div>
@@ -323,7 +372,7 @@ export const SurveysList = ({
       <div>
         <div className="flex-col space-y-3" ref={parent}>
           <div
-            className="mt-6 grid w-full grid-cols-8 place-items-center gap-3 px-6 pr-8 text-sm text-slate-800"
+            className="mt-6 grid w-full grid-cols-8 place-items-center gap-3 px-6 pr-14 text-sm text-slate-800"
             data-testid="survey-list-header">
             <div className="col-span-2 place-self-start">{t("common.name")}</div>
             <div className="col-span-1">{t("common.status")}</div>
@@ -345,6 +394,11 @@ export const SurveysList = ({
               renameSurvey={handleRenameSurvey}
               publicDomain={publicDomain}
               locale={locale}
+              surveyVisibilityGate={visibilityGate}
+              workspaceName={workspace.name}
+              listQueryKey={queryKey}
+              updateSurveyVisibility={handleUpdateSurveyVisibility}
+              onVisibilityNotEnabled={handleVisibilityNotEnabled}
             />
           ))}
         </div>
@@ -380,6 +434,7 @@ export const SurveysList = ({
           surveyFilters={normalizedFilters}
           setSurveyFilters={setSurveyFilters}
           currentWorkspaceChannel={currentWorkspaceChannel}
+          surveyVisibilityEnabled={visibilityGate.enforced}
         />
         {surveyContent}
       </div>

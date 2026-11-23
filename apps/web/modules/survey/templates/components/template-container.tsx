@@ -2,20 +2,20 @@
 
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { Workspace } from "@formbricks/database/prisma-browser";
 import type { TTemplate } from "@formbricks/types/templates";
 import type { TUserLocale } from "@formbricks/types/user";
 import { customSurveyTemplate } from "@/app/lib/templates";
 import type { TAIUnavailableReason } from "@/lib/ai/service";
+import { type TWorkspaceWithoutCustomCss } from "@/modules/custom-css/lib/types";
 import { TemplateList } from "@/modules/survey/components/template-list";
 import { TemplateCreateQueryClientProvider } from "@/modules/survey/components/template-list/query-client-provider";
 import { MenuBar } from "@/modules/survey/templates/components/menu-bar";
 import { PreviewSurvey } from "@/modules/ui/components/preview-survey";
 import { SearchBar } from "@/modules/ui/components/search-bar";
-import { getMinimalSurvey } from "../lib/minimal-survey";
+import { getTemplatePreviewSurvey } from "../lib/minimal-survey";
 
 type TemplateContainerWithPreviewProps = {
-  workspace: Workspace;
+  workspace: TWorkspaceWithoutCustomCss;
   isTemplatePage?: boolean;
   publicDomain: string;
   /** The language surveys created here are authored in — see `resolveDefaultSurveyLanguage`. */
@@ -70,6 +70,7 @@ export const TemplateContainerWithPreview = ({
               defaultLanguage={defaultLanguage}
               templateSearch={templateSearch ?? ""}
               showAICreateCard={!isTemplatePage}
+              showImportCard
               language={language}
               isAIAvailable={isAIAvailable}
               aiUnavailableReason={aiUnavailableReason}
@@ -83,7 +84,7 @@ export const TemplateContainerWithPreview = ({
         <aside className="group hidden flex-1 shrink-0 items-center justify-center overflow-hidden border-l border-slate-100 bg-slate-50 md:flex md:flex-col">
           {activeTemplate && (
             <PreviewSurvey
-              survey={{ ...getMinimalSurvey(t), ...activeTemplate.preset }}
+              survey={getTemplatePreviewSurvey(t, activeTemplate.preset)}
               elementId={activeElementId}
               workspace={workspace}
               languageCode={"default"}

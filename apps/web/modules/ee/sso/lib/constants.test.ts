@@ -1,24 +1,25 @@
-import { createLocalAccountIssuer, createOAuthAccountIssuer } from "@better-auth/core/db";
-import { github, google } from "@better-auth/core/social-providers";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
-import { canonicalAccountIssuer, ssoAccountIssuer } from "./constants";
+import {
+  SSO_RECOVERY_COMPLETION_PATH,
+  SSO_RECOVERY_CONFIRM_PATH,
+  SSO_RECOVERY_SIGN_IN_PATH,
+} from "@/modules/auth/lib/verification-links";
+import { canonicalAccountIssuer, isSsoRecoveryInternalCallbackUrl, ssoAccountIssuer } from "./constants";
+
+const WEBAPP_URL = "https://app.example.com";
 
 /**
- * `Account.issuer` is spelled in four places that cannot import each other, and ENG-2555 happened
+ * `Account.issuer` is spelled in three places that cannot import each other, and ENG-2555 happened
  * because two of them disagreed about google: the SQL backfill had a `CASE` arm for it, the TypeScript
  * helper did not, and every Google sign-in broke while the whole suite stayed green.
  *
- * So this pins `canonicalAccountIssuer` against the two sources it has to agree with:
- *
- * - the SQL literal, parsed out of the migration rather than restated here — restating it would just
- *   move the drift into this file;
- * - Better Auth's own exports, which are what actually key the row at sign-in.
- *
- * The upstream leg is the one with a future in it: if a Better Auth release changes google's issuer, or
- * gives github one it does not have today, this fails at `pnpm test` instead of at somebody's login.
+ * Better Auth 1.7.7 no longer reads `Account.issuer`, but 1.7.0 pods still do, so we keep writing the
+ * value to keep a rollback to 1.7.0 working. This pins `canonicalAccountIssuer` against the SQL
+ * literals, parsed out of the migrations rather than restated here — restating them would just move the
+ * drift into this file.
  */
 const MIGRATION_DIR = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -71,6 +72,55 @@ const parsedSources = Object.entries(ISSUER_MIGRATION_SOURCES).map(([label, path
 // other copy is identical to it, so asserting against one is asserting against all.
 const { arms, elseTemplate } = parsedSources[0].cases[0];
 
+describe("isSsoRecoveryInternalCallbackUrl", () => {
+  /**
+   * The predicate had no test of its own — the loop tests only reached it through
+   * `startSsoRecovery`, so nothing pinned the trailing-slash handling that stops
+   * `…/complete/` slipping past a check Next would then route to the real page anyway.
+   */
+  test.each([
+    ["the completion path", `${WEBAPP_URL}${SSO_RECOVERY_COMPLETION_PATH}?state=abc`],
+    ["the recovery sign-in path", `${WEBAPP_URL}${SSO_RECOVERY_SIGN_IN_PATH}?token=abc`],
+    // ENG-7395: the GET on the completion path forwards here, so it is part of the loop too.
+    ["the confirmation page", `${WEBAPP_URL}${SSO_RECOVERY_CONFIRM_PATH}?state=abc`],
+    ["a single trailing slash", `${WEBAPP_URL}${SSO_RECOVERY_COMPLETION_PATH}/`],
+    ["many trailing slashes", `${WEBAPP_URL}${SSO_RECOVERY_COMPLETION_PATH}/////`],
+    // Next's `normalizeRepeatedSlashes` collapses interior repeats and backslashes before routing, so
+    // each of these reaches the completion route; a check that missed them left a way back into the loop.
+    ["an interior repeated slash", `${WEBAPP_URL}/api//auth/sso/recovery/complete`],
+    ["several interior repeats", `${WEBAPP_URL}/api///auth//sso/recovery///complete`],
+    ["a backslash separator", `${WEBAPP_URL}/api\\auth/sso/recovery/complete`],
+    ["repeats and a trailing slash together", `${WEBAPP_URL}/api//auth/sso/recovery/complete//`],
+    ["a dot segment that normalises back", `${WEBAPP_URL}/api/auth/sso/recovery/../recovery/complete`],
+    ["a root-relative form", `${SSO_RECOVERY_COMPLETION_PATH}?state=abc`],
+  ])("recognises %s", (_label, callbackUrl) => {
+    expect(isSsoRecoveryInternalCallbackUrl(callbackUrl)).toBe(true);
+  });
+
+  test.each([
+    ["an ordinary app URL", `${WEBAPP_URL}/organizations/org_1/workspaces/ws_1/surveys`],
+    ["a path that merely starts the same", `${WEBAPP_URL}${SSO_RECOVERY_COMPLETION_PATH}-not-really`],
+    ["a path that merely contains it", `${WEBAPP_URL}/x${SSO_RECOVERY_COMPLETION_PATH}`],
+    ["the app root", WEBAPP_URL],
+    ["an unparseable value", "::::"],
+  ])("leaves %s alone", (_label, callbackUrl) => {
+    expect(isSsoRecoveryInternalCallbackUrl(callbackUrl)).toBe(false);
+  });
+
+  test("stays linear on the input shape that made the old regex quadratic", () => {
+    // Deliberately a slash run that does NOT reach the end. `/\/+$/` (Sonar S8786) matches greedily
+    // from every start position, hits the trailing `b`, fails the anchor and backtracks: measured
+    // 34ms at 10k slashes, 2.9s at 100k, 313s at 1M. Trailing slashes would NOT catch this — the old
+    // regex matched those on the first attempt — so the run has to end in a non-slash to bind.
+    const adversarial = `${WEBAPP_URL}/a${"/".repeat(100_000)}b`;
+    const started = Date.now();
+
+    expect(isSsoRecoveryInternalCallbackUrl(adversarial)).toBe(false);
+
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
 describe("canonicalAccountIssuer ↔ every SQL spelling of the mapping", () => {
   // Guard the guard: if the regex silently matched nothing, every assertion below would pass against an
   // empty object and prove precisely nothing. The repair file must contain exactly two copies (SET and
@@ -117,43 +167,27 @@ describe("canonicalAccountIssuer ↔ every SQL spelling of the mapping", () => {
   });
 });
 
-describe("canonicalAccountIssuer ↔ Better Auth's own account key", () => {
-  const providerOptions = { clientId: "pin-test", clientSecret: "pin-test" };
-
-  /**
-   * How upstream resolves the issuer (`better-auth/dist/oauth2/account-key.mjs`): a provider's declared
-   * `accountIssuer` wins, and only its absence falls back to the synthetic form.
-   */
-  test("google declares its own issuer, and we use that rather than the synthetic form", () => {
-    const declared = google(providerOptions).accountIssuer;
-
-    expect(declared).toBe("https://accounts.google.com");
-    expect(canonicalAccountIssuer("google")).toBe(declared);
-    // The regression itself: this is the value that was written, and it is not the one BA looks under.
+describe("canonicalAccountIssuer for the providers Better Auth 1.7.0 declared an issuer for", () => {
+  // 1.7.0 resolved the issuer from the provider's own declaration (google: `https://accounts.google.com`),
+  // falling back to the synthetic `local:oauth:<id>` form. Those values are frozen into rows written
+  // by 1.7.0 and by the migrations, so they are asserted here as literals, not read from upstream.
+  test("google keeps its declared issuer, not the synthetic form", () => {
+    expect(canonicalAccountIssuer("google")).toBe("https://accounts.google.com");
     expect(canonicalAccountIssuer("google")).not.toBe(ssoAccountIssuer("google"));
   });
 
-  /**
-   * Pins the *assumption* behind the fallback, not just the fallback. If a future release gives github a
-   * declared issuer, `local:oauth:github` silently becomes wrong for it in exactly the way it was wrong
-   * for google — and this is what notices.
-   */
-  test("github declares none, so the synthetic fallback is the right answer for it", () => {
-    // `in` rather than reading the property: upstream's type for github has no `accountIssuer` at all,
-    // so this is checked at compile time as well as here. If a release adds one, the property appears
-    // and this fails — which is the notification we want.
-    expect("accountIssuer" in github(providerOptions)).toBe(false);
-    expect(canonicalAccountIssuer("github")).toBe(createOAuthAccountIssuer("github"));
+  test("github falls back to the synthetic form", () => {
+    expect(canonicalAccountIssuer("github")).toBe("local:oauth:github");
   });
 
-  test("credential matches Better Auth's local account issuer", () => {
-    expect(canonicalAccountIssuer("credential")).toBe(createLocalAccountIssuer("credential"));
+  test("credential is the local credential issuer", () => {
+    expect(canonicalAccountIssuer("credential")).toBe("local:credential");
   });
 });
 
-describe("ssoAccountIssuer stays the pinning helper", () => {
-  // It is still correct for the generic providers we pin `accountIssuer` on, and this records that the
-  // two helpers are deliberately different rather than one being a leftover.
+describe("ssoAccountIssuer", () => {
+  // The synthetic form for the generic providers (azuread / openid / saml) and the fallback arm of
+  // `canonicalAccountIssuer`; kept as its own helper because google's canonical value is not this form.
   test.each(["azuread", "openid", "saml"])("%s keeps the synthetic form", (provider) => {
     expect(ssoAccountIssuer(provider)).toBe(`local:oauth:${provider}`);
     expect(canonicalAccountIssuer(provider)).toBe(ssoAccountIssuer(provider));

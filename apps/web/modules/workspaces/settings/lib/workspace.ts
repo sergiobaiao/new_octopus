@@ -10,14 +10,16 @@ import {
   ResourceNotFoundError,
   ValidationError,
 } from "@formbricks/types/errors";
-import { TWorkspace, TWorkspaceUpdateInput, ZWorkspaceUpdateInput } from "@formbricks/types/workspace";
+import { TLogo, TWorkspace, TWorkspaceUpdateInput, ZWorkspaceUpdateInput } from "@formbricks/types/workspace";
 import { reconcileFeedbackDirectoryRelationships } from "@/lib/authzed/feedback-directory";
 import { runPostCommitProjection } from "@/lib/authzed/projection-boundary";
 import { reconcileTeamWorkspaceRelationships } from "@/lib/authzed/team-workspace";
 import { DEFAULT_LOCALE } from "@/lib/constants";
 import { isPrismaKnownRequestError, isUniqueConstraintError } from "@/lib/utils/prisma-error";
 import { validateInputs } from "@/lib/utils/validate";
-import { deleteFilesByWorkspaceId } from "@/modules/storage/service";
+import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
+import { deleteFile, deleteWorkspaceFilesBestEffort } from "@/modules/storage/service";
+import { parseStorageFileUrl } from "@/modules/storage/utils";
 
 // Keep v5 defaults aligned with current production camelCase keys.
 // Safe-identifier migration (with backwards compatibility) is intentionally deferred to v5.1.
@@ -75,10 +77,121 @@ const selectWorkspace = {
   placement: true,
   clickOutsideClose: true,
   overlay: true,
+  overlayColor: true,
+  overlayOpacity: true,
   appSetupCompleted: true,
   styling: true,
   logo: true,
   customHeadScripts: true,
+};
+
+// Identifies an object by what it actually resolves to in the bucket, so two URLs that differ only
+// in origin or percent-encoding still compare equal.
+const storageObjectKey = (fileUrl: string): string | null => {
+  const parsed = parseStorageFileUrl(fileUrl);
+  if (!parsed) return null;
+
+  try {
+    return `${parsed.storageId}/${parsed.accessType}/${decodeURIComponent(parsed.fileName)}`;
+  } catch {
+    // `logo.url` is caller-supplied and nothing upstream validates percent escapes, so a name like
+    // `bad%zz.png` reaches this far and makes decodeURIComponent throw. The caller is compared and
+    // cleaned up *after* the workspace write has committed, so throwing here would report a save
+    // that actually succeeded as failed. An unresolvable name is simply not a key we can match.
+    return null;
+  }
+};
+
+/**
+ * Whether the object is one the organization still points at.
+ *
+ * Organization favicons and email logos upload through the same `/api/v1/management/storage` route
+ * as workspace logos, so they land under `{workspaceId}/public/` and clear both guards below.
+ * Changing them takes `organization.manage`; this path takes only `workspace.manage`. Without this
+ * check a workspace manager could point the workspace logo at an organization asset, clear it, and
+ * delete a file they have no permission to touch — while the organization row still references it.
+ */
+const isOrganizationOwnedAsset = async (organizationId: string, objectKey: string): Promise<boolean> => {
+  const organization = await prisma.organization.findUnique({
+    where: { id: organizationId },
+    select: { whitelabel: true },
+  });
+
+  const whitelabel = organization?.whitelabel;
+  if (!whitelabel) return false;
+
+  return [whitelabel.logoUrl, whitelabel.faviconUrl].some(
+    (url) => url && storageObjectKey(url) === objectKey
+  );
+};
+
+/**
+ * Deletes the storage object a removed or replaced workspace logo used to point at.
+ *
+ * `logo.url` arrives through the update input and `parseStorageFileUrl` derives the storage id from
+ * the URL itself without checking its origin, so that id alone decides whose object gets deleted.
+ * Acting on it unguarded would be a cross-tenant delete primitive: point the logo at another
+ * workspace's storage URL, clear it, and the app removes their file. So the parsed id is checked
+ * against the prefixes this workspace actually owns first — the same guard ENG-1981 and ENG-2258
+ * put on response files.
+ *
+ * Best-effort: the user asked to change the logo, and the database already says so. A storage
+ * failure is logged and never thrown, or a dead bucket would fail an update that did happen.
+ */
+const deleteOrphanedWorkspaceLogoFile = async (
+  workspaceId: string,
+  organizationId: string,
+  previousUrl: string
+) => {
+  try {
+    const storageFile = parseStorageFileUrl(previousUrl);
+    // An external logo URL (a CDN link, which the UI supports) is not ours to delete.
+    if (!storageFile) return;
+
+    const ownedPrefixes = await getWorkspaceLegacyStoragePrefixes(workspaceId);
+    if (!ownedPrefixes.includes(storageFile.storageId)) {
+      logger.error(
+        { workspaceId, storageId: storageFile.storageId },
+        "Refusing to delete a workspace logo stored outside the workspace"
+      );
+      return;
+    }
+
+    // Owning the prefix says the object is this workspace's, not that it is a logo — `logo.url` is
+    // caller-supplied, so it can name any object under that prefix. Logo uploads always go through
+    // the management storage route, which issues `public` keys, so refusing anything else keeps this
+    // path away from `private/` objects (response attachments) even when the url is chosen.
+    if (storageFile.accessType !== "public") {
+      logger.error(
+        { workspaceId, accessType: storageFile.accessType },
+        "Refusing to delete a non-public object through workspace logo cleanup"
+      );
+      return;
+    }
+
+    const objectKey = `${storageFile.storageId}/${storageFile.accessType}/${decodeURIComponent(storageFile.fileName)}`;
+    if (await isOrganizationOwnedAsset(organizationId, objectKey)) {
+      logger.error(
+        { workspaceId, organizationId },
+        "Refusing to delete an organization-owned asset through workspace logo cleanup"
+      );
+      return;
+    }
+
+    // Upload percent-encodes the file name into the URL, but the object is stored under the decoded
+    // name, so a logo called "my logo.png" misses its key entirely unless it is decoded here.
+    const result = await deleteFile(
+      storageFile.storageId,
+      storageFile.accessType,
+      decodeURIComponent(storageFile.fileName)
+    );
+
+    if (!result.ok) {
+      logger.error({ workspaceId, error: result.error }, "Failed to delete the previous workspace logo");
+    }
+  } catch (error) {
+    logger.error({ error, workspaceId }, "Failed to delete the previous workspace logo");
+  }
 };
 
 export const updateWorkspace = async (
@@ -89,16 +202,69 @@ export const updateWorkspace = async (
   // ENG-1919: organizationId is the workspace's tenant anchor, set at creation and immutable on
   // update. Persisting a caller-supplied organizationId here would let an authorized workspace
   // owner move their workspace (and all its data) into another organization, so it is stripped.
-  const { organizationId: _organizationId, ...data } = inputWorkspace;
+  // expectedUpdatedAt is a concurrency baseline, not a column — writing it would be nonsense and
+  // would also fight Prisma's own @updatedAt.
+  //
+  // ENG-2949: custom CSS is written only by `updateWorkspaceCustomCss`, which checks the stricter role,
+  // the plan and the processor. `ZWorkspaceUpdateInput` has no such keys, but validation above does not
+  // replace the input, so a caller passing them would otherwise reach the write untouched.
+  const {
+    organizationId: _organizationId,
+    expectedUpdatedAt,
+    customCss: _customCss,
+    customCssPrevious: _customCssPrevious,
+    ...data
+  } = inputWorkspace as TWorkspaceUpdateInput & { customCss?: unknown; customCssPrevious?: unknown };
   let updatedWorkspace;
+  let previousLogoUrl: string | undefined;
   try {
-    updatedWorkspace = await prisma.workspace.update({
-      where: {
-        id: workspaceId,
-      },
-      data,
-      select: selectWorkspace,
-    });
+    // Only an update carrying a logo can orphan one, so a rename or a styling change costs no read.
+    if ("logo" in inputWorkspace) {
+      // Required rather than optional: an opt-in guard protects nobody who forgets it, and a save
+      // with no baseline is exactly the stale write that restores a url whose object is gone.
+      if (!expectedUpdatedAt) {
+        throw new ValidationError("expectedUpdatedAt is required when the update carries a logo");
+      }
+
+      // Read, version check and write are one transaction over a locked row. Without it, two saves
+      // that both loaded logo A interleave: the replace writes C and deletes A, then the stale save
+      // restores A, leaving the row pointing at an object that no longer exists.
+      ({ updatedWorkspace, previousLogoUrl } = await prisma.$transaction(async (tx) => {
+        const [current] = await tx.$queryRaw<{ logo: TLogo | null; updatedAt: Date }[]>`
+          SELECT "logo", "updated_at" AS "updatedAt"
+          FROM "Workspace"
+          WHERE "id" = ${workspaceId}
+          FOR UPDATE
+        `;
+
+        if (!current) {
+          throw new ResourceNotFoundError("workspace", workspaceId);
+        }
+
+        if (current.updatedAt.getTime() !== expectedUpdatedAt.getTime()) {
+          throw new OperationNotAllowedError(
+            "This workspace was changed somewhere else. Reload the page and try again."
+          );
+        }
+
+        return {
+          updatedWorkspace: await tx.workspace.update({
+            where: { id: workspaceId },
+            data,
+            select: selectWorkspace,
+          }),
+          previousLogoUrl: current.logo?.url,
+        };
+      }));
+    } else {
+      updatedWorkspace = await prisma.workspace.update({
+        where: {
+          id: workspaceId,
+        },
+        data,
+        select: selectWorkspace,
+      });
+    }
   } catch (error) {
     if (isPrismaKnownRequestError(error)) {
       throw new DatabaseError(error.message);
@@ -110,12 +276,81 @@ export const updateWorkspace = async (
     reconcileTeamWorkspaceRelationships({ workspaceIds: [workspaceId] })
   );
 
+  // Compared against what was actually persisted, not against the input: Prisma treats
+  // `logo: undefined` as "leave this field alone", so trusting the input would delete the object
+  // while the row still points at it. Every upload gets a unique `--fid--{uuid}` key, so the old
+  // object has exactly one referrer and losing it orphans the file.
+  //
+  // Compared on the resolved object key, not the raw url: one object can be named by an absolute
+  // and a relative url, and with the file name percent-encoded or not, so a string compare would
+  // read a re-spelled url as a change and delete the object the row still points at.
+  const previousObjectKey = previousLogoUrl ? storageObjectKey(previousLogoUrl) : null;
+  const persistedObjectKey = updatedWorkspace.logo?.url ? storageObjectKey(updatedWorkspace.logo.url) : null;
+
+  if (previousLogoUrl && previousObjectKey !== persistedObjectKey) {
+    await deleteOrphanedWorkspaceLogoFile(workspaceId, updatedWorkspace.organizationId, previousLogoUrl);
+  }
+
   return updatedWorkspace as TWorkspace;
+};
+
+/**
+ * Enforces the organization's workspace cap inside the creating transaction (ENG-3921).
+ *
+ * A count read outside the transaction is a check-then-act race: a burst of concurrent creates all
+ * read the same count before any of them commits, so every one passes and the organization lands as
+ * far past its cap as the burst is wide. Locking the organization row first makes concurrent creates
+ * for one organization take turns, and under READ COMMITTED the count that follows sees every
+ * workspace an earlier lock holder committed.
+ *
+ * The parent row is locked rather than the workspaces because it always exists: `FOR UPDATE` over an
+ * organization's workspaces locks nothing while it has none. FOR NO KEY UPDATE (not FOR UPDATE)
+ * because concurrent creates only need to serialize with each other; it does not conflict with the
+ * FOR KEY SHARE lock every insert of an organization-owned row takes on this row through its foreign
+ * key, so teams, memberships and invites are not held up behind a workspace create. It must be the
+ * transaction's first lock: the caller holds nothing yet while it waits, so it cannot close a
+ * deadlock cycle.
+ */
+const assertWorkspaceLimitNotReached = async (
+  tx: Prisma.TransactionClient,
+  organizationId: string,
+  workspaceLimit: number
+): Promise<void> => {
+  const organizations = await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT "id"
+    FROM "Organization"
+    WHERE "id" = ${organizationId}
+    FOR NO KEY UPDATE
+  `;
+
+  if (organizations.length === 0) {
+    throw new ResourceNotFoundError("Organization", organizationId);
+  }
+
+  const workspaceCount = await tx.workspace.count({ where: { organizationId } });
+
+  if (workspaceCount >= workspaceLimit) {
+    throw new OperationNotAllowedError("Organization workspace limit reached");
+  }
+};
+
+export type TCreateWorkspaceOptions = {
+  /**
+   * The most workspaces the organization may own once this one exists, as resolved by
+   * `getOrganizationWorkspacesLimit`. Resolve it before calling: it can read through to Stripe, and
+   * that must not happen while the organization row is locked. `Infinity` means unlimited.
+   *
+   * `null` only for the first workspace of an organization the caller has just created, which owns
+   * none yet. It is required rather than optional so a new path that adds a workspace to an existing
+   * organization cannot skip the cap by omission.
+   */
+  workspaceLimit: number | null;
 };
 
 export const createWorkspace = async (
   organizationId: string,
-  workspaceInput: TWorkspaceUpdateInput
+  workspaceInput: TWorkspaceUpdateInput,
+  { workspaceLimit }: TCreateWorkspaceOptions
 ): Promise<TWorkspace> => {
   validateInputs([organizationId, ZId], [workspaceInput, ZWorkspaceUpdateInput]);
 
@@ -123,17 +358,32 @@ export const createWorkspace = async (
     throw new ValidationError("Workspace Name is required");
   }
 
-  const { teamIds, config: configInput, ...data } = workspaceInput;
+  // expectedUpdatedAt shares ZWorkspaceUpdateInput with the update path but is a concurrency
+  // baseline, not a column; leaving it in would hand Prisma an unknown field on create.
+  // ENG-2949: a new workspace starts without custom CSS; see `updateWorkspace` for why it is stripped.
+  const {
+    teamIds,
+    config: configInput,
+    expectedUpdatedAt: _expectedUpdatedAt,
+    customCss: _customCss,
+    customCssPrevious: _customCssPrevious,
+    ...data
+  } = workspaceInput as TWorkspaceUpdateInput & { customCss?: unknown; customCssPrevious?: unknown };
   // Captured out here so the guard above still narrows it: inside the transaction callback below,
   // TypeScript widens workspaceInput.name back to `string | undefined`.
   const name = workspaceInput.name;
   let workspace: TWorkspace;
 
   try {
-    // The ownership check and both writes share one transaction: it keeps the check and the link
-    // atomic (a team cannot leave the organization in between), and stops a failed createMany from
-    // leaving an orphan workspace with no team links.
+    // The cap check, the ownership check and both writes share one transaction: it keeps each check
+    // atomic with the write it guards (the cap cannot be raced past, a team cannot leave the
+    // organization in between), and stops a failed createMany from leaving an orphan workspace with no
+    // team links.
     workspace = (await prisma.$transaction(async (tx) => {
+      if (workspaceLimit !== null && Number.isFinite(workspaceLimit)) {
+        await assertWorkspaceLimitNotReached(tx, organizationId, workspaceLimit);
+      }
+
       // ENG-1922: teamIds are caller-supplied. Validate that every team belongs to this
       // organization before linking it — otherwise a caller could attach another org's team
       // to their workspace (a cross-tenant WorkspaceTeam write). The FK only enforces that the
@@ -227,7 +477,9 @@ const deleteWorkspaceRecord = async (db: TWorkspaceDeletionDbClient, workspaceId
     where: {
       id: workspaceId,
     },
-    select: selectWorkspace,
+    // legacyEnvironmentId rides along on the deleted row so storage cleanup has the legacy prefix
+    // after the row is gone. It is not part of selectWorkspace because no other caller needs it.
+    select: { ...selectWorkspace, legacyEnvironmentId: true },
   });
 
   return { feedbackDirectoryAssignments, workspace };
@@ -244,12 +496,7 @@ const completeWorkspaceDeletion = async (
     reconcileFeedbackDirectoryRelationships({ assignments: feedbackDirectoryAssignments })
   );
 
-  const s3Result = await deleteFilesByWorkspaceId(workspaceId, []);
-
-  if (!s3Result.ok && "error" in s3Result) {
-    // fail silently because we don't want to throw an error if the files are not deleted
-    logger.error(s3Result.error, "Error deleting S3 files");
-  }
+  await deleteWorkspaceFilesBestEffort(workspace);
 
   return workspace;
 };

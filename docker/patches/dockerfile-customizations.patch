@@ -1,25 +1,21 @@
 diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
+index 8efc7aa721..df9a70b747 100644
 --- a/apps/web/Dockerfile
 +++ b/apps/web/Dockerfile
-@@ -17,6 +17,8 @@
- ## step 2: Install & build
+@@ -43,14 +43,19 @@ RUN node /tmp/verify-runtime.mjs && rm /tmp/verify-runtime.mjs
+ ## step 1: Install & build
  #
  FROM base AS installer
 +ARG LICENSE_FILE=/app/apps/web/modules/ee/license-check/lib/license.ts
 +ENV LICENSE_FILE=/app/apps/web/modules/ee/license-check/lib/license.ts
++
++# GNU patch for the rebrand step below (busybox patch is not enough)
++RUN apk add --no-cache patch
  
  # Enable corepack and prepare pnpm
  RUN npm install --ignore-scripts -g corepack@0.35.0
-@@ -24,14 +26,14 @@
+ RUN corepack enable
  RUN corepack prepare pnpm@11.7.0 --activate
- 
- # Install necessary build tools and compilers
--RUN apk update && apk add --no-cache cmake g++ gcc jq make openssl-dev python3
-+RUN apk update && apk add --no-cache cmake g++ gcc jq make openssl-dev patch python3
- 
- # Copy the secrets handling script
- COPY apps/web/scripts/docker/read-secrets.sh /tmp/read-secrets.sh
- RUN chmod +x /tmp/read-secrets.sh
  
 -# Increase Node.js memory limit as a regular build argument
 -ARG NODE_OPTIONS="--max_old_space_size=8192"
@@ -27,10 +23,10 @@ diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
 +ARG NODE_OPTIONS="--max_old_space_size=4096"
  ENV NODE_OPTIONS=${NODE_OPTIONS}
  
- # Target architecture - automatically provided by Docker in multi-platform builds
-@@ -53,6 +55,116 @@
- # Prepare the build
- COPY . .
+ # pnpm 11 checks node_modules against the manifests before every `pnpm run` and, by default,
+@@ -104,6 +109,119 @@ RUN touch -c -t 200001010000 pnpm-lock.yaml pnpm-workspace.yaml package.json doc
+       apps/*/package.json packages/*/package.json \
+     && find patches apps/web/vendor -type f -exec touch -t 200001010000 {} +
  
 +# Rebrand: swap "Formbricks" for "Octopus" in a few user-facing strings (page
 +# title, auth appName/issuer, email from-name, TOTP label, API docs) without
@@ -142,15 +138,9 @@ diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
 +console.log(`Patched license file: ${licenseFile}`);
 +NODE
 +
++# Limit turbo parallelism (build-next-runtime.mjs hardcodes the pnpm args); fail loudly if upstream changes the line.
++RUN sed -i 's|"--filter=@formbricks/web..."|"--filter=@formbricks/web...", "--concurrency=1"|' apps/web/scripts/docker/build-next-runtime.mjs \n    && grep -q 'concurrency=1' apps/web/scripts/docker/build-next-runtime.mjs
++
  # Create a .env file
  RUN touch apps/web/.env
  
-@@ -73,7 +185,7 @@
-     --mount=type=secret,id=cubejs_api_secret \
-     --mount=type=secret,id=sentry_auth_token \
-     --mount=type=secret,id=posthog_key \
--    /tmp/read-secrets.sh pnpm build --filter=@formbricks/web...
-+    /tmp/read-secrets.sh pnpm build --filter=@formbricks/web... --concurrency=1
- 
- #
- ## step 3: setup production runner

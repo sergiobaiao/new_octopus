@@ -460,6 +460,24 @@ describe("ssoDatabaseHooks.user.create.after", () => {
   });
 });
 
+describe("ssoDatabaseHooks.account.create.before", () => {
+  const before = ssoDatabaseHooks.account!.create!.before!;
+
+  // Better Auth 1.7.7 no longer writes the issuer; a 1.7.0 pod still looks accounts up by it.
+  test.each([
+    ["credential", "local:credential"],
+    ["google", "https://accounts.google.com"],
+    ["azuread", "local:oauth:azuread"],
+    ["saml", "local:oauth:saml"],
+  ])("stamps the 1.7.0 issuer on a new %s account", async (providerId, issuer) => {
+    const account = { userId: "u1", providerId, accountId: "acc-1" };
+
+    await expect(before(account as never, undefined as never)).resolves.toEqual({
+      data: { ...account, issuer },
+    });
+  });
+});
+
 describe("ssoDatabaseHooks.account.create.after", () => {
   const after = ssoDatabaseHooks.account!.create!.after!;
   const ctxWith = (updateUser: unknown) => ({ context: { internalAdapter: { updateUser } } });
@@ -511,6 +529,41 @@ describe("ssoLicenseGateBefore", () => {
 
   test("allows a SAML callback when both SSO and SAML are licensed", async () => {
     await expect(ssoLicenseGateBefore(samlCtx as never)).resolves.toBeUndefined();
+  });
+
+  /**
+   * Why SSO recovery needs no entitlement check of its own.
+   *
+   * Neither `resendVerificationEmailAction` nor `completeSsoRecovery` calls `getIsSsoEnabled`, which
+   * reads like the "EE feature reachable without an entitlement check" that `.coderabbit.yaml` asks
+   * reviewers to flag. What makes it safe is upstream: recovery has exactly one producer
+   * (`startSsoRecovery`, called only from `ssoRecoveryAfterHandler`), that producer runs in
+   * `hooks.after`, and this gate runs first in `hooks.before` selecting requests by the same
+   * `resolveSsoIdentityProvider` predicate. On an unlicensed instance the callback is rejected before
+   * the endpoint runs, so no intent is ever minted and there is nothing downstream to reach.
+   *
+   * Pinned per provider because that shared predicate IS the argument: narrow one side's selection and
+   * the gate silently stops covering the other.
+   */
+  test.each(["google", "github", "azuread", "azure-ad", "openid", "saml"])(
+    "rejects a %s callback when SSO is unlicensed, so no recovery intent can be minted",
+    async (providerId) => {
+      vi.mocked(getIsSsoEnabled).mockResolvedValue(false);
+
+      await expect(
+        ssoLicenseGateBefore({ path: "/callback/:providerId", params: { providerId } } as never)
+      ).rejects.toThrow("SSO is not enabled");
+    }
+  );
+
+  test("a request this gate ignores is one recovery ignores too", async () => {
+    const nonCallback = { path: "/sign-up/email" } as never;
+
+    await ssoLicenseGateBefore(nonCallback);
+
+    expect(getIsSsoEnabled).not.toHaveBeenCalled();
+    // The other half of the shared predicate: no provider resolved, so recovery declines to act.
+    expect(getSsoProviderFromContext(nonCallback)).toBeNull();
   });
 });
 
