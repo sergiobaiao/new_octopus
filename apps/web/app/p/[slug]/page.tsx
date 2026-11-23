@@ -1,6 +1,7 @@
 import { Metadata } from "next";
 import { notFound, redirect } from "next/navigation";
 import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
+import { getAcceptedLanguages } from "@/lib/utils/locale";
 import { getSurveyBySlug } from "@/modules/survey/lib/slug";
 import { isLinkSurveyServable } from "@/modules/survey/link/lib/public-access";
 import { getMetadataForLinkSurvey } from "@/modules/survey/link/metadata";
@@ -27,7 +28,13 @@ export const generateMetadata = async (props: PrettyUrlPageProps): Promise<Metad
   }
 
   const languageCode = typeof searchParams.lang === "string" ? searchParams.lang : undefined;
-  return getMetadataForLinkSurvey(survey.id, languageCode);
+  return getMetadataForLinkSurvey({
+    surveyId: survey.id,
+    languageCode,
+    acceptedLanguages: await getAcceptedLanguages(),
+    suId: searchParams.suId,
+    suToken: searchParams.suToken,
+  });
 };
 
 export default async function PrettyUrlPage(props: PrettyUrlPageProps) {
