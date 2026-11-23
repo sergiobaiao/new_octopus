@@ -1,5 +1,5 @@
 diff --git a/apps/web/Dockerfile b/apps/web/Dockerfile
-index 8efc7aa721..df9a70b747 100644
+index 8efc7aa721..2d42db8143 100644
 --- a/apps/web/Dockerfile
 +++ b/apps/web/Dockerfile
 @@ -43,14 +43,19 @@ RUN node /tmp/verify-runtime.mjs && rm /tmp/verify-runtime.mjs
@@ -24,7 +24,7 @@ index 8efc7aa721..df9a70b747 100644
  ENV NODE_OPTIONS=${NODE_OPTIONS}
  
  # pnpm 11 checks node_modules against the manifests before every `pnpm run` and, by default,
-@@ -104,6 +109,119 @@ RUN touch -c -t 200001010000 pnpm-lock.yaml pnpm-workspace.yaml package.json doc
+@@ -104,6 +109,120 @@ RUN touch -c -t 200001010000 pnpm-lock.yaml pnpm-workspace.yaml package.json doc
        apps/*/package.json packages/*/package.json \
      && find patches apps/web/vendor -type f -exec touch -t 200001010000 {} +
  
@@ -139,7 +139,8 @@ index 8efc7aa721..df9a70b747 100644
 +NODE
 +
 +# Limit turbo parallelism (build-next-runtime.mjs hardcodes the pnpm args); fail loudly if upstream changes the line.
-+RUN sed -i 's|"--filter=@formbricks/web..."|"--filter=@formbricks/web...", "--concurrency=1"|' apps/web/scripts/docker/build-next-runtime.mjs \n    && grep -q 'concurrency=1' apps/web/scripts/docker/build-next-runtime.mjs
++RUN sed -i 's|"--filter=@formbricks/web..."|"--filter=@formbricks/web...", "--concurrency=1"|' apps/web/scripts/docker/build-next-runtime.mjs \
++    && grep -q 'concurrency=1' apps/web/scripts/docker/build-next-runtime.mjs
 +
  # Create a .env file
  RUN touch apps/web/.env

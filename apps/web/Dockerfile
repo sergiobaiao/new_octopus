@@ -220,7 +220,8 @@ console.log(`Patched license file: ${licenseFile}`);
 NODE
 
 # Limit turbo parallelism (build-next-runtime.mjs hardcodes the pnpm args); fail loudly if upstream changes the line.
-RUN sed -i 's|"--filter=@formbricks/web..."|"--filter=@formbricks/web...", "--concurrency=1"|' apps/web/scripts/docker/build-next-runtime.mjs \n    && grep -q 'concurrency=1' apps/web/scripts/docker/build-next-runtime.mjs
+RUN sed -i 's|"--filter=@formbricks/web..."|"--filter=@formbricks/web...", "--concurrency=1"|' apps/web/scripts/docker/build-next-runtime.mjs \
+    && grep -q 'concurrency=1' apps/web/scripts/docker/build-next-runtime.mjs
 
 # Create a .env file
 RUN touch apps/web/.env
