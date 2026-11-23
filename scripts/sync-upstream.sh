@@ -41,6 +41,7 @@ OWNED_PATHS=(
   "apps/web/public/favicon.ico"
   "apps/web/public/logo-transparent.png"
   "docker/patches/"
+  ".dockerignore"
 )
 
 if [ -n "$(git status --porcelain)" ]; then
