@@ -18,7 +18,8 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.platform }})
-    timeout-minutes: 45
+    # First build compiles Node.js from source (upstream node-runtime-builder stage, 45+ min); later builds hit the cache.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
